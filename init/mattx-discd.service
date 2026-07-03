@@ -23,10 +23,11 @@
 
 [Unit]
 Description=MattX Cluster Discovery Daemon
-After=network.target mattx.ko
+After=network.target
 
 [Service]
-ExecStart=/usr/local/sbin/mattx-discd
+ExecStart=/usr/local/etc/init.d/mattx start
+ExecStop=/usr/local/etc/init.d/mattx stop
 Restart=always
 User=root
 

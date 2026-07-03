@@ -93,7 +93,8 @@ install:
 	sudo cp -f etc/mattx.conf /etc/mattx.conf
 	sudo chmod 644 /etc/mattx.conf
 	sudo cp -f init/mattx-discd.service /etc/systemd/system/mattx-discd.service
-
+	sudo cp -f init/mattx /usr/local/etc/init.d/mattx
+	sudo chmod +x /usr/local/etc/init.d/mattx
 
 	# install the kernel module
 
@@ -114,3 +115,5 @@ uninstall:
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
 	sudo rm -f /etc/mattx.conf
+	sudo rm -f /etc/systemd/system/mattx-discd.service
+	sudo rm -f /usr/local/etc/init.d/mattx

@@ -1,0 +1,161 @@
+#!/bin/bash
+#
+# MattX - The Modern Single System Image (SSI) Cluster
+# 
+# Copyright (c) 2026 by Matthias Rechenburg
+# All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Commercial licensing options are available upon request.
+#
+
+KVER=$(uname -r)
+MOD_PATH="/usr/local/lib/modules/$KVER/mattx.ko"
+CONF_PATH="/etc/mattx.conf"
+DAEMON_PATH="/usr/local/sbin/mattx-discd"
+PROC_ADMIN="/proc/mattx/admin"
+PROC_GUESTS="/proc/mattx/guests"
+
+check_files() {
+    if [ ! -f "$MOD_PATH" ]; then
+        echo "MattX [ERROR]: Kernel module not found at $MOD_PATH"
+        exit 1
+    fi
+    if [ ! -f "$CONF_PATH" ]; then
+        echo "MattX [ERROR]: Configuration file not found at $CONF_PATH"
+        exit 1
+    fi
+    if [ ! -x "$DAEMON_PATH" ]; then
+        echo "MattX [ERROR]: Discovery daemon not found or not executable at $DAEMON_PATH"
+        exit 1
+    fi
+}
+
+start() {
+    echo "Starting MattX SSI Cluster..."
+    check_files
+
+    # 1. Load the Kernel Module
+    if lsmod | grep -q "^mattx "; then
+        echo "MattX [INFO]: Kernel module is already loaded."
+    else
+        echo "MattX [INFO]: Loading kernel module ($MOD_PATH)..."
+        insmod "$MOD_PATH"
+        if [ $? -ne 0 ]; then
+            echo "MattX [FATAL]: Failed to load kernel module!"
+            exit 1
+        fi
+    fi
+
+    # 2. Start the Discovery Daemon
+    if pgrep -x "mattx-discd" > /dev/null; then
+        echo "MattX [INFO]: Discovery daemon is already running."
+    else
+        echo "MattX [INFO]: Starting discovery daemon..."
+        # Run in background and redirect output to a log file
+        $DAEMON_PATH > /var/log/mattx-discd.log 2>&1 &
+        sleep 1
+        if ! pgrep -x "mattx-discd" > /dev/null; then
+            echo "MattX [FATAL]: Discovery daemon failed to start!"
+            exit 1
+        fi
+    fi
+    echo "MattX started successfully! 🚀"
+}
+
+stop() {
+    echo "Stopping MattX SSI Cluster..."
+    
+    # 1. Cordon and Drain (High Availability Shutdown)
+    if [ -f "$PROC_ADMIN" ] && [ -f "$PROC_GUESTS" ]; then
+        echo "MattX [INFO]: Cordoning node (Disabling incoming migrations)..."
+        echo "accept 0" > "$PROC_ADMIN"
+
+        GUEST_COUNT=$(wc -l < "$PROC_GUESTS")
+        if [ "$GUEST_COUNT" -gt 0 ]; then
+            echo "MattX [INFO]: Draining node... Expelling $GUEST_COUNT guest process(es)..."
+            
+            # Loop through all guests and expel them one by one
+            for pid in $(cut -d':' -f1 "$PROC_GUESTS"); do
+                echo "MattX [INFO]: Expelling PID $pid back to its Home Node..."
+                # This echo blocks until the kernel finishes the return migration!
+                echo "expel $pid" > "$PROC_ADMIN"
+            done
+            echo "MattX [INFO]: All guests successfully expelled and safely home."
+        else
+            echo "MattX [INFO]: No guest processes to expel."
+        fi
+    fi
+
+    # 2. Stop the Discovery Daemon
+    if pgrep -x "mattx-discd" > /dev/null; then
+        echo "MattX [INFO]: Stopping discovery daemon..."
+        pkill -x "mattx-discd"
+        sleep 1
+    fi
+
+    # 3. Unload the Kernel Module
+    if lsmod | grep -q "^mattx "; then
+        echo "MattX [INFO]: Unloading kernel module..."
+        rmmod mattx
+        if [ $? -ne 0 ]; then
+            echo "MattX [FATAL]: Failed to unload kernel module! Are there still exported processes?"
+            exit 1
+        fi
+    fi
+    echo "MattX stopped successfully! 🛑"
+}
+
+status() {
+    echo "--- MattX Cluster Status ---"
+    if lsmod | grep -q "^mattx "; then
+        echo "Kernel Module:   LOADED"
+        if [ -f "$PROC_GUESTS" ]; then
+            GUESTS=$(wc -l < "$PROC_GUESTS")
+            echo "Active Guests:   $GUESTS"
+        fi
+    else
+        echo "Kernel Module:   NOT LOADED"
+    fi
+
+    if pgrep -x "mattx-discd" > /dev/null; then
+        echo "Daemon (discd):  RUNNING"
+    else
+        echo "Daemon (discd):  STOPPED"
+    fi
+    echo "----------------------------"
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+esac
+exit 0
