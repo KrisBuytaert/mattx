@@ -47,6 +47,7 @@ check_files() {
 start() {
     echo "Starting MattX SSI Cluster..."
     check_files
+    . $CONF_PATH
 
     # 1. Load the Kernel Module
     if lsmod | grep -q "^mattx "; then
@@ -75,11 +76,39 @@ start() {
             exit 1
         fi
     fi
+
+    # 3. Mount the MattXFS if enabled
+    if [ "$MATTXFS_ENABLED" = true ]; then
+        mkdir -p /mattxfs
+        echo "MattX [INFO]: Mounting MattXFS at /mattxfs..."
+        mkdir -p /mattxfs
+        mount -t mattxfs none /mattxfs
+        if [ $? -ne 0 ]; then
+            echo "MattX [FATAL]: Failed to mount MattXFS!"
+            exit 1
+        fi
+    else
+        echo "MattX [INFO]: MattXFS is disabled in configuration."
+    fi
+
+    # 4. setup DFSA directory if enabled
+    if [ "$DFSA_DIR" != "" ]; then
+        mkdir -p "$DFSA_DIR"
+        chmod 777 "$DFSA_DIR"
+        echo "MattX [INFO]: Direct File System Access (DFSA) directory set to $DFSA_DIR"
+    else
+        echo "MattX [INFO]: DFSA directory not specified in configuration."
+    fi 
+
+    # 5. set default includes for the cluster
+    if [ -n "$MATTX_INCLUDE" ]; then
+        echo "MattX [INFO]: Setting default included processes: $MATTX_INCLUDE"
+        echo "include $MATTX_INCLUDE" > "$PROC_ADMIN"
+    else
+        echo "MattX [WARNING]: No default included processes specified in configuration."
+    fi
+
     echo $DAEMON_PID > /var/run/mattx.pid
-
-    # for now we setup the default configration here
-    echo "include pvmchess-client,mpichess-client,migtest,dfsatest,epolltest" > /proc/mattx/admin
-
 
     echo "MattX started successfully! 🚀"
 }
@@ -108,14 +137,24 @@ stop() {
         fi
     fi
 
-    # 2. Stop the Discovery Daemon
+    # 2. Unmount the MattXFS if it was mounted
+    if mountpoint -q /mattxfs; then
+        echo "MattX [INFO]: Unmounting MattXFS..."
+        umount /mattxfs
+        if [ $? -ne 0 ]; then
+            echo "MattX [FATAL]: Failed to unmount MattXFS! Are there still open files or processes using it?"
+            exit 1
+        fi
+    fi
+
+    # 3. Stop the Discovery Daemon
     if pgrep -x "mattx-discd" > /dev/null; then
         echo "MattX [INFO]: Stopping discovery daemon..."
         pkill -x "mattx-discd"
         sleep 1
     fi
 
-    # 3. Unload the Kernel Module
+    # 4. Unload the Kernel Module
     if lsmod | grep -q "^mattx "; then
         echo "MattX [INFO]: Unloading kernel module..."
         rmmod mattx
