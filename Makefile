@@ -98,9 +98,10 @@ install:
 	sudo cp -f init/mattx /usr/local/etc/init.d/mattx
 	sudo chmod +x /usr/local/etc/init.d/mattx
 
-	# install the kernel module
+	# install the kernel modules
 	sudo mkdir -p /usr/local/lib/modules/$(KVER)
 	sudo cp -f mattx.ko /usr/local/lib/modules/$(KVER)/mattx.ko
+	sudo cp -f mattxfs/mattxfs.ko /usr/local/lib/modules/$(KVER)/mattxfs.ko
 
 	sudo systemctl enable mattx
 
@@ -125,3 +126,5 @@ uninstall:
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo rm -f /usr/local/etc/init.d/mattx
 	sudo rm -f /usr/local/lib/modules/$(KVER)/mattx.ko
+	sudo rm -f /usr/local/lib/modules/$(KVER)/mattxfs.ko
+	

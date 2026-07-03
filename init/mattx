@@ -22,24 +22,29 @@
 # Commercial licensing options are available upon request.
 #
 
-KVER=$(uname -r)
-MOD_PATH="/usr/local/lib/modules/$KVER/mattx.ko"
-CONF_PATH="/etc/mattx.conf"
-DAEMON_PATH="/usr/local/sbin/mattx-discd"
-PROC_ADMIN="/proc/mattx/admin"
-PROC_GUESTS="/proc/mattx/guests"
+MATTX_KVER=$(uname -r)
+MATTX_MOD_PATH="/usr/local/lib/modules/$MATTX_KVER/mattx.ko"
+MATTXFS_MOD_PATH="/usr/local/lib/modules/$MATTX_KVER/mattxfs.ko"
+MATTX_CONF_PATH="/etc/mattx.conf"
+MATTX_DAEMON_PATH="/usr/local/sbin/mattx-discd"
+MATTX_PROC_ADMIN="/proc/mattx/admin"
+MATTX_PROC_GUESTS="/proc/mattx/guests"
 
 check_files() {
-    if [ ! -f "$MOD_PATH" ]; then
-        echo "MattX [ERROR]: Kernel module not found at $MOD_PATH"
+    if [ ! -f "$MATTX_MOD_PATH" ]; then
+        echo "MattX [ERROR]: Kernel module not found at $MATTX_MOD_PATH"
         exit 1
     fi
-    if [ ! -f "$CONF_PATH" ]; then
-        echo "MattX [ERROR]: Configuration file not found at $CONF_PATH"
+    if [ ! -f "$MATTXFS_MOD_PATH" ]; then
+        echo "MattX [ERROR]: MattXFS kernel module not found at $MATTXFS_MOD_PATH"
         exit 1
     fi
-    if [ ! -x "$DAEMON_PATH" ]; then
-        echo "MattX [ERROR]: Discovery daemon not found or not executable at $DAEMON_PATH"
+    if [ ! -f "$MATTX_CONF_PATH" ]; then
+        echo "MattX [ERROR]: Configuration file not found at $MATTX_CONF_PATH"
+        exit 1
+    fi
+    if [ ! -x "$MATTX_DAEMON_PATH" ]; then
+        echo "MattX [ERROR]: Discovery daemon not found or not executable at $MATTX_DAEMON_PATH"
         exit 1
     fi
 }
@@ -47,14 +52,14 @@ check_files() {
 start() {
     echo "Starting MattX SSI Cluster..."
     check_files
-    . $CONF_PATH
+    . $MATTX_CONF_PATH
 
     # 1. Load the Kernel Module
     if lsmod | grep -q "^mattx "; then
         echo "MattX [INFO]: Kernel module is already loaded."
     else
-        echo "MattX [INFO]: Loading kernel module ($MOD_PATH)..."
-        insmod "$MOD_PATH"
+        echo "MattX [INFO]: Loading kernel module ($MATTX_MOD_PATH)..."
+        insmod "$MATTX_MOD_PATH"
         if [ $? -ne 0 ]; then
             echo "MattX [FATAL]: Failed to load kernel module!"
             exit 1
@@ -68,7 +73,7 @@ start() {
     else
         echo "MattX [INFO]: Starting discovery daemon..."
         # Run in background and redirect output to a log file
-        $DAEMON_PATH > /var/log/mattx-discd.log 2>&1 &
+        $MATTX_DAEMON_PATH > /var/log/mattx-discd.log 2>&1 &
         DAEMON_PID=$!
         sleep 1
         if ! pgrep -x "mattx-discd" > /dev/null; then
@@ -79,6 +84,19 @@ start() {
 
     # 3. Mount the MattXFS if enabled
     if [ "$MATTXFS_ENABLED" = true ]; then
+
+        # Load MattXFS Kernel Module
+        if lsmod | grep -q "^mattxfs "; then
+            echo "MattX [INFO]: MattXFS kernel module is already loaded."
+        else
+            echo "MattX [INFO]: Loading MattXFS kernel module..."
+            insmod "$MATTXFS_MOD_PATH"
+            if [ $? -ne 0 ]; then
+                echo "MattX [FATAL]: Failed to load kernel module!"
+                exit 1
+            fi
+        fi
+
         mkdir -p /mattxfs
         echo "MattX [INFO]: Mounting MattXFS at /mattxfs..."
         mkdir -p /mattxfs
@@ -103,7 +121,7 @@ start() {
     # 5. set default includes for the cluster
     if [ -n "$MATTX_INCLUDE" ]; then
         echo "MattX [INFO]: Setting default included processes: $MATTX_INCLUDE"
-        echo "include $MATTX_INCLUDE" > "$PROC_ADMIN"
+        echo "include $MATTX_INCLUDE" > $MATTX_PROC_ADMIN
     else
         echo "MattX [WARNING]: No default included processes specified in configuration."
     fi
@@ -117,19 +135,19 @@ stop() {
     echo "Stopping MattX SSI Cluster..."
     
     # 1. Cordon and Drain (High Availability Shutdown)
-    if [ -f "$PROC_ADMIN" ] && [ -f "$PROC_GUESTS" ]; then
+    if [ -f "$MATTX_PROC_ADMIN" ] && [ -f "$MATTX_PROC_GUESTS" ]; then
         echo "MattX [INFO]: Cordoning node (Disabling incoming migrations)..."
-        echo "accept 0" > "$PROC_ADMIN"
+        echo "accept 0" > "$MATTX_PROC_ADMIN"
 
-        GUEST_COUNT=$(wc -l < "$PROC_GUESTS")
+        GUEST_COUNT=$(wc -l < "$MATTX_PROC_GUESTS")
         if [ "$GUEST_COUNT" -gt 0 ]; then
             echo "MattX [INFO]: Draining node... Expelling $GUEST_COUNT guest process(es)..."
             
             # Loop through all guests and expel them one by one
-            for pid in $(cut -d':' -f1 "$PROC_GUESTS"); do
+            for pid in $(cut -d':' -f1 "$MATTX_PROC_GUESTS"); do
                 echo "MattX [INFO]: Expelling PID $pid back to its Home Node..."
                 # This echo blocks until the kernel finishes the return migration!
-                echo "expel $pid" > "$PROC_ADMIN"
+                echo "expel $pid" > "$MATTX_PROC_ADMIN"
             done
             echo "MattX [INFO]: All guests successfully expelled and safely home."
         else
@@ -172,8 +190,8 @@ status() {
     echo "--- MattX Cluster Status ---"
     if lsmod | grep -q "^mattx "; then
         echo "Kernel Module:   LOADED"
-        if [ -f "$PROC_GUESTS" ]; then
-            GUESTS=$(wc -l < "$PROC_GUESTS")
+        if [ -f "$MATTX_PROC_GUESTS" ]; then
+            GUESTS=$(wc -l < "$MATTX_PROC_GUESTS")
             echo "Active Guests:   $GUESTS"
         fi
     else
