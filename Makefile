@@ -99,7 +99,7 @@ install:
 	sudo chmod +x /usr/local/etc/init.d/mattx
 
 	# install the kernel module
-	sudo mkdir -p /usr/local/lib/modules/$(KVER)/mattx
+	sudo mkdir -p /usr/local/lib/modules/$(KVER)
 	sudo cp -f mattx.ko /usr/local/lib/modules/$(KVER)/mattx.ko
 
 	echo "NOTICE: MattX installation complete."
