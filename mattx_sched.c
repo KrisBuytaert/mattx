@@ -33,7 +33,7 @@
 #include <linux/timekeeping.h>
 
 // --- Load Balancer Configuration ---
-char config_migration_excludes[512] = "cat,watch,cron,top,bash,pvmd,sshd,sshd-session,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal";
+char config_migration_excludes[512] = "cat,watch,cron,top,bash,make,pvmd,sshd,sshd-session,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal";
 char config_migration_includes[512] = ""; // Default empty (Whitelist disabled)
 u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
 bool config_accept_guests = true; // <-- NEW: Default to accepting guests!
