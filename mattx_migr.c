@@ -598,6 +598,73 @@ void mattx_send_vma_data(void) {
     local_migration_req = NULL;
 }
 
+// --- THE NODE DRAINER (Expel) ---
+int mattx_expel_guest(pid_t local_pid) {
+    u32 orig_pid = 0;
+    int home_node = -1;
+    struct task_struct *surrogate = NULL;
+    bool found = false;
+
+    // 1. Find the guest in the registry
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == local_pid) {
+            orig_pid = guest_registry[i].orig_pid;
+            home_node = guest_registry[i].home_node;
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!found) {
+        printk(KERN_WARNING "MattX: [EXPEL] PID %d is not a MattX guest!\n", local_pid);
+        return -ENOENT;
+    }
+
+    if (!cluster_map[home_node]) {
+        printk(KERN_ERR "MattX: [EXPEL] Home Node %d is disconnected! Cannot expel PID %d.\n", home_node, local_pid);
+        return -ENOTCONN;
+    }
+
+    // 2. Grab the task struct
+    rcu_read_lock();
+    surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID);
+    if (surrogate) get_task_struct(surrogate);
+    rcu_read_unlock();
+
+    if (surrogate) {
+        mattx_dbg("[EXPEL] Initiating forced return for Surrogate PID %d to Node %d...\n", local_pid, home_node);
+        
+        // 3. Trigger the exact same return pipeline as a Recall!
+        mattx_capture_and_return_state(surrogate, orig_pid, home_node);
+        put_task_struct(surrogate);
+
+        // 4. BLOCKING WAIT: Wait until the guest is fully removed from the registry
+        mattx_dbg("[EXPEL] Waiting for migration of PID %d to complete...\n", local_pid);
+        while (1) {
+            found = false;
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == local_pid) {
+                    found = true;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (!found) break; // It's gone! Migration complete!
+            
+            // Sleep for 100ms and check again. This safely blocks the /proc write!
+            msleep(100);
+        }
+        mattx_dbg("[EXPEL] Successfully expelled PID %d!\n", local_pid);
+        return 0;
+    }
+
+    return -ESRCH;
+}
+
 
 void mattx_trigger_recall(pid_t orig_pid) {
     int target_node = get_export_target(orig_pid);

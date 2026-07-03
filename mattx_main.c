@@ -55,7 +55,7 @@ EXPORT_SYMBOL(config_debug_mode);
 bool config_mpi_support = false; // Default to false
 EXPORT_SYMBOL(config_mpi_support);
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -71,6 +71,7 @@ static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_A
     [MATTX_ATTR_MATTXFS_ENABLED] = { .type = NLA_U8 },
     [MATTX_ATTR_DFSA_DIR] = { .type = NLA_STRING, .len = 255 },
     [MATTX_ATTR_MPI_SUPPORT] = { .type = NLA_U8 },
+    [MATTX_ATTR_ACCEPT_GUESTS] = { .type = NLA_U8 },
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -191,12 +192,17 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         config_mpi_support = nla_get_u8(info->attrs[MATTX_ATTR_MPI_SUPPORT]) ? true : false;
         mattx_dbg("[NL] MPI Support Enabled: %s\n", config_mpi_support ? "TRUE" : "FALSE");
     }
-
-    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, MPI: %s\n",
+    if (info->attrs[MATTX_ATTR_ACCEPT_GUESTS]) {
+        config_accept_guests = nla_get_u8(info->attrs[MATTX_ATTR_ACCEPT_GUESTS]) ? true : false;
+        mattx_dbg("[NL] Accept Guests Enabled: %s\n", config_accept_guests ? "TRUE" : "FALSE");
+    }
+    
+    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, MPI: %s, Accept: %s\n",    
            config_migrate_file_io ? "TRUE" : "FALSE",
            config_migrate_network_io ? "TRUE" : "FALSE",
            config_mattxfs_enabled ? "TRUE" : "FALSE",
-           config_mpi_support ? "TRUE" : "FALSE");
+           config_mpi_support ? "TRUE" : "FALSE",
+           config_accept_guests ? "TRUE" : "FALSE");           
     return 0;
 }
 

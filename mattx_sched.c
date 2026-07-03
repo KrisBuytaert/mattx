@@ -36,6 +36,7 @@
 char config_migration_excludes[512] = "cat,watch,cron,top,bash,pvmd,sshd,sshd-session,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal";
 char config_migration_includes[512] = ""; // Default empty (Whitelist disabled)
 u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
+bool config_accept_guests = true; // <-- NEW: Default to accepting guests!
 static pid_t last_migrated_pid = 0; // Prevents picking the same task twice in a burst
 static unsigned long last_migration_jiffies = 0; // Tracks the 5-second cooldown
 
@@ -162,6 +163,13 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
+            
+            // --- THE CORDON CHECK ---
+            // If the remote node has closed its doors, skip it entirely!
+            if (!cluster_load_table[i].accept_guests) {
+                continue;
+            }
+
             u32 remote_load = cluster_load_table[i].cpu_load;
             u32 remote_affinity = cluster_load_table[i].affinity;
             if (remote_affinity == 0) remote_affinity = 1000; // Failsafe
@@ -212,16 +220,22 @@ int mattx_balancer_loop(void *data) {
         
         u32 current_affinity = config_node_affinity ? config_node_affinity : num_online_cpus() * 1000;
 
+        // 1. Calculate the TRUE local load
         local_load.cpu_load = mattx_calc_local_load(); 
         local_load.affinity = current_affinity;
         local_load.mem_free_mb = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
+        
+        // 2. Explicitly state our Cordon status!
+        local_load.accept_guests = config_accept_guests ? 1 : 0;
 
+        // 3. Broadcast to the cluster
         for (i = 0; i < MAX_NODES; i++) {
             if (cluster_map[i] && cluster_map[i]->node_id != -1) {
                 mattx_comm_send_ctrl(cluster_map[i], MATTX_MSG_LOAD_UPDATE, &local_load, sizeof(local_load));
             }
         }
         
+        // 4. Evaluate our own TRUE load
         mattx_evaluate_and_balance(local_load.cpu_load, local_load.affinity);
 
         // --- THE SAFE GUEST WATCHER (Node 2) ---

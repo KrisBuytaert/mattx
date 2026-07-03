@@ -175,6 +175,7 @@ struct mattx_load_info {
     u32 cpu_load;    // Now instantaneous runqueue length!
     u32 mem_free_mb;
     u32 affinity;    // Node Speed / Affinity
+    u32 accept_guests; // Explicit Cordon Flag!
 };
 
 struct mattx_vma_info {
@@ -930,7 +931,9 @@ extern mattx_sys_close_fn real_sys_close;
 extern bool config_migrate_file_io;
 extern bool config_migrate_network_io;
 extern bool config_mpi_support;
+extern bool config_accept_guests;
 
+int mattx_expel_guest(pid_t local_pid);
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 int mattx_comm_send_ctrl(struct mattx_link *link, u32 type, void *data, u32 len);
