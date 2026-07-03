@@ -28,8 +28,11 @@ After=network.target
 [Service]
 ExecStart=/usr/local/etc/init.d/mattx start
 ExecStop=/usr/local/etc/init.d/mattx stop
+ExecReload=/etc/init.d/mattx reload
+PIDFile=/var/run/mattx.pid
+RemainAfterExit=no
 Restart=always
-User=root
+Type=forking
 
 [Install]
 WantedBy=multi-user.target

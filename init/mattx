@@ -63,16 +63,20 @@ start() {
     # 2. Start the Discovery Daemon
     if pgrep -x "mattx-discd" > /dev/null; then
         echo "MattX [INFO]: Discovery daemon is already running."
+        DAEMON_PID=$(pgrep -x "mattx-discd")
     else
         echo "MattX [INFO]: Starting discovery daemon..."
         # Run in background and redirect output to a log file
         $DAEMON_PATH > /var/log/mattx-discd.log 2>&1 &
+        DAEMON_PID=$!
         sleep 1
         if ! pgrep -x "mattx-discd" > /dev/null; then
             echo "MattX [FATAL]: Discovery daemon failed to start!"
             exit 1
         fi
     fi
+    echo $DAEMON_PID > /var/run/mattx.pid
+
     echo "MattX started successfully! 🚀"
 }
 
@@ -116,6 +120,8 @@ stop() {
             exit 1
         fi
     fi
+    rm -f /var/run/mattx.pid
+
     echo "MattX stopped successfully! 🛑"
 }
 
@@ -146,7 +152,7 @@ case "$1" in
     stop)
         stop
         ;;
-    restart)
+    restart|reload)
         stop
         sleep 2
         start
