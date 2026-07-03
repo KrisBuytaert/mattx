@@ -27,6 +27,7 @@ obj-m += mattx.o
 mattx-objs := mattx_main.o mattx_comm.o mattx_sched.o mattx_migr.o mattx_proc.o mattx_hooks.o mattx_import.o mattx_guest.o mattx_fileio.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
+KVER := $(shell uname -r)
 PWD := $(shell pwd)
 
 # --- User-Space Build Config ---
@@ -93,10 +94,13 @@ install:
 	sudo cp -f etc/mattx.conf /etc/mattx.conf
 	sudo chmod 644 /etc/mattx.conf
 	sudo cp -f init/mattx-discd.service /etc/systemd/system/mattx-discd.service
+	sudo mkdir -p /usr/local/etc/init.d
 	sudo cp -f init/mattx /usr/local/etc/init.d/mattx
 	sudo chmod +x /usr/local/etc/init.d/mattx
 
 	# install the kernel module
+	sudo mkdir -p /usr/local/lib/modules/$(KVER)/mattx
+	sudo cp -f mattx.ko /usr/local/lib/modules/$(KVER)/mattx.ko
 
 	echo "NOTICE: MattX installation complete."
 	echo "Please configure /etc/mattx.conf before running the daemon."
@@ -117,3 +121,4 @@ uninstall:
 	sudo rm -f /etc/mattx.conf
 	sudo rm -f /etc/systemd/system/mattx-discd.service
 	sudo rm -f /usr/local/etc/init.d/mattx
+	sudo rm -f /usr/local/lib/modules/$(KVER)/mattx.ko
