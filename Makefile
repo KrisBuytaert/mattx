@@ -102,6 +102,8 @@ install:
 	sudo mkdir -p /usr/local/lib/modules/$(KVER)
 	sudo cp -f mattx.ko /usr/local/lib/modules/$(KVER)/mattx.ko
 
+	sudo systemctl enable mattx.service
+
 	echo "NOTICE: MattX installation complete."
 	echo "Please configure /etc/mattx.conf before running the daemon."
 
