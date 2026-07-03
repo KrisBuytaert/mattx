@@ -77,6 +77,10 @@ start() {
     fi
     echo $DAEMON_PID > /var/run/mattx.pid
 
+    # for now we setup the default configration here
+    echo "include pvmchess-client,mpichess-client,migtest,dfsatest,epolltest" > /proc/mattx/admin
+
+
     echo "MattX started successfully! 🚀"
 }
 
