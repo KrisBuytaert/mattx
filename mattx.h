@@ -59,7 +59,8 @@
 #include <linux/version.h>
 #include <linux/time64.h> // Ensure we have time64_t
 #include <linux/task_work.h>
-
+#include <linux/utsname.h>
+#include <linux/resource.h>
 
 // --- KERNEL COMPATIBILITY: The Sockaddr Evolution ---
 // In late 2025 (Linux 6.18/6.19+), the kernel replaced 'struct sockaddr *' 
@@ -162,6 +163,12 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_SENDMSG_REPLY,
     MATTX_MSG_SYS_RECVMSG_REQ,
     MATTX_MSG_SYS_RECVMSG_REPLY,
+    MATTX_MSG_SYS_UNAME_REQ,
+    MATTX_MSG_SYS_UNAME_REPLY,
+    MATTX_MSG_SYS_PRLIMIT64_REQ,
+    MATTX_MSG_SYS_PRLIMIT64_REPLY,
+    MATTX_MSG_SYS_PRCTL_REQ,
+    MATTX_MSG_SYS_PRCTL_REPLY,
 };
 
 struct mattx_header {
@@ -544,6 +551,37 @@ struct mattx_sys_recvmsg_reply {
     char data[]; // Flexible array for the flattened data!
 };
 
+struct mattx_sys_uname_req { 
+    u32 orig_pid; 
+};
+struct mattx_sys_uname_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct new_utsname uts; 
+};
+
+struct mattx_sys_prlimit64_req { 
+    u32 orig_pid; pid_t pid; int resource; 
+    u8 has_new; u8 has_old; struct rlimit new_rlim; 
+};
+struct mattx_sys_prlimit64_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct rlimit old_rlim; 
+};
+
+struct mattx_sys_prctl_req { 
+    u32 orig_pid; 
+    int option; 
+    unsigned long arg2, arg3, arg4, arg5; 
+};
+
+struct mattx_sys_prctl_reply { 
+    u32 orig_pid; 
+    int error; 
+};
+
+
 
 
 struct mattx_fake_fd_info {
@@ -662,6 +700,22 @@ struct mattx_rpc_work {
     bool is_recvmsg;
     struct msghdr __user *msg_ptr;
 
+    // For UNAME
+    bool is_uname;
+
+    // For PRLIMIT64
+    bool is_prlimit64;
+    pid_t prlimit_pid;
+    int prlimit_resource;
+    bool prlimit_has_new;
+    bool prlimit_has_old;
+    void __user *prlimit_new_rlim_ptr;
+    void __user *prlimit_old_rlim_ptr;
+
+    // For PRCTL
+    bool is_prctl;
+    int prctl_option;
+    unsigned long prctl_arg2, prctl_arg3, prctl_arg4, prctl_arg5;
 };
 
 struct mattx_link {
@@ -920,6 +974,12 @@ extern mattx_sys_dup2_fn real_sys_dup2;
 
 typedef long (*mattx_sys_close_fn)(const struct pt_regs *regs);
 extern mattx_sys_close_fn real_sys_close;
+
+typedef long (*mattx_sys_prlimit64_fn)(const struct pt_regs *regs);
+extern mattx_sys_prlimit64_fn real_sys_prlimit64;
+
+typedef long (*mattx_sys_prctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_prctl_fn real_sys_prctl;
 
 
 // The Extreme Debugging Macro ---

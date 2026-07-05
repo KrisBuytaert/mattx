@@ -52,6 +52,8 @@ mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
 mattx_sys_dup_fn real_sys_dup = NULL;
 mattx_sys_dup2_fn real_sys_dup2 = NULL;
 mattx_sys_close_fn real_sys_close = NULL;
+mattx_sys_prlimit64_fn real_sys_prlimit64 = NULL;
+mattx_sys_prctl_fn real_sys_prctl = NULL;
 
 
 
@@ -204,6 +206,19 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_prlimit64";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_prlimit64 = (mattx_sys_prlimit64_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_prctl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_prctl = (mattx_sys_prctl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
 }
 

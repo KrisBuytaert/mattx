@@ -2876,6 +2876,139 @@ static void handle_sys_recvmsg_reply(struct mattx_link *link, struct mattx_heade
 
 
 
+static void handle_sys_uname_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_uname_req *req = payload;
+    struct mattx_sys_uname_reply reply;
+    reply.orig_pid = req->orig_pid;
+    reply.error = 0;
+    
+    memcpy(&reply.uts, utsname(), sizeof(struct new_utsname));
+    
+    if (cluster_map[hdr->sender_id]) mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_UNAME_REPLY, &reply, sizeof(reply));
+}
+
+static void handle_sys_uname_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_uname_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            if (reply->error == 0) {
+                guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct new_utsname), GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, &reply->uts, sizeof(struct new_utsname));
+            }
+            guest_registry[i].rpc_done = true;
+            if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq);
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+// The prlimit64 Deputy Hijack
+struct mattx_prlimit_ctx { struct callback_head cb; struct mattx_sys_prlimit64_req req; int target_node; };
+static void mattx_prlimit_cb(struct callback_head *cb) {
+    struct mattx_prlimit_ctx *ctx = container_of(cb, struct mattx_prlimit_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs; int ret = -EFAULT;
+    struct mattx_sys_prlimit64_reply reply;
+
+    unsigned long new_ptr = task_regs->sp - 128 - sizeof(struct rlimit) * 2;
+    unsigned long old_ptr = new_ptr + sizeof(struct rlimit);
+
+    if (!ctx->req.has_new || copy_to_user((void __user *)new_ptr, &ctx->req.new_rlim, sizeof(struct rlimit)) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->req.pid; regs.si = ctx->req.resource;
+        regs.dx = ctx->req.has_new ? new_ptr : 0; regs.r10 = ctx->req.has_old ? old_ptr : 0;
+        if (real_sys_prlimit64) ret = real_sys_prlimit64(&regs);
+    }
+
+    reply.orig_pid = ctx->req.orig_pid; reply.error = ret;
+
+    if (ret == 0 && ctx->req.has_old) {
+        if (copy_from_user(&reply.old_rlim, (void __user *)old_ptr, sizeof(struct rlimit))) {
+            mattx_dbg("[HIJACK] Warning: Failed to read old_rlim from user-space!\n");
+        }
+    }
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PRLIMIT64_REPLY, &reply, sizeof(reply));
+    kfree(ctx); set_current_state(TASK_STOPPED); schedule();
+}
+// (Add handle_sys_prlimit64_req to allocate ctx and task_work_add it to the Deputy)
+
+
+// The prctl Deputy Hijack
+struct mattx_prctl_ctx { struct callback_head cb; struct mattx_sys_prctl_req req; int target_node; };
+static void mattx_prctl_cb(struct callback_head *cb) {
+    struct mattx_prctl_ctx *ctx = container_of(cb, struct mattx_prctl_ctx, cb);
+    struct pt_regs regs; int ret = -ENOSYS;
+    struct mattx_sys_prctl_reply reply;
+
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->req.option; regs.si = ctx->req.arg2; regs.dx = ctx->req.arg3;
+    regs.r10 = ctx->req.arg4; regs.r8 = ctx->req.arg5;
+    if (real_sys_prctl) ret = real_sys_prctl(&regs);
+
+    reply.orig_pid = ctx->req.orig_pid; reply.error = ret;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PRCTL_REPLY, &reply, sizeof(reply));
+    kfree(ctx); set_current_state(TASK_STOPPED); schedule();
+}
+// (Add handle_sys_prctl_req to allocate ctx and task_work_add it to the Deputy)
+
+
+static void handle_sys_prlimit64_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_prlimit64_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_prlimit_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+            init_task_work(&ctx->cb, mattx_prlimit_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+static void handle_sys_prctl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_prctl_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_prctl_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+            init_task_work(&ctx->cb, mattx_prctl_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+
+static void handle_sys_prlimit64_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_prlimit64_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            if (reply->error == 0) {
+                guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct rlimit), GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, &reply->old_rlim, sizeof(struct rlimit));
+            }
+            guest_registry[i].rpc_done = true;
+            if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq);
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+
+
+
 
 // --- VFS RPC Registry ---
 // This allows mattxfs.ko to sleep while waiting for network replies
@@ -4083,7 +4216,12 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_SENDMSG_REPLY, handle_sys_sendmsg_reply);
     mattx_register_handler(MATTX_MSG_SYS_RECVMSG_REQ, handle_sys_recvmsg_req);
     mattx_register_handler(MATTX_MSG_SYS_RECVMSG_REPLY, handle_sys_recvmsg_reply);
-
+    mattx_register_handler(MATTX_MSG_SYS_UNAME_REQ, handle_sys_uname_req);
+    mattx_register_handler(MATTX_MSG_SYS_UNAME_REPLY, handle_sys_uname_reply);
+    mattx_register_handler(MATTX_MSG_SYS_PRLIMIT64_REQ, handle_sys_prlimit64_req);
+    mattx_register_handler(MATTX_MSG_SYS_PRLIMIT64_REPLY, handle_sys_prlimit64_reply);
+    mattx_register_handler(MATTX_MSG_SYS_PRCTL_REQ, handle_sys_prctl_req);
+    mattx_register_handler(MATTX_MSG_SYS_PRCTL_REPLY, handle_sys_generic_int_reply); // Reusing the generic int reply!
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }

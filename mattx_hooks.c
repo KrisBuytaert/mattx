@@ -497,6 +497,32 @@ static void mattx_rpc_worker(struct work_struct *work) {
             put_task_struct(s);
         }
 
+    } else if (rpc->is_uname) {
+        struct mattx_sys_uname_req req = { .orig_pid = rpc->orig_pid };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_UNAME_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_prlimit64) {
+        struct mattx_sys_prlimit64_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid; 
+        req.pid = rpc->prlimit_pid; 
+        req.resource = rpc->prlimit_resource;
+        req.has_new = rpc->prlimit_has_new; 
+        req.has_old = rpc->prlimit_has_old;
+        
+        if (req.has_new) {
+            struct task_struct *s = NULL; rcu_read_lock(); s = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (s) get_task_struct(s); rcu_read_unlock();
+            if (s) { 
+                access_process_vm(s, (unsigned long)rpc->prlimit_new_rlim_ptr, &req.new_rlim, sizeof(struct rlimit), FOLL_FORCE); put_task_struct(s); 
+            }
+        }
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PRLIMIT64_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_prctl) {
+        struct mattx_sys_prctl_req req = { .orig_pid = rpc->orig_pid, .option = rpc->prctl_option, .arg2 = rpc->prctl_arg2, .arg3 = rpc->prctl_arg3, .arg4 = rpc->prctl_arg4, .arg5 = rpc->prctl_arg5 };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PRCTL_REQ, &req, sizeof(req));
+
+
 
 
     // OPEN WORKER (DEFAULT FALLBACK)
@@ -1167,6 +1193,56 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 if (read_buf) kfree(read_buf);
                 if (regs) regs->ax = retval;
                 
+            // --- UNAME AWAKENING ---
+            } else if (rpc->is_uname) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR; void *read_buf = NULL;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (error == 0 && read_buf) access_process_vm(surrogate, (unsigned long)rpc->buff, read_buf, sizeof(struct new_utsname), FOLL_WRITE | FOLL_FORCE);
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+            // --- PRLIMIT64 AWAKENING ---
+            } else if (rpc->is_prlimit64) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR; void *read_buf = NULL;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (error == 0 && rpc->prlimit_has_old && read_buf) access_process_vm(surrogate, (unsigned long)rpc->prlimit_old_rlim_ptr, read_buf, sizeof(struct rlimit), FOLL_WRITE | FOLL_FORCE);
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+            // --- PRCTL AWAKENING ---
+            } else if (rpc->is_prctl) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res;
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (regs) regs->ax = error;                
+
+
 
             // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
             } else if (remote_fd >= 0) {
@@ -3108,6 +3184,160 @@ static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) 
 }
 
 
+// --- BATCH 1: LOCAL SPOOFERS (Zero Latency) ---
+static struct kretprobe getpid_kprobe;
+static struct kretprobe gettid_kprobe;
+
+static int entry_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+static int ret_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->pid) {
+                regs->ax = guest_registry[i].orig_pid; // Spoof the PID instantly!
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+    return 0;
+}
+
+// --- BATCH 1: WORMHOLE TUNNELERS ---
+struct uname_kretprobe_data { void __user *buf; };
+static struct kretprobe uname_kprobe;
+static int entry_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        ((struct uname_kretprobe_data *)ri->data)->buf = (void __user *)SYSCALL_REGS(regs)->di;
+        SYSCALL_REGS(regs)->di = 0; // Sabotage!
+    }
+    return 0;
+}
+
+// --- UNAME RET HANDLER ---
+static int ret_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct uname_kretprobe_data *data = (struct uname_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0; int i;
+
+    if (!is_guest_process(my_pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_uname = true; rpc->buff = data->buf;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+struct prlimit_kretprobe_data { pid_t pid; int resource; void __user *new_rlim; void __user *old_rlim; };
+static struct kretprobe prlimit64_kprobe;
+static int entry_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct prlimit_kretprobe_data *data = (struct prlimit_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->pid = (pid_t)sys_regs->di; data->resource = (int)sys_regs->si;
+        data->new_rlim = (void __user *)sys_regs->dx; data->old_rlim = (void __user *)sys_regs->r10;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+
+// --- PRLIMIT64 RET HANDLER ---
+static int ret_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct prlimit_kretprobe_data *data = (struct prlimit_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0; int i;
+
+    if (!is_guest_process(my_pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_prlimit64 = true; rpc->prlimit_pid = data->pid; rpc->prlimit_resource = data->resource;
+            rpc->prlimit_has_new = (data->new_rlim != NULL); rpc->prlimit_has_old = (data->old_rlim != NULL);
+            rpc->prlimit_new_rlim_ptr = data->new_rlim; rpc->prlimit_old_rlim_ptr = data->old_rlim;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+struct prctl_kretprobe_data { int option; unsigned long arg2, arg3, arg4, arg5; };
+static struct kretprobe prctl_kprobe;
+static int entry_handler_prctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct prctl_kretprobe_data *data = (struct prctl_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->option = (int)sys_regs->di; data->arg2 = sys_regs->si; data->arg3 = sys_regs->dx;
+        data->arg4 = sys_regs->r10; data->arg5 = sys_regs->r8;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+
+// --- PRCTL RET HANDLER ---
+static int ret_handler_prctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct prctl_kretprobe_data *data = (struct prctl_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0; int i;
+
+    if (!is_guest_process(my_pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_prctl = true; rpc->prctl_option = data->option; rpc->prctl_arg2 = data->arg2;
+            rpc->prctl_arg3 = data->arg3; rpc->prctl_arg4 = data->arg4; rpc->prctl_arg5 = data->arg5;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
 
 // --- KPROBE REGISTRATION ---
 
@@ -3355,7 +3585,8 @@ int mattx_hooks_init(void) {
     getsockname_kprobe.handler = ret_handler_sockname;
     getsockname_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
     getsockname_kprobe.maxactive = 64;
-    register_kretprobe(&getsockname_kprobe);
+    ret = register_kretprobe(&getsockname_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getsockname, returned %d\n", ret);
 
     memset(&getpeername_kprobe, 0, sizeof(getpeername_kprobe));
     getpeername_kprobe.kp.symbol_name = "__x64_sys_getpeername";
@@ -3363,7 +3594,8 @@ int mattx_hooks_init(void) {
     getpeername_kprobe.handler = ret_handler_sockname;         // Shared!
     getpeername_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
     getpeername_kprobe.maxactive = 64;
-    register_kretprobe(&getpeername_kprobe);
+    ret = register_kretprobe(&getpeername_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getpeername, returned %d\n", ret );
 
     // --- SOCKOPTS ---
     memset(&setsockopt_kprobe, 0, sizeof(setsockopt_kprobe));
@@ -3372,7 +3604,8 @@ int mattx_hooks_init(void) {
     setsockopt_kprobe.handler = ret_handler_sockopt;
     setsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
     setsockopt_kprobe.maxactive = 64;
-    register_kretprobe(&setsockopt_kprobe);
+    ret = register_kretprobe(&setsockopt_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for setsockopt, returned %d\n", ret);
 
     memset(&getsockopt_kprobe, 0, sizeof(getsockopt_kprobe));
     getsockopt_kprobe.kp.symbol_name = "__x64_sys_getsockopt";
@@ -3380,7 +3613,8 @@ int mattx_hooks_init(void) {
     getsockopt_kprobe.handler = ret_handler_sockopt;         // Shared!
     getsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
     getsockopt_kprobe.maxactive = 64;
-    register_kretprobe(&getsockopt_kprobe);
+    ret = register_kretprobe(&getsockopt_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getsockopt, returned %d\n", ret);
 
     // --- SENDMSG & RECVMSG ---
     memset(&sendmsg_kprobe, 0, sizeof(sendmsg_kprobe));
@@ -3389,7 +3623,8 @@ int mattx_hooks_init(void) {
     sendmsg_kprobe.handler = ret_handler_msg;
     sendmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
     sendmsg_kprobe.maxactive = 64;
-    register_kretprobe(&sendmsg_kprobe);
+    ret = register_kretprobe(&sendmsg_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendmsg, returned %d\n", ret);
 
     memset(&recvmsg_kprobe, 0, sizeof(recvmsg_kprobe));
     recvmsg_kprobe.kp.symbol_name = "__x64_sys_recvmsg";
@@ -3397,7 +3632,52 @@ int mattx_hooks_init(void) {
     recvmsg_kprobe.handler = ret_handler_msg;         // Shared!
     recvmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
     recvmsg_kprobe.maxactive = 64;
-    register_kretprobe(&recvmsg_kprobe);
+    ret = register_kretprobe(&recvmsg_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvmsg, returned %d\n", ret);
+
+    memset(&getpid_kprobe, 0, sizeof(getpid_kprobe));
+    getpid_kprobe.kp.symbol_name = "__x64_sys_getpid";
+    getpid_kprobe.entry_handler = entry_handler_getpid;
+    getpid_kprobe.handler = ret_handler_getpid;
+    getpid_kprobe.maxactive = 64;
+    ret = register_kretprobe(&getpid_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getpid, returned %d\n", ret);
+
+    memset(&gettid_kprobe, 0, sizeof(gettid_kprobe));
+    gettid_kprobe.kp.symbol_name = "__x64_sys_gettid";
+    gettid_kprobe.entry_handler = entry_handler_getpid; // Reusing getpid handler to spoof main thread!
+    gettid_kprobe.handler = ret_handler_getpid;
+    gettid_kprobe.maxactive = 64;
+    ret = register_kretprobe(&gettid_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for gettid, returned %d\n", ret);
+
+    memset(&uname_kprobe, 0, sizeof(uname_kprobe));
+    uname_kprobe.kp.symbol_name = "__x64_sys_newuname";
+    uname_kprobe.entry_handler = entry_handler_uname;
+    uname_kprobe.handler = ret_handler_uname;
+    uname_kprobe.data_size = sizeof(struct uname_kretprobe_data);
+    uname_kprobe.maxactive = 64;
+    ret = register_kretprobe(&uname_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for uname, returned %d\n", ret   );
+
+    memset(&prlimit64_kprobe, 0, sizeof(prlimit64_kprobe));
+    prlimit64_kprobe.kp.symbol_name = "__x64_sys_prlimit64";
+    prlimit64_kprobe.entry_handler = entry_handler_prlimit64;
+    prlimit64_kprobe.handler = ret_handler_prlimit64;
+    prlimit64_kprobe.data_size = sizeof(struct prlimit_kretprobe_data);
+    prlimit64_kprobe.maxactive = 64;
+    ret = register_kretprobe(&prlimit64_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for prlimit64, returned %d\n", ret   );
+
+    memset(&prctl_kprobe, 0, sizeof(prctl_kprobe));
+    prctl_kprobe.kp.symbol_name = "__x64_sys_prctl";
+    prctl_kprobe.entry_handler = entry_handler_prctl;
+    prctl_kprobe.handler = ret_handler_prctl;
+    prctl_kprobe.data_size = sizeof(struct prctl_kretprobe_data);
+    prctl_kprobe.maxactive = 64;
+    ret = register_kretprobe(&prctl_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for prctl, returned %d\n", ret);
+
 
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
@@ -3405,6 +3685,11 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&getpid_kprobe);
+    unregister_kretprobe(&gettid_kprobe);
+    unregister_kretprobe(&uname_kprobe);
+    unregister_kretprobe(&prlimit64_kprobe);
+    unregister_kretprobe(&prctl_kprobe);
     unregister_kretprobe(&sendmsg_kprobe);
     unregister_kretprobe(&recvmsg_kprobe);
     unregister_kretprobe(&getsockname_kprobe);
