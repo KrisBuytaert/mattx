@@ -34,7 +34,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 servertestpoll servertestselect dfsatest epolltest
+all: module daemon stub migtest migtest2 migtest3 servertestpoll servertestselect dfsatest epolltest
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -53,6 +53,9 @@ migtest: bin/migtest.c
 migtest2: bin/migtest2.c
 	gcc -o bin/migtest2 bin/migtest2.c
 
+migtest3: bin/migtest3.c
+	gcc -o bin/migtest3 bin/migtest3.c
+
 servertestpoll: bin/servertestpoll.c
 	gcc -o bin/servertestpoll bin/servertestpoll.c
 
@@ -67,12 +70,13 @@ epolltest: bin/epolltest.c
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest
 	rm -f mattxfs/Module.symvers
 
 install:
 	sudo rm -f /usr/local/bin/migtest
 	sudo rm -f /usr/local/bin/migtest2
+	sudo rm -f /usr/local/bin/migtest3
 	sudo rm -f /usr/local/bin/servertestpoll
 	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/mattx-stub
@@ -115,6 +119,7 @@ uninstall:
 	sudo systemctl disable mattx
 	sudo rm -f /usr/local/bin/migtest
 	sudo rm -f /usr/local/bin/migtest2
+	sudo rm -f /usr/local/bin/migtest3
 	sudo rm -f /usr/local/bin/servertestpoll
 	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/dfsatest
