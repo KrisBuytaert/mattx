@@ -87,6 +87,7 @@ install:
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
 	sudo cp -f bin/migtest2 /usr/local/bin/migtest2
+	sudo cp -f bin/migtest3 /usr/local/bin/migtest3
 	sudo cp -f bin/servertestpoll /usr/local/bin/servertestpoll
 	sudo cp -f bin/servertestselect /usr/local/bin/servertestselect
 	sudo cp -f bin/dfsatest /usr/local/bin/dfsatest
