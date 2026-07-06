@@ -3007,6 +3007,126 @@ static void handle_sys_prlimit64_reply(struct mattx_link *link, struct mattx_hea
 
 
 
+// The pread64 kworker
+struct mattx_pread64_kworker_ctx { struct work_struct work; struct mattx_sys_pread64_req req; int target_node; };
+static void mattx_pread64_kworker(struct work_struct *work) {
+    struct mattx_pread64_kworker_ctx *ctx = container_of(work, struct mattx_pread64_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    ssize_t ret_bytes = -EBADF; void *read_buf = NULL;
+
+    if (file) {
+        read_buf = kmalloc(ctx->req.count, GFP_KERNEL);
+        if (read_buf) {
+            loff_t pos = ctx->req.pos;
+            ret_bytes = kernel_read(file, read_buf, ctx->req.count, &pos);
+        } else { ret_bytes = -ENOMEM; }
+        fput(file);
+    }
+
+    size_t reply_size = sizeof(struct mattx_sys_read_reply) + (ret_bytes > 0 ? ret_bytes : 0);
+    struct mattx_sys_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid; reply->bytes_read = ret_bytes; reply->error = (ret_bytes < 0) ? ret_bytes : 0;
+        if (ret_bytes > 0) memcpy(reply->data, read_buf, ret_bytes);
+        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PREAD64_REPLY, reply, reply_size);
+        kfree(reply);
+    }
+    if (read_buf) kfree(read_buf); 
+        kfree(ctx);
+}
+
+static void handle_sys_pread64_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_pread64_req *req = payload;
+    struct mattx_pread64_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_pread64_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// The fcntl & ioctl Deputy Hijack:
+struct mattx_fio_ctx { struct callback_head cb; u32 orig_pid; int fd; int cmd; unsigned long arg; u8 has_ptr; char data[256]; int target_node; bool is_ioctl; };
+static void mattx_fio_cb(struct callback_head *cb) {
+    struct mattx_fio_ctx *ctx = container_of(cb, struct mattx_fio_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs; int ret = -EFAULT;
+    struct mattx_sys_fcntl_reply reply; // Reused for ioctl
+
+    unsigned long user_ptr = task_regs->sp - 256 - 128; // 256 byte scratchpad below redzone
+
+    if (!ctx->has_ptr || copy_to_user((void __user *)user_ptr, ctx->data, 256) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->fd; regs.si = ctx->cmd; regs.dx = ctx->has_ptr ? user_ptr : ctx->arg;
+        
+        if (ctx->is_ioctl && real_sys_ioctl) ret = real_sys_ioctl(&regs);
+        else if (!ctx->is_ioctl && real_sys_fcntl) ret = real_sys_fcntl(&regs);
+    }
+
+    reply.orig_pid = ctx->orig_pid; reply.error = ret;
+    if (ctx->has_ptr) {
+        if (copy_from_user(reply.data, (void __user *)user_ptr, 256)) {
+            mattx_dbg("[HIJACK] Warning: Failed to read fcntl/ioctl data from user-space!\n");
+        }
+    }
+    
+    u32 msg_type = ctx->is_ioctl ? MATTX_MSG_SYS_IOCTL_REPLY : MATTX_MSG_SYS_FCNTL_REPLY;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], msg_type, &reply, sizeof(reply));
+    
+    kfree(ctx); set_current_state(TASK_STOPPED); schedule();
+}
+
+static void handle_sys_fcntl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_fcntl_req *req = payload; struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_fio_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->cmd = req->cmd; ctx->arg = req->arg; ctx->has_ptr = req->has_ptr; memcpy(ctx->data, req->data, 256); ctx->target_node = hdr->sender_id; ctx->is_ioctl = false;
+            init_task_work(&ctx->cb, mattx_fio_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+static void handle_sys_ioctl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_ioctl_req *req = payload; struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_fio_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->cmd = req->cmd; ctx->arg = req->arg; ctx->has_ptr = req->has_ptr; memcpy(ctx->data, req->data, 256); ctx->target_node = hdr->sender_id; ctx->is_ioctl = true;
+            init_task_work(&ctx->cb, mattx_fio_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+
+static void handle_sys_fio_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_fcntl_reply *reply = payload; // Reused for ioctl
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_read_buf = kmalloc(256, GFP_ATOMIC);
+            if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, reply->data, 256);
+            guest_registry[i].rpc_done = true;
+            if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq);
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+
+
+
+
 
 
 
@@ -4222,6 +4342,17 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_PRLIMIT64_REPLY, handle_sys_prlimit64_reply);
     mattx_register_handler(MATTX_MSG_SYS_PRCTL_REQ, handle_sys_prctl_req);
     mattx_register_handler(MATTX_MSG_SYS_PRCTL_REPLY, handle_sys_generic_int_reply); // Reusing the generic int reply!
+
+    mattx_register_handler(MATTX_MSG_SYS_FCNTL_REPLY, handle_sys_fio_reply);        // Reusing the sys fio reply for fnctl!
+    mattx_register_handler(MATTX_MSG_SYS_FCNTL_REQ, handle_sys_fcntl_req);
+
+    mattx_register_handler(MATTX_MSG_SYS_IOCTL_REPLY, handle_sys_fio_reply);        // Reusing the sys fio reply for ioctl!
+    mattx_register_handler(MATTX_MSG_SYS_IOCTL_REQ, handle_sys_ioctl_req);
+
+    mattx_register_handler(MATTX_MSG_SYS_PREAD64_REPLY, handle_sys_read_reply);     // Reusing the generic read reply!
+    mattx_register_handler(MATTX_MSG_SYS_PREAD64_REQ, handle_sys_pread64_req);
+
+
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }

@@ -169,6 +169,12 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_PRLIMIT64_REPLY,
     MATTX_MSG_SYS_PRCTL_REQ,
     MATTX_MSG_SYS_PRCTL_REPLY,
+    MATTX_MSG_SYS_FCNTL_REQ,
+    MATTX_MSG_SYS_FCNTL_REPLY,
+    MATTX_MSG_SYS_IOCTL_REQ,
+    MATTX_MSG_SYS_IOCTL_REPLY,
+    MATTX_MSG_SYS_PREAD64_REQ,
+    MATTX_MSG_SYS_PREAD64_REPLY,
 };
 
 struct mattx_header {
@@ -582,6 +588,41 @@ struct mattx_sys_prctl_reply {
 };
 
 
+struct mattx_sys_fcntl_req { 
+    u32 orig_pid; int fd; 
+    int cmd; unsigned long arg; 
+    u8 has_ptr; char data[256]; 
+};
+
+struct mattx_sys_fcntl_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[256]; 
+};
+
+struct mattx_sys_ioctl_req { 
+    u32 orig_pid; 
+    int fd; 
+    unsigned int cmd; 
+    unsigned long arg; 
+    u8 has_ptr; 
+    char data[256]; 
+};
+
+struct mattx_sys_ioctl_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[256]; 
+};
+
+struct mattx_sys_pread64_req { 
+    u32 orig_pid; 
+    int fd; 
+    size_t count; 
+    loff_t pos; 
+};
+// Note: We will reuse mattx_sys_read_reply for pread64's reply!
+
 
 
 struct mattx_fake_fd_info {
@@ -716,6 +757,19 @@ struct mattx_rpc_work {
     bool is_prctl;
     int prctl_option;
     unsigned long prctl_arg2, prctl_arg3, prctl_arg4, prctl_arg5;
+
+    // For FCNTL & IOCTL
+    bool is_fcntl;
+    bool is_ioctl;
+    int fcntl_cmd;
+    unsigned int ioctl_cmd;
+    unsigned long ioctl_arg; // Reused for fcntl_arg
+    bool ioctl_has_ptr;      // Reused for fcntl
+    char ioctl_data[256];    // Reused for fcntl
+
+    // For PREAD64
+    bool is_pread64;
+    loff_t pread64_pos;
 };
 
 struct mattx_link {
@@ -980,6 +1034,14 @@ extern mattx_sys_prlimit64_fn real_sys_prlimit64;
 
 typedef long (*mattx_sys_prctl_fn)(const struct pt_regs *regs);
 extern mattx_sys_prctl_fn real_sys_prctl;
+
+typedef long (*mattx_sys_fcntl_fn)(const struct pt_regs *regs);
+extern mattx_sys_fcntl_fn real_sys_fcntl;
+
+typedef long (*mattx_sys_ioctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_ioctl_fn real_sys_ioctl;
+
+
 
 
 // The Extreme Debugging Macro ---

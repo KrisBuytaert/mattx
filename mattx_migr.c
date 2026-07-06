@@ -54,6 +54,8 @@ mattx_sys_dup2_fn real_sys_dup2 = NULL;
 mattx_sys_close_fn real_sys_close = NULL;
 mattx_sys_prlimit64_fn real_sys_prlimit64 = NULL;
 mattx_sys_prctl_fn real_sys_prctl = NULL;
+mattx_sys_fcntl_fn real_sys_fcntl = NULL;
+mattx_sys_ioctl_fn real_sys_ioctl = NULL;
 
 
 
@@ -219,6 +221,21 @@ static void mattx_resolve_hidden_symbols(void) {
         real_sys_prctl = (mattx_sys_prctl_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_fcntl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_fcntl = (mattx_sys_fcntl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_ioctl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_ioctl = (mattx_sys_ioctl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
 
 }
 
