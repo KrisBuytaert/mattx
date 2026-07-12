@@ -537,6 +537,29 @@ static void mattx_rpc_worker(struct work_struct *work) {
         struct mattx_sys_pread64_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .count = min_t(size_t, rpc->len, 4096), .pos = rpc->pread64_pos };
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PREAD64_REQ, &req, sizeof(req));
 
+    } else if (rpc->is_statfs) {
+        struct mattx_sys_statfs_req req = { .orig_pid = rpc->orig_pid }; strncpy(req.path, rpc->meta_path, 255);
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_STATFS_REQ, &req, sizeof(req));
+    
+    } else if (rpc->is_fstatfs) {
+        struct mattx_sys_fstatfs_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->meta_dfd };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_FSTATFS_REQ, &req, sizeof(req));
+    
+    } else if (rpc->is_newfstatat) {
+        struct mattx_sys_newfstatat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .flags = rpc->meta_flags }; strncpy(req.path, rpc->meta_path, 255);
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_NEWFSTATAT_REQ, &req, sizeof(req));
+    
+    } else if (rpc->is_faccessat2) {
+        struct mattx_sys_faccessat2_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .mode = rpc->meta_mode, .flags = rpc->meta_flags }; strncpy(req.path, rpc->meta_path, 255);
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_FACCESSAT2_REQ, &req, sizeof(req));
+    
+    } else if (rpc->is_readlink) {
+        struct mattx_sys_readlink_req req = { .orig_pid = rpc->orig_pid, .bufsiz = rpc->meta_bufsiz }; strncpy(req.path, rpc->meta_path, 255);
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_READLINK_REQ, &req, sizeof(req));
+    
+    } else if (rpc->is_readlinkat) {
+        struct mattx_sys_readlinkat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .bufsiz = rpc->meta_bufsiz }; strncpy(req.path, rpc->meta_path, 255);
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_READLINKAT_REQ, &req, sizeof(req));
 
     
 
@@ -1295,9 +1318,33 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 if (read_buf) kfree(read_buf);
                 if (regs) regs->ax = ret_bytes;
 
+            // --- META AWAKENING ---
+            } else if (rpc->is_statfs || rpc->is_fstatfs || rpc->is_newfstatat || rpc->is_faccessat2 || rpc->is_readlink || rpc->is_readlinkat) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR; void *read_buf = NULL; size_t datalen = 0;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) { 
+                            error = guest_registry[i].rpc_fsync_res; 
+                            datalen = guest_registry[i].rpc_lseek_res; // Reused for datalen
+                            read_buf = guest_registry[i].rpc_read_buf; 
+                        }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                
+                if (error >= 0 && read_buf && datalen > 0 && rpc->meta_buf_ptr) {
+                    if (access_process_vm(surrogate, (unsigned long)rpc->meta_buf_ptr, read_buf, datalen, FOLL_WRITE | FOLL_FORCE) != datalen) error = -EFAULT;
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
 
 
 
+
+                
 
             // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
             } else if (remote_fd >= 0) {
@@ -3495,6 +3542,244 @@ static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *re
 
 
 
+// --- BATCH 2.2: DEDICATED METADATA FETCHERS ---
+static struct kretprobe statfs_kprobe, fstatfs_kprobe, newfstatat_kprobe, faccessat2_kprobe, readlink_kprobe, readlinkat_kprobe;
+
+struct statfs_kretprobe_data { const char __user *path; void __user *buf; };
+static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
+        data->path = (const char __user *)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
+        SYSCALL_REGS(regs)->di = 0; // Sabotage
+    }
+    return 0;
+}
+
+static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_statfs = true; rpc->meta_buf_ptr = data->buf;
+            if (data->path) {
+                if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
+                    mattx_dbg("[HOOK] Warning: Failed to read path for statfs!\n");
+                }
+            }
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+
+struct fstatfs_kretprobe_data { int fd; void __user *buf; };
+static int entry_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
+        data->fd = (int)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
+        SYSCALL_REGS(regs)->di = -1; // Sabotage
+    }
+    return 0;
+}
+
+static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_fstatfs = true; rpc->meta_dfd = data->fd; rpc->meta_buf_ptr = data->buf;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user *buf; int flags; };
+static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
+        data->dfd = (int)SYSCALL_REGS(regs)->di; data->path = (const char __user *)SYSCALL_REGS(regs)->si;
+        data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
+        SYSCALL_REGS(regs)->di = -1; // Sabotage
+    }
+    return 0;
+}
+
+static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_newfstatat = true; rpc->meta_dfd = data->dfd; rpc->meta_flags = data->flags; rpc->meta_buf_ptr = data->buf;
+            if (data->path) {
+                if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
+                    mattx_dbg("[HOOK] Warning: Failed to read path for newfstatat!\n");
+                }
+            }
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; int flags; };
+static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
+        data->dfd = (int)SYSCALL_REGS(regs)->di; data->path = (const char __user *)SYSCALL_REGS(regs)->si;
+        data->mode = (int)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
+        SYSCALL_REGS(regs)->di = -1; // Sabotage
+    }
+    return 0;
+}
+
+static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_faccessat2 = true; rpc->meta_dfd = data->dfd; rpc->meta_mode = data->mode; rpc->meta_flags = data->flags;
+            if (data->path) {
+                if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
+                    mattx_dbg("[HOOK] Warning: Failed to read path for faccessat2!\n");
+                }
+            }
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+struct readlink_kretprobe_data { const char __user *path; void __user *buf; size_t bufsiz; };
+static int entry_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
+        data->path = (const char __user *)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
+        data->bufsiz = (size_t)SYSCALL_REGS(regs)->dx;
+        SYSCALL_REGS(regs)->di = 0; // Sabotage
+    }
+    return 0;
+}
+
+static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_readlink = true; rpc->meta_bufsiz = data->bufsiz; rpc->meta_buf_ptr = data->buf;
+            if (data->path) {
+                if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
+                    mattx_dbg("[HOOK] Warning: Failed to read path for readlink!\n");
+                }
+            }
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user *buf; size_t bufsiz; };
+static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
+        data->dfd = (int)SYSCALL_REGS(regs)->di; data->path = (const char __user *)SYSCALL_REGS(regs)->si;
+        data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->bufsiz = (size_t)SYSCALL_REGS(regs)->r10;
+        SYSCALL_REGS(regs)->di = -1; // Sabotage
+    }
+    return 0;
+}
+
+static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_readlinkat = true; rpc->meta_dfd = data->dfd; rpc->meta_bufsiz = data->bufsiz; rpc->meta_buf_ptr = data->buf;
+            if (data->path) {
+                if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
+                    mattx_dbg("[HOOK] Warning: Failed to read path for readlinkat!\n");
+                }
+            }
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+
 
 
 // --- KPROBE REGISTRATION ---
@@ -3863,12 +4148,72 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&pread64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pread64, returned %d\n", ret);
 
+    memset(&statfs_kprobe, 0, sizeof(statfs_kprobe)); 
+    statfs_kprobe.kp.symbol_name = "__x64_sys_statfs"; 
+    statfs_kprobe.entry_handler = entry_handler_statfs; 
+    statfs_kprobe.handler = ret_handler_statfs; 
+    statfs_kprobe.data_size = sizeof(struct statfs_kretprobe_data); 
+    statfs_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&statfs_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statfs, returned %d\n", ret);
+
+    memset(&fstatfs_kprobe, 0, sizeof(fstatfs_kprobe)); 
+    fstatfs_kprobe.kp.symbol_name = "__x64_sys_fstatfs"; 
+    fstatfs_kprobe.entry_handler = entry_handler_fstatfs; 
+    fstatfs_kprobe.handler = ret_handler_fstatfs; 
+    fstatfs_kprobe.data_size = sizeof(struct fstatfs_kretprobe_data); 
+    fstatfs_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&fstatfs_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fstatfs, returned %d\n", ret);
+
+    memset(&newfstatat_kprobe, 0, sizeof(newfstatat_kprobe)); 
+    newfstatat_kprobe.kp.symbol_name = "__x64_sys_newfstatat"; 
+    newfstatat_kprobe.entry_handler = entry_handler_newfstatat; 
+    newfstatat_kprobe.handler = ret_handler_newfstatat; 
+    newfstatat_kprobe.data_size = sizeof(struct newfstatat_kretprobe_data); 
+    newfstatat_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&newfstatat_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for newfstatat, returned %d\n", ret);
+
+    memset(&faccessat2_kprobe, 0, sizeof(faccessat2_kprobe)); 
+    faccessat2_kprobe.kp.symbol_name = "__x64_sys_faccessat2"; 
+    faccessat2_kprobe.entry_handler = entry_handler_faccessat2; 
+    faccessat2_kprobe.handler = ret_handler_faccessat2; 
+    faccessat2_kprobe.data_size = sizeof(struct faccessat2_kretprobe_data); 
+    faccessat2_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&faccessat2_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for faccessat2, returned %d\n", ret);
+
+    memset(&readlink_kprobe, 0, sizeof(readlink_kprobe)); 
+    readlink_kprobe.kp.symbol_name = "__x64_sys_readlink"; 
+    readlink_kprobe.entry_handler = entry_handler_readlink; 
+    readlink_kprobe.handler = ret_handler_readlink; 
+    readlink_kprobe.data_size = sizeof(struct readlink_kretprobe_data); 
+    readlink_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&readlink_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlink, returned %d\n", ret);
+
+    memset(&readlinkat_kprobe, 0, sizeof(readlinkat_kprobe)); 
+    readlinkat_kprobe.kp.symbol_name = "__x64_sys_readlinkat"; 
+    readlinkat_kprobe.entry_handler = entry_handler_readlinkat; 
+    readlinkat_kprobe.handler = ret_handler_readlinkat; 
+    readlinkat_kprobe.data_size = sizeof(struct readlinkat_kretprobe_data); 
+    readlinkat_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&readlinkat_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlinkat, returned %d\n", ret);
+
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&statfs_kprobe);
+    unregister_kretprobe(&fstatfs_kprobe);
+    unregister_kretprobe(&newfstatat_kprobe);
+    unregister_kretprobe(&faccessat2_kprobe);
+    unregister_kretprobe(&readlink_kprobe);
+    unregister_kretprobe(&readlinkat_kprobe);
     unregister_kretprobe(&fcntl_kprobe);
     unregister_kretprobe(&ioctl_kprobe);
     unregister_kretprobe(&pread64_kprobe);

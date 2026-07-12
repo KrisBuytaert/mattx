@@ -55,7 +55,8 @@
 #include <linux/kprobes.h>       
 #include <linux/workqueue.h>     
 #include <linux/bitops.h>        
-#include <linux/stat.h>          
+#include <linux/stat.h>
+#include <linux/statfs.h>          
 #include <linux/version.h>
 #include <linux/time64.h> // Ensure we have time64_t
 #include <linux/task_work.h>
@@ -175,6 +176,18 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_IOCTL_REPLY,
     MATTX_MSG_SYS_PREAD64_REQ,
     MATTX_MSG_SYS_PREAD64_REPLY,
+    MATTX_MSG_SYS_STATFS_REQ, 
+    MATTX_MSG_SYS_STATFS_REPLY,
+    MATTX_MSG_SYS_FSTATFS_REQ, 
+    MATTX_MSG_SYS_FSTATFS_REPLY,
+    MATTX_MSG_SYS_NEWFSTATAT_REQ, 
+    MATTX_MSG_SYS_NEWFSTATAT_REPLY,
+    MATTX_MSG_SYS_FACCESSAT2_REQ, 
+    MATTX_MSG_SYS_FACCESSAT2_REPLY,
+    MATTX_MSG_SYS_READLINK_REQ, 
+    MATTX_MSG_SYS_READLINK_REPLY,
+    MATTX_MSG_SYS_READLINKAT_REQ, 
+    MATTX_MSG_SYS_READLINKAT_REPLY,
 };
 
 struct mattx_header {
@@ -623,6 +636,77 @@ struct mattx_sys_pread64_req {
 };
 // Note: We will reuse mattx_sys_read_reply for pread64's reply!
 
+struct mattx_sys_statfs_req { 
+    u32 orig_pid; 
+    char path[256]; 
+};
+
+struct mattx_sys_statfs_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct statfs buf; 
+};
+
+struct mattx_sys_fstatfs_req { 
+    u32 orig_pid; 
+    int fd; 
+};
+
+struct mattx_sys_fstatfs_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct statfs buf; 
+};
+
+struct mattx_sys_newfstatat_req { 
+    u32 orig_pid; 
+    int dfd; 
+    int flags; 
+    char path[256]; 
+};
+struct mattx_sys_newfstatat_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct stat buf; 
+};
+
+struct mattx_sys_faccessat2_req { 
+    u32 orig_pid; 
+    int dfd; 
+    int mode; 
+    int flags; 
+    char path[256]; 
+};
+struct mattx_sys_faccessat2_reply { 
+    u32 orig_pid; 
+    int error; 
+};
+
+struct mattx_sys_readlink_req { 
+    u32 orig_pid; 
+    size_t bufsiz; 
+    char path[256]; 
+};
+struct mattx_sys_readlink_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[]; 
+};
+
+struct mattx_sys_readlinkat_req { 
+    u32 orig_pid; 
+    int dfd; 
+    size_t bufsiz; 
+    char path[256]; 
+};
+struct mattx_sys_readlinkat_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[]; 
+};
+
+
+
 
 
 struct mattx_fake_fd_info {
@@ -770,6 +854,14 @@ struct mattx_rpc_work {
     // For PREAD64
     bool is_pread64;
     loff_t pread64_pos;
+
+    // For META FETCHERS (Microstep 2.2)
+    bool is_statfs, is_fstatfs, is_newfstatat, is_faccessat2, is_readlink, is_readlinkat;
+    int meta_dfd, meta_flags, meta_mode;
+    size_t meta_bufsiz;
+    char meta_path[256];
+    void __user *meta_buf_ptr;
+
 };
 
 struct mattx_link {
@@ -1041,7 +1133,23 @@ extern mattx_sys_fcntl_fn real_sys_fcntl;
 typedef long (*mattx_sys_ioctl_fn)(const struct pt_regs *regs);
 extern mattx_sys_ioctl_fn real_sys_ioctl;
 
+typedef long (*mattx_sys_statfs_fn)(const struct pt_regs *regs);
+extern mattx_sys_statfs_fn real_sys_statfs;
 
+typedef long (*mattx_sys_fstatfs_fn)(const struct pt_regs *regs);
+extern mattx_sys_fstatfs_fn real_sys_fstatfs;
+
+typedef long (*mattx_sys_newfstatat_fn)(const struct pt_regs *regs);
+extern mattx_sys_newfstatat_fn real_sys_newfstatat;
+
+typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
+extern mattx_sys_faccessat2_fn real_sys_faccessat2;
+
+typedef long (*mattx_sys_readlink_fn)(const struct pt_regs *regs);
+extern mattx_sys_readlink_fn real_sys_readlink;
+
+typedef long (*mattx_sys_readlinkat_fn)(const struct pt_regs *regs);
+extern mattx_sys_readlinkat_fn real_sys_readlinkat;
 
 
 // The Extreme Debugging Macro ---

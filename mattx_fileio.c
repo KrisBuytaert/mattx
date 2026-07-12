@@ -66,6 +66,55 @@ static void mattx_revert_creds(const struct cred *old_cred, struct cred *new_cre
     if (new_cred) put_cred(new_cred);
 }
 
+// --- THE IDENTITY THEFT HELPER ---
+static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs, const char *path, int path_reg, void *out_buf, size_t out_size, int buf_reg) {
+    int ret = -ESRCH;
+    if (!deputy) return ret;
+
+    kthread_use_mm(deputy->mm);
+    struct fs_struct *old_fs = current->fs;
+    struct files_struct *old_files = current->files;
+    const struct cred *old_cred = override_creds(deputy->cred);
+    
+    current->fs = deputy->fs;
+    current->files = deputy->files;
+
+    unsigned long scratchpad = task_pt_regs(deputy)->sp - 8192; 
+    unsigned long path_ptr = scratchpad;
+    unsigned long buf_ptr = scratchpad + 4096;
+
+    if (path) {
+        if (copy_to_user((void __user *)path_ptr, path, strlen(path) + 1)) {
+            ret = -EFAULT;
+            goto out;
+        }
+        if (path_reg == 1) regs->di = path_ptr;
+        else if (path_reg == 2) regs->si = path_ptr;
+    }
+
+    if (out_buf && out_size > 0) {
+        if (buf_reg == 2) regs->si = buf_ptr;
+        else if (buf_reg == 3) regs->dx = buf_ptr;
+    }
+
+    ret = syscall_fn(regs);
+
+    if (ret >= 0 && out_buf && out_size > 0) {
+        if (copy_from_user(out_buf, (void __user *)buf_ptr, out_size)) {
+            mattx_dbg("[KWORKER] Warning: Failed to read out_buf from scratchpad!\n");
+        }
+    }
+
+out:
+    current->fs = old_fs;
+    current->files = old_files;
+    revert_creds(old_cred);
+    kthread_unuse_mm(deputy->mm);
+
+    return ret;
+}
+
+
 // Global File Table for MattXFS ---
 // This holds the real files opened on behalf of remote MattXFS clients
 static struct file *mfs_open_files[MAX_FDS];
@@ -3123,6 +3172,227 @@ static void handle_sys_fio_reply(struct mattx_link *link, struct mattx_header *h
 }
 
 
+// --- STATFS ---
+struct mattx_statfs_kworker_ctx { struct work_struct work; struct mattx_sys_statfs_req req; int target_node; };
+static void mattx_statfs_kworker(struct work_struct *work) {
+    struct mattx_statfs_kworker_ctx *ctx = container_of(work, struct mattx_statfs_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; void *out_buf = kmalloc(sizeof(struct statfs), GFP_KERNEL);
+    struct task_struct *deputy = NULL;
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_statfs) ret = mattx_execute_as_deputy(deputy, real_sys_statfs, &regs, ctx->req.path, 1, out_buf, sizeof(struct statfs), 2);
+    if (deputy) put_task_struct(deputy);
+
+    struct mattx_sys_statfs_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (ret == 0 && out_buf) memcpy(&reply.buf, out_buf, sizeof(struct statfs));
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_STATFS_REPLY, &reply, sizeof(reply));
+    if (out_buf) kfree(out_buf); 
+        kfree(ctx);
+}
+static void handle_sys_statfs_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_statfs_req *req = payload; struct mattx_statfs_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_statfs_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_statfs_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_statfs_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error; guest_registry[i].rpc_lseek_res = sizeof(struct statfs);
+            if (reply->error == 0) { guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct statfs), GFP_ATOMIC); if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, &reply->buf, sizeof(struct statfs)); }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+// --- FSTATFS ---
+struct mattx_fstatfs_kworker_ctx { struct work_struct work; struct mattx_sys_fstatfs_req req; int target_node; };
+static void mattx_fstatfs_kworker(struct work_struct *work) {
+    struct mattx_fstatfs_kworker_ctx *ctx = container_of(work, struct mattx_fstatfs_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; void *out_buf = kmalloc(sizeof(struct statfs), GFP_KERNEL);
+    struct task_struct *deputy = NULL;
+
+    regs.di = ctx->req.fd;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_fstatfs) ret = mattx_execute_as_deputy(deputy, real_sys_fstatfs, &regs, NULL, 0, out_buf, sizeof(struct statfs), 2);
+    if (deputy) put_task_struct(deputy);
+
+    struct mattx_sys_fstatfs_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (ret == 0 && out_buf) memcpy(&reply.buf, out_buf, sizeof(struct statfs));
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_FSTATFS_REPLY, &reply, sizeof(reply));
+    if (out_buf) kfree(out_buf); 
+        kfree(ctx);
+}
+static void handle_sys_fstatfs_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_fstatfs_req *req = payload; struct mattx_fstatfs_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_fstatfs_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_fstatfs_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_fstatfs_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error; guest_registry[i].rpc_lseek_res = sizeof(struct statfs);
+            if (reply->error == 0) { guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct statfs), GFP_ATOMIC); if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, &reply->buf, sizeof(struct statfs)); }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+// --- NEWFSTATAT ---
+struct mattx_newfstatat_kworker_ctx { struct work_struct work; struct mattx_sys_newfstatat_req req; int target_node; };
+static void mattx_newfstatat_kworker(struct work_struct *work) {
+    struct mattx_newfstatat_kworker_ctx *ctx = container_of(work, struct mattx_newfstatat_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; void *out_buf = kmalloc(sizeof(struct stat), GFP_KERNEL);
+    struct task_struct *deputy = NULL;
+
+    regs.di = ctx->req.dfd; regs.r10 = ctx->req.flags;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_newfstatat) ret = mattx_execute_as_deputy(deputy, real_sys_newfstatat, &regs, ctx->req.path, 2, out_buf, sizeof(struct stat), 3);
+    if (deputy) put_task_struct(deputy);
+
+    struct mattx_sys_newfstatat_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (ret == 0 && out_buf) memcpy(&reply.buf, out_buf, sizeof(struct stat));
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_NEWFSTATAT_REPLY, &reply, sizeof(reply));
+    if (out_buf) kfree(out_buf); 
+        kfree(ctx);
+}
+static void handle_sys_newfstatat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_newfstatat_req *req = payload; struct mattx_newfstatat_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_newfstatat_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_newfstatat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_newfstatat_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error; guest_registry[i].rpc_lseek_res = sizeof(struct stat);
+            if (reply->error == 0) { guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct stat), GFP_ATOMIC); if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, &reply->buf, sizeof(struct stat)); }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+// --- FACCESSAT2 ---
+struct mattx_faccessat2_kworker_ctx { struct work_struct work; struct mattx_sys_faccessat2_req req; int target_node; };
+static void mattx_faccessat2_kworker(struct work_struct *work) {
+    struct mattx_faccessat2_kworker_ctx *ctx = container_of(work, struct mattx_faccessat2_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+
+    regs.di = ctx->req.dfd; regs.dx = ctx->req.mode; regs.r10 = ctx->req.flags;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_faccessat2) ret = mattx_execute_as_deputy(deputy, real_sys_faccessat2, &regs, ctx->req.path, 2, NULL, 0, 0);
+    if (deputy) put_task_struct(deputy);
+
+    struct mattx_sys_faccessat2_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_FACCESSAT2_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_faccessat2_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_faccessat2_req *req = payload; struct mattx_faccessat2_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_faccessat2_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- READLINK ---
+struct mattx_readlink_kworker_ctx { struct work_struct work; struct mattx_sys_readlink_req req; int target_node; };
+static void mattx_readlink_kworker(struct work_struct *work) {
+    struct mattx_readlink_kworker_ctx *ctx = container_of(work, struct mattx_readlink_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; size_t bufsiz = min_t(size_t, ctx->req.bufsiz, 4096);
+    void *out_buf = kmalloc(bufsiz, GFP_KERNEL); struct task_struct *deputy = NULL;
+
+    regs.dx = bufsiz;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_readlink) ret = mattx_execute_as_deputy(deputy, real_sys_readlink, &regs, ctx->req.path, 1, out_buf, bufsiz, 2);
+    if (deputy) put_task_struct(deputy);
+
+    size_t copy_len = (ret > 0) ? ret : 0;
+    size_t rsize = sizeof(struct mattx_sys_readlink_reply) + copy_len;
+    struct mattx_sys_readlink_reply *reply = kzalloc(rsize, GFP_KERNEL);
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid; reply->error = ret;
+        if (copy_len > 0 && out_buf) memcpy(reply->data, out_buf, copy_len);
+        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_READLINK_REPLY, reply, rsize);
+        kfree(reply);
+    }
+    if (out_buf) kfree(out_buf); 
+        kfree(ctx);
+}
+static void handle_sys_readlink_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_readlink_req *req = payload; struct mattx_readlink_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_readlink_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_readlink_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_readlink_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error; guest_registry[i].rpc_lseek_res = (reply->error > 0) ? reply->error : 0;
+            if (reply->error > 0) { guest_registry[i].rpc_read_buf = kmalloc(reply->error, GFP_ATOMIC); if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, reply->data, reply->error); }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+// --- READLINKAT ---
+struct mattx_readlinkat_kworker_ctx { struct work_struct work; struct mattx_sys_readlinkat_req req; int target_node; };
+static void mattx_readlinkat_kworker(struct work_struct *work) {
+    struct mattx_readlinkat_kworker_ctx *ctx = container_of(work, struct mattx_readlinkat_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; size_t bufsiz = min_t(size_t, ctx->req.bufsiz, 4096);
+    void *out_buf = kmalloc(bufsiz, GFP_KERNEL); struct task_struct *deputy = NULL;
+
+    regs.di = ctx->req.dfd; regs.r10 = bufsiz;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_readlinkat) ret = mattx_execute_as_deputy(deputy, real_sys_readlinkat, &regs, ctx->req.path, 2, out_buf, bufsiz, 3);
+    if (deputy) put_task_struct(deputy);
+
+    size_t copy_len = (ret > 0) ? ret : 0;
+    size_t rsize = sizeof(struct mattx_sys_readlinkat_reply) + copy_len;
+    struct mattx_sys_readlinkat_reply *reply = kzalloc(rsize, GFP_KERNEL);
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid; reply->error = ret;
+        if (copy_len > 0 && out_buf) memcpy(reply->data, out_buf, copy_len);
+        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_READLINKAT_REPLY, reply, rsize);
+        kfree(reply);
+    }
+    if (out_buf) kfree(out_buf); 
+        kfree(ctx);
+}
+static void handle_sys_readlinkat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_readlinkat_req *req = payload; struct mattx_readlinkat_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_readlinkat_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_readlinkat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_readlinkat_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error; guest_registry[i].rpc_lseek_res = (reply->error > 0) ? reply->error : 0;
+            if (reply->error > 0) { guest_registry[i].rpc_read_buf = kmalloc(reply->error, GFP_ATOMIC); if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, reply->data, reply->error); }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+
+
+
 
 
 
@@ -4342,17 +4612,24 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_PRLIMIT64_REPLY, handle_sys_prlimit64_reply);
     mattx_register_handler(MATTX_MSG_SYS_PRCTL_REQ, handle_sys_prctl_req);
     mattx_register_handler(MATTX_MSG_SYS_PRCTL_REPLY, handle_sys_generic_int_reply); // Reusing the generic int reply!
-
     mattx_register_handler(MATTX_MSG_SYS_FCNTL_REPLY, handle_sys_fio_reply);        // Reusing the sys fio reply for fnctl!
     mattx_register_handler(MATTX_MSG_SYS_FCNTL_REQ, handle_sys_fcntl_req);
-
     mattx_register_handler(MATTX_MSG_SYS_IOCTL_REPLY, handle_sys_fio_reply);        // Reusing the sys fio reply for ioctl!
     mattx_register_handler(MATTX_MSG_SYS_IOCTL_REQ, handle_sys_ioctl_req);
-
     mattx_register_handler(MATTX_MSG_SYS_PREAD64_REPLY, handle_sys_read_reply);     // Reusing the generic read reply!
     mattx_register_handler(MATTX_MSG_SYS_PREAD64_REQ, handle_sys_pread64_req);
-
-
+    mattx_register_handler(MATTX_MSG_SYS_STATFS_REQ, handle_sys_statfs_req);
+    mattx_register_handler(MATTX_MSG_SYS_STATFS_REPLY, handle_sys_statfs_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FSTATFS_REQ, handle_sys_fstatfs_req);
+    mattx_register_handler(MATTX_MSG_SYS_FSTATFS_REPLY, handle_sys_fstatfs_reply);
+    mattx_register_handler(MATTX_MSG_SYS_NEWFSTATAT_REQ, handle_sys_newfstatat_req);
+    mattx_register_handler(MATTX_MSG_SYS_NEWFSTATAT_REPLY, handle_sys_newfstatat_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FACCESSAT2_REQ, handle_sys_faccessat2_req);
+    mattx_register_handler(MATTX_MSG_SYS_FACCESSAT2_REPLY, handle_sys_generic_int_reply);   // Reusing the generic int reply for faccessat2!
+    mattx_register_handler(MATTX_MSG_SYS_READLINK_REQ, handle_sys_readlink_req);
+    mattx_register_handler(MATTX_MSG_SYS_READLINK_REPLY, handle_sys_readlink_reply);
+    mattx_register_handler(MATTX_MSG_SYS_READLINKAT_REQ, handle_sys_readlinkat_req);
+    mattx_register_handler(MATTX_MSG_SYS_READLINKAT_REPLY, handle_sys_readlinkat_reply);
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }
