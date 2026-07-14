@@ -3589,7 +3589,10 @@ struct fstatfs_kretprobe_data { int fd; void __user *buf; };
 static int entry_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
-        data->fd = (int)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
+        int local_fd = (int)SYSCALL_REGS(regs)->di;
+        data->fd = local_fd;
+        if (local_fd >= 0) is_wormhole_fd(local_fd, &data->fd); // Translate to Remote FD!
+        data->buf = (void __user *)SYSCALL_REGS(regs)->si;
         SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
     return 0;
@@ -3623,7 +3626,10 @@ struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user
 static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
-        data->dfd = (int)SYSCALL_REGS(regs)->di; data->path = (const char __user *)SYSCALL_REGS(regs)->si;
+        int local_dfd = (int)SYSCALL_REGS(regs)->di;
+        data->dfd = local_dfd;
+        if (local_dfd >= 0) is_wormhole_fd(local_dfd, &data->dfd); // Translate to Remote FD!
+        data->path = (const char __user *)SYSCALL_REGS(regs)->si;
         data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
         SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
@@ -3663,7 +3669,10 @@ struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; i
 static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
-        data->dfd = (int)SYSCALL_REGS(regs)->di; data->path = (const char __user *)SYSCALL_REGS(regs)->si;
+        int local_dfd = (int)SYSCALL_REGS(regs)->di;
+        data->dfd = local_dfd;
+        if (local_dfd >= 0) is_wormhole_fd(local_dfd, &data->dfd); // Translate to Remote FD!
+        data->path = (const char __user *)SYSCALL_REGS(regs)->si;
         data->mode = (int)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
         SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
@@ -3743,7 +3752,10 @@ struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user
 static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
-        data->dfd = (int)SYSCALL_REGS(regs)->di; data->path = (const char __user *)SYSCALL_REGS(regs)->si;
+        int local_dfd = (int)SYSCALL_REGS(regs)->di;
+        data->dfd = local_dfd;
+        if (local_dfd >= 0) is_wormhole_fd(local_dfd, &data->dfd); // Translate to Remote FD!
+        data->path = (const char __user *)SYSCALL_REGS(regs)->si;
         data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->bufsiz = (size_t)SYSCALL_REGS(regs)->r10;
         SYSCALL_REGS(regs)->di = -1; // Sabotage
     }

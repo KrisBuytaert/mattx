@@ -66,8 +66,9 @@ static void mattx_revert_creds(const struct cred *old_cred, struct cred *new_cre
     if (new_cred) put_cred(new_cred);
 }
 
+
 // --- THE IDENTITY THEFT HELPER ---
-static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs, const char *path, int path_reg, void *out_buf, size_t out_size, int buf_reg) {
+static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs, const char *path, int path_reg, void *out_buf, size_t out_size, int buf_reg, int fd_to_map, int fd_reg) {
     int ret = -ESRCH;
     if (!deputy) return ret;
 
@@ -97,7 +98,53 @@ static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn
         else if (buf_reg == 3) regs->dx = buf_ptr;
     }
 
+    int temp_fd = -1;
+    struct file *mapped_file = NULL;
+
+    // --- THE MATTXFS FD IMPLANT ---
+    // If the FD is >= 1000, it's in the export registry. Raw syscalls can't see it!
+    // We temporarily implant it into the Deputy's native FD table.
+    if (fd_to_map >= 1000) {
+        mapped_file = mattx_get_remote_file(deputy->pid, fd_to_map);
+        if (mapped_file) {
+            spin_lock(&deputy->files->file_lock);
+            struct fdtable *fdt = files_fdtable(deputy->files);
+            for (int j = 3; j < fdt->max_fds; j++) {
+                if (!rcu_dereference_raw(fdt->fd[j])) {
+                    rcu_assign_pointer(fdt->fd[j], mapped_file);
+                    __set_bit(j, fdt->open_fds);
+                    temp_fd = j;
+                    break;
+                }
+            }
+            spin_unlock(&deputy->files->file_lock);
+            
+            if (temp_fd >= 0) {
+                if (fd_reg == 1) regs->di = temp_fd;
+                else if (fd_reg == 2) regs->si = temp_fd;
+            } else {
+                fput(mapped_file);
+                ret = -EMFILE;
+                goto out;
+            }
+        } else {
+            ret = -EBADF;
+            goto out;
+        }
+    }
+
     ret = syscall_fn(regs);
+
+    // Clean up the temporary implant!
+    if (temp_fd >= 0) {
+        spin_lock(&deputy->files->file_lock);
+        struct fdtable *fdt = files_fdtable(deputy->files);
+        rcu_assign_pointer(fdt->fd[temp_fd], NULL);
+        __clear_bit(temp_fd, fdt->open_fds);
+        spin_unlock(&deputy->files->file_lock);
+        fput(mapped_file); // Release the FD table reference
+        fput(mapped_file); // Release the mattx_get_remote_file reference
+    }
 
     if (ret >= 0 && out_buf && out_size > 0) {
         if (copy_from_user(out_buf, (void __user *)buf_ptr, out_size)) {
@@ -3181,7 +3228,9 @@ static void mattx_statfs_kworker(struct work_struct *work) {
     struct task_struct *deputy = NULL;
 
     rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (real_sys_statfs) ret = mattx_execute_as_deputy(deputy, real_sys_statfs, &regs, ctx->req.path, 1, out_buf, sizeof(struct statfs), 2);
+    if (real_sys_statfs) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_statfs, &regs, ctx->req.path, 1, out_buf, sizeof(struct statfs), 2, -1, 0);
+    }    
     if (deputy) put_task_struct(deputy);
 
     struct mattx_sys_statfs_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
@@ -3218,7 +3267,9 @@ static void mattx_fstatfs_kworker(struct work_struct *work) {
 
     regs.di = ctx->req.fd;
     rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (real_sys_fstatfs) ret = mattx_execute_as_deputy(deputy, real_sys_fstatfs, &regs, NULL, 0, out_buf, sizeof(struct statfs), 2);
+    if (real_sys_fstatfs) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_fstatfs, &regs, NULL, 0, out_buf, sizeof(struct statfs), 2, ctx->req.fd, 1);
+    }
     if (deputy) put_task_struct(deputy);
 
     struct mattx_sys_fstatfs_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
@@ -3255,7 +3306,9 @@ static void mattx_newfstatat_kworker(struct work_struct *work) {
 
     regs.di = ctx->req.dfd; regs.r10 = ctx->req.flags;
     rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (real_sys_newfstatat) ret = mattx_execute_as_deputy(deputy, real_sys_newfstatat, &regs, ctx->req.path, 2, out_buf, sizeof(struct stat), 3);
+    if (real_sys_newfstatat) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_newfstatat, &regs, ctx->req.path, 2, out_buf, sizeof(struct stat), 3, ctx->req.dfd, 1);
+    } 
     if (deputy) put_task_struct(deputy);
 
     struct mattx_sys_newfstatat_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
@@ -3291,7 +3344,9 @@ static void mattx_faccessat2_kworker(struct work_struct *work) {
 
     regs.di = ctx->req.dfd; regs.dx = ctx->req.mode; regs.r10 = ctx->req.flags;
     rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (real_sys_faccessat2) ret = mattx_execute_as_deputy(deputy, real_sys_faccessat2, &regs, ctx->req.path, 2, NULL, 0, 0);
+    if (real_sys_faccessat2) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_faccessat2, &regs, ctx->req.path, 2, NULL, 0, 0, ctx->req.dfd, 1);
+    }
     if (deputy) put_task_struct(deputy);
 
     struct mattx_sys_faccessat2_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
@@ -3313,7 +3368,9 @@ static void mattx_readlink_kworker(struct work_struct *work) {
 
     regs.dx = bufsiz;
     rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (real_sys_readlink) ret = mattx_execute_as_deputy(deputy, real_sys_readlink, &regs, ctx->req.path, 1, out_buf, bufsiz, 2);
+    if (real_sys_readlink) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_readlink, &regs, ctx->req.path, 1, out_buf, bufsiz, 2, -1, 0);
+    }
     if (deputy) put_task_struct(deputy);
 
     size_t copy_len = (ret > 0) ? ret : 0;
@@ -3356,7 +3413,9 @@ static void mattx_readlinkat_kworker(struct work_struct *work) {
 
     regs.di = ctx->req.dfd; regs.r10 = bufsiz;
     rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (real_sys_readlinkat) ret = mattx_execute_as_deputy(deputy, real_sys_readlinkat, &regs, ctx->req.path, 2, out_buf, bufsiz, 3);
+    if (real_sys_readlinkat) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_readlinkat, &regs, ctx->req.path, 2, out_buf, bufsiz, 3, ctx->req.dfd, 1);
+    }
     if (deputy) put_task_struct(deputy);
 
     size_t copy_len = (ret > 0) ? ret : 0;
