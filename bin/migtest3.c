@@ -25,11 +25,13 @@
 #define SYS_faccessat2 439
 #endif
 
+
 void setup_test_files() {
     printf("[Master] Setting up test files in /tmp...\n");
-    system("touch /tmp/mattx_test_file.txt");
+    system("echo 'Hello MattX Cluster!' > /tmp/mattx_test_file.txt");
     system("ln -sf /tmp/mattx_test_file.txt /tmp/mattx_test_link");
 }
+
 
 void worker_process() {
     printf("[Worker] Started with PID: %d\n", getpid());
@@ -68,6 +70,45 @@ void worker_process() {
         if (dumpable >= 0) {
             printf("[Worker] prctl(PR_GET_DUMPABLE) -> %d\n", dumpable);
         } else { perror("[Worker] prctl failed"); }
+
+
+        // ==========================================
+        // BATCH 2.1: FD Manipulators & Readers
+        // ==========================================
+        
+        int fd_test = open("/tmp/mattx_test_file.txt", O_RDONLY);
+        if (fd_test >= 0) {
+            // 1. fcntl (Get File Status Flags)
+            int flags = fcntl(fd_test, F_GETFL);
+            if (flags >= 0) {
+                printf("[Worker] fcntl(F_GETFL) -> flags: 0x%x\n", flags);
+            } else { 
+                perror("[Worker] fcntl failed"); 
+            }
+
+            // 2. pread64 (Read 5 bytes starting at offset 6 -> should read "MattX")
+            char pread_buf[16] = {0};
+            ssize_t p_bytes = pread(fd_test, pread_buf, 5, 6);
+            if (p_bytes >= 0) {
+                printf("[Worker] pread64(offset 6, 5 bytes) -> '%s'\n", pread_buf);
+            } else { 
+                perror("[Worker] pread64 failed"); 
+            }
+            close(fd_test);
+        } else { 
+            perror("[Worker] open failed for fcntl/pread64 test"); 
+        }
+
+        // 3. ioctl (Get Terminal Window Size)
+        // We use STDOUT_FILENO (1). If running in a real terminal, it returns rows/cols.
+        // If running in the background, it might fail with ENOTTY, which is also a valid test!
+        struct winsize ws;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+            printf("[Worker] ioctl(TIOCGWINSZ) -> rows: %d, cols: %d\n", ws.ws_row, ws.ws_col);
+        } else {
+            perror("[Worker] ioctl(TIOCGWINSZ) failed (expected if not a tty)");
+        }
+
 
         // ==========================================
         // BATCH 2.2: Metadata Fetchers
