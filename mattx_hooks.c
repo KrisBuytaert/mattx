@@ -3545,6 +3545,8 @@ static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *re
 // --- BATCH 2.2: DEDICATED METADATA FETCHERS ---
 static struct kretprobe statfs_kprobe, fstatfs_kprobe, newfstatat_kprobe, faccessat2_kprobe, readlink_kprobe, readlinkat_kprobe;
 
+
+
 struct statfs_kretprobe_data { const char __user *path; void __user *buf; };
 static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
@@ -3585,22 +3587,30 @@ static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *reg
 
 
 
-struct fstatfs_kretprobe_data { int fd; void __user *buf; };
+struct fstatfs_kretprobe_data { int fd; void __user *buf; bool is_ghost; };
 static int entry_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
         int local_fd = (int)SYSCALL_REGS(regs)->di;
         data->fd = local_fd;
-        if (local_fd >= 0) is_wormhole_fd(local_fd, &data->fd); // Translate to Remote FD!
+        data->is_ghost = false;
+
+        if (local_fd >= 0) data->is_ghost = is_wormhole_fd(local_fd, &data->fd);
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] fstatfs: Intercepted Ghost FD %d (Remote: %d). Tunneling to VM1...\n", local_fd, data->fd);
+            SYSCALL_REGS(regs)->di = -1; // Sabotage
+        } else {
+            mattx_dbg("[HOOK] fstatfs: Local FD %d detected. Executing locally on VM2.\n", local_fd);
+        }
         data->buf = (void __user *)SYSCALL_REGS(regs)->si;
-        SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
     return 0;
 }
 
 static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3622,23 +3632,30 @@ static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *re
 
 
 
-struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user *buf; int flags; };
+struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user *buf; int flags; bool is_ghost; };
 static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
-        if (local_dfd >= 0) is_wormhole_fd(local_dfd, &data->dfd); // Translate to Remote FD!
+        data->is_ghost = false;
+
+        if (local_dfd == AT_FDCWD) data->is_ghost = true;
+        else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] newfstatat: Intercepted Ghost DFD %d. Tunneling to VM1...\n", local_dfd);
+            SYSCALL_REGS(regs)->di = -1; // Sabotage
+        }
         data->path = (const char __user *)SYSCALL_REGS(regs)->si;
         data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
-        SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
     return 0;
 }
 
 static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3665,23 +3682,30 @@ static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs 
 
 
 
-struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; int flags; };
+struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; int flags; bool is_ghost; };
 static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
-        if (local_dfd >= 0) is_wormhole_fd(local_dfd, &data->dfd); // Translate to Remote FD!
+        data->is_ghost = false;
+
+        if (local_dfd == AT_FDCWD) data->is_ghost = true;
+        else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] faccessat2: Intercepted Ghost DFD %d. Tunneling to VM1...\n", local_dfd);
+            SYSCALL_REGS(regs)->di = -1; // Sabotage
+        }
         data->path = (const char __user *)SYSCALL_REGS(regs)->si;
         data->mode = (int)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
-        SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
     return 0;
 }
 
 static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3748,23 +3772,30 @@ static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *r
 
 
 
-struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user *buf; size_t bufsiz; };
+struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user *buf; size_t bufsiz; bool is_ghost; };
 static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->pid)) {
         struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
-        if (local_dfd >= 0) is_wormhole_fd(local_dfd, &data->dfd); // Translate to Remote FD!
+        data->is_ghost = false;
+
+        if (local_dfd == AT_FDCWD) data->is_ghost = true;
+        else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] readlinkat: Intercepted Ghost DFD %d. Tunneling to VM1...\n", local_dfd);
+            SYSCALL_REGS(regs)->di = -1; // Sabotage
+        }
         data->path = (const char __user *)SYSCALL_REGS(regs)->si;
         data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->bufsiz = (size_t)SYSCALL_REGS(regs)->r10;
-        SYSCALL_REGS(regs)->di = -1; // Sabotage
     }
     return 0;
 }
 
 static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
