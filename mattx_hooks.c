@@ -561,7 +561,13 @@ static void mattx_rpc_worker(struct work_struct *work) {
         struct mattx_sys_readlinkat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .bufsiz = rpc->meta_bufsiz }; strncpy(req.path, rpc->meta_path, 255);
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_READLINKAT_REQ, &req, sizeof(req));
 
-    
+    } else if (rpc->is_getdents64) {
+        struct mattx_sys_getdents64_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->getdents64_fd, .count = min_t(u32, rpc->getdents64_count, 32768) };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_GETDENTS64_REQ, &req, sizeof(req));
+    } else if (rpc->is_pipe2) {
+        struct mattx_sys_pipe2_req req = { .orig_pid = rpc->orig_pid, .flags = rpc->pipe2_flags };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PIPE2_REQ, &req, sizeof(req));
+
 
 
     // OPEN WORKER (DEFAULT FALLBACK)
@@ -1342,9 +1348,86 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 if (regs) regs->ax = error;
 
 
+            // --- GETDENTS64 AWAKENING ---
+            } else if (rpc->is_getdents64) {
+                struct pt_regs *regs = task_pt_regs(surrogate); int error = -EINTR; void *read_buf = NULL; size_t datalen = 0;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; datalen = guest_registry[i].rpc_lseek_res; read_buf = guest_registry[i].rpc_read_buf; }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (error >= 0 && read_buf && datalen > 0 && rpc->getdents64_dirp) {
+                    if (access_process_vm(surrogate, (unsigned long)rpc->getdents64_dirp, read_buf, datalen, FOLL_WRITE | FOLL_FORCE) != datalen) error = -EFAULT;
+                }
+                if (read_buf) {
+                    kfree(read_buf);
+                }
+                if (regs) {
+                    regs->ax = error;
+                }
+
+            // --- PIPE2 AWAKENING (THE TWIN INJECTOR) ---
+            } else if (rpc->is_pipe2) {
+                struct pt_regs *regs = task_pt_regs(surrogate); int error = -EINTR; void *read_buf = NULL;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (error == 0 && read_buf) {
+                    int *remote_fds = (int *)read_buf;
+                    int local_fds[2] = {-1, -1};
+                    
+                    // Inject BOTH FDs into the Surrogate's table!
+                    if (surrogate->files) {
+                        spin_lock(&surrogate->files->file_lock);
+                        struct fdtable *fdt = files_fdtable(surrogate->files);
+                        int injected = 0;
+                        for (int j = 3; j < fdt->max_fds && injected < 2; j++) {
+                            if (!rcu_dereference_raw(fdt->fd[j])) {
+                                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_ATOMIC);
+                                if (fd_info) {
+                                    fd_info->home_node = rpc->home_node; fd_info->orig_pid = rpc->orig_pid; fd_info->remote_fd = remote_fds[injected];
+                                    struct file *fake_file = anon_inode_getfile("mattx_pipe_proxy", &mattx_fops, fd_info, O_RDWR);
+                                    if (!IS_ERR(fake_file)) {
+                                        rcu_assign_pointer(fdt->fd[j], fake_file);
+                                        __set_bit(j, fdt->open_fds);
+                                        local_fds[injected] = j;
+                                        injected++;
+                                    } else { kfree(fd_info); }
+                                }
+                            }
+                        }
+                        spin_unlock(&surrogate->files->file_lock);
+                        
+                        if (injected == 2) {
+                            // Write the two local FDs into the user's pipefd[2] array!
+                            if (access_process_vm(surrogate, (unsigned long)rpc->pipe2_pipefd, local_fds, sizeof(local_fds), FOLL_WRITE | FOLL_FORCE) == sizeof(local_fds)) {
+                                error = 0;
+                                mattx_dbg("[RPC] Twin Injector Complete! Mapped Remote FDs [%d, %d] to Local FDs [%d, %d]\n", remote_fds[0], remote_fds[1], local_fds[0], local_fds[1]);
+                            } else { error = -EFAULT; }
+                        } else { error = -EMFILE; }
+                    } else { error = -EBADF; }
+                }
+                if (read_buf) {
+                    kfree(read_buf);
+                }
+                if (regs) {
+                    regs->ax = error;
+                }
+
+
 
 
                 
+
 
             // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
             } else if (remote_fd >= 0) {
@@ -3821,6 +3904,87 @@ static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs 
 }
 
 
+// --- BATCH 2.3: GETDENTS64 ---
+struct getdents64_kretprobe_data { int fd; void __user *dirp; u32 count; bool is_ghost; int remote_fd; };
+static struct kretprobe getdents64_kprobe;
+
+static int entry_handler_getdents64(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct getdents64_kretprobe_data *data = (struct getdents64_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->fd = (int)sys_regs->di; data->dirp = (void __user *)sys_regs->si; data->count = (u32)sys_regs->dx;
+        data->is_ghost = false;
+        if (data->fd >= 0) data->is_ghost = is_wormhole_fd(data->fd, &data->remote_fd);
+        if (data->is_ghost) sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_getdents64(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct getdents64_kretprobe_data *data = (struct getdents64_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_getdents64 = true; rpc->getdents64_fd = data->remote_fd; 
+            rpc->getdents64_dirp = data->dirp; rpc->getdents64_count = data->count;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+// --- BATCH 2.3: PIPE2 ---
+struct pipe2_kretprobe_data { void __user *pipefd; int flags; };
+static struct kretprobe pipe2_kprobe;
+
+static int entry_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct pipe2_kretprobe_data *data = (struct pipe2_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->pipefd = (void __user *)sys_regs->di; data->flags = (int)sys_regs->si;
+        sys_regs->di = 0; // Sabotage! (Pass NULL so native pipe2 fails safely)
+    }
+    return 0;
+}
+
+static int ret_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct pipe2_kretprobe_data *data = (struct pipe2_kretprobe_data *)ri->data;
+    if (!is_guest_process(current->pid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    int home_node = -1; u32 orig_pid = 0;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_pipe2 = true; rpc->pipe2_pipefd = data->pipefd; rpc->pipe2_flags = data->flags;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
 
 
 
@@ -4245,12 +4409,34 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&readlinkat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlinkat, returned %d\n", ret);
 
+    memset(&getdents64_kprobe, 0, sizeof(getdents64_kprobe)); 
+    getdents64_kprobe.kp.symbol_name = "__x64_sys_getdents64"; 
+    getdents64_kprobe.entry_handler = entry_handler_getdents64; 
+    getdents64_kprobe.handler = ret_handler_getdents64; 
+    getdents64_kprobe.data_size = sizeof(struct getdents64_kretprobe_data); 
+    getdents64_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&getdents64_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getdents64, returned %d\n", ret);
+
+    memset(&pipe2_kprobe, 0, sizeof(pipe2_kprobe)); 
+    pipe2_kprobe.kp.symbol_name = "__x64_sys_pipe2"; 
+    pipe2_kprobe.entry_handler = entry_handler_pipe2; 
+    pipe2_kprobe.handler = ret_handler_pipe2; 
+    pipe2_kprobe.data_size = sizeof(struct pipe2_kretprobe_data); 
+    pipe2_kprobe.maxactive = 64; 
+    ret = register_kretprobe(&pipe2_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pipe2, returned %d\n", ret);
+
+
+
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&getdents64_kprobe);
+    unregister_kretprobe(&pipe2_kprobe);
     unregister_kretprobe(&statfs_kprobe);
     unregister_kretprobe(&fstatfs_kprobe);
     unregister_kretprobe(&newfstatat_kprobe);

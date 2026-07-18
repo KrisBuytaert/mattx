@@ -94,7 +94,8 @@ static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn
     }
 
     if (out_buf && out_size > 0) {
-        if (buf_reg == 2) regs->si = buf_ptr;
+        if (buf_reg == 1) regs->di = buf_ptr;
+        else if (buf_reg == 2) regs->si = buf_ptr;
         else if (buf_reg == 3) regs->dx = buf_ptr;
     }
 
@@ -3450,8 +3451,102 @@ static void handle_sys_readlinkat_reply(struct mattx_link *link, struct mattx_he
 
 
 
+// --- GETDENTS64 ---
+struct mattx_getdents64_kworker_ctx { struct work_struct work; struct mattx_sys_getdents64_req req; int target_node; };
+static void mattx_getdents64_kworker(struct work_struct *work) {
+    struct mattx_getdents64_kworker_ctx *ctx = container_of(work, struct mattx_getdents64_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; 
+    size_t bufsiz = min_t(size_t, ctx->req.count, 32768);
+    void *out_buf = kmalloc(bufsiz, GFP_KERNEL);
+    struct task_struct *deputy = NULL;
+
+    regs.di = ctx->req.fd; regs.dx = bufsiz;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_getdents64) ret = mattx_execute_as_deputy(deputy, real_sys_getdents64, &regs, NULL, 0, out_buf, bufsiz, 2, ctx->req.fd, 1);
+    if (deputy) put_task_struct(deputy);
+
+    size_t copy_len = (ret > 0) ? ret : 0;
+    size_t reply_size = sizeof(struct mattx_sys_getdents64_reply) + copy_len;
+    struct mattx_sys_getdents64_reply *reply = kzalloc(reply_size, GFP_KERNEL);
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid; reply->error = ret;
+        if (copy_len > 0 && out_buf) memcpy(reply->data, out_buf, copy_len);
+        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_GETDENTS64_REPLY, reply, reply_size);
+        kfree(reply);
+    }
+    if (out_buf) kfree(out_buf); 
+    kfree(ctx);
+}
+
+static void handle_sys_getdents64_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getdents64_req *req = payload; struct mattx_getdents64_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_getdents64_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_getdents64_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getdents64_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error; guest_registry[i].rpc_lseek_res = (reply->error > 0) ? reply->error : 0;
+            if (reply->error > 0) { 
+                guest_registry[i].rpc_read_buf = kmalloc(reply->error, GFP_ATOMIC); 
+                if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, reply->data, reply->error); 
+            }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
 
 
+// --- PIPE2 ---
+struct mattx_pipe2_kworker_ctx { struct work_struct work; struct mattx_sys_pipe2_req req; int target_node; };
+static void mattx_pipe2_kworker(struct work_struct *work) {
+    struct mattx_pipe2_kworker_ctx *ctx = container_of(work, struct mattx_pipe2_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; void *out_buf = kmalloc(8, GFP_KERNEL); // 2 integers = 8 bytes
+    struct task_struct *deputy = NULL;
+
+    regs.si = ctx->req.flags;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (real_sys_pipe2) ret = mattx_execute_as_deputy(deputy, real_sys_pipe2, &regs, NULL, 0, out_buf, 8, 1, -1, 0);
+    if (deputy) put_task_struct(deputy);
+
+    struct mattx_sys_pipe2_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret, .fd0 = -1, .fd1 = -1 };
+    if (ret == 0 && out_buf) {
+        int *fds = (int *)out_buf;
+        reply.fd0 = fds[0]; reply.fd1 = fds[1];
+    }
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PIPE2_REPLY, &reply, sizeof(reply));
+    if (out_buf) kfree(out_buf); 
+    kfree(ctx);
+}
+
+static void handle_sys_pipe2_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_pipe2_req *req = payload; struct mattx_pipe2_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_pipe2_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_pipe2_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            if (reply->error == 0) {
+                guest_registry[i].rpc_read_buf = kmalloc(8, GFP_ATOMIC); // 2 ints
+                if (guest_registry[i].rpc_read_buf) {
+                    int *fds = (int *)guest_registry[i].rpc_read_buf;
+                    fds[0] = reply->fd0; fds[1] = reply->fd1;
+                }
+            }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
 
 
 
@@ -4689,6 +4784,12 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_READLINK_REPLY, handle_sys_readlink_reply);
     mattx_register_handler(MATTX_MSG_SYS_READLINKAT_REQ, handle_sys_readlinkat_req);
     mattx_register_handler(MATTX_MSG_SYS_READLINKAT_REPLY, handle_sys_readlinkat_reply);
+    mattx_register_handler(MATTX_MSG_SYS_GETDENTS64_REQ, handle_sys_getdents64_req);
+    mattx_register_handler(MATTX_MSG_SYS_GETDENTS64_REPLY, handle_sys_getdents64_reply);
+    mattx_register_handler(MATTX_MSG_SYS_PIPE2_REQ, handle_sys_pipe2_req);
+    mattx_register_handler(MATTX_MSG_SYS_PIPE2_REPLY, handle_sys_pipe2_reply);
+
+
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }

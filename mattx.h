@@ -188,6 +188,10 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_READLINK_REPLY,
     MATTX_MSG_SYS_READLINKAT_REQ, 
     MATTX_MSG_SYS_READLINKAT_REPLY,
+    MATTX_MSG_SYS_GETDENTS64_REQ, 
+    MATTX_MSG_SYS_GETDENTS64_REPLY,
+    MATTX_MSG_SYS_PIPE2_REQ, 
+    MATTX_MSG_SYS_PIPE2_REPLY,
 };
 
 struct mattx_header {
@@ -705,6 +709,31 @@ struct mattx_sys_readlinkat_reply {
     char data[]; 
 };
 
+struct mattx_sys_getdents64_req { 
+    u32 orig_pid; 
+    int fd; u32 count; 
+};
+
+struct mattx_sys_getdents64_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[]; 
+};
+
+struct mattx_sys_pipe2_req { 
+    u32 orig_pid; 
+    int flags; 
+};
+
+struct mattx_sys_pipe2_reply { 
+    u32 orig_pid; 
+    int error; 
+    int fd0; 
+    int fd1; 
+};
+
+
+
 
 
 
@@ -861,6 +890,17 @@ struct mattx_rpc_work {
     size_t meta_bufsiz;
     char meta_path[256];
     void __user *meta_buf_ptr;
+
+    // For GETDENTS64
+    bool is_getdents64;
+    int getdents64_fd;
+    u32 getdents64_count;
+    void __user *getdents64_dirp;
+
+    // For PIPE2
+    bool is_pipe2;
+    int pipe2_flags;
+    void __user *pipe2_pipefd;
 
 };
 
@@ -1150,6 +1190,13 @@ extern mattx_sys_readlink_fn real_sys_readlink;
 
 typedef long (*mattx_sys_readlinkat_fn)(const struct pt_regs *regs);
 extern mattx_sys_readlinkat_fn real_sys_readlinkat;
+
+typedef long (*mattx_sys_getdents64_fn)(const struct pt_regs *regs);
+extern mattx_sys_getdents64_fn real_sys_getdents64;
+
+typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
+extern mattx_sys_pipe2_fn real_sys_pipe2;
+
 
 
 // The Extreme Debugging Macro ---

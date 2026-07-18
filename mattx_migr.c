@@ -62,6 +62,8 @@ mattx_sys_newfstatat_fn real_sys_newfstatat = NULL;
 mattx_sys_faccessat2_fn real_sys_faccessat2 = NULL;
 mattx_sys_readlink_fn real_sys_readlink = NULL;
 mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
+mattx_sys_getdents64_fn real_sys_getdents64 = NULL;
+mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -248,36 +250,54 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
-    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_fstatfs";
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_fstatfs";
     if (register_kprobe(&kp) == 0) { 
         real_sys_fstatfs = (mattx_sys_fstatfs_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 
-    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_newfstatat";
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_newfstatat";
     if (register_kprobe(&kp) == 0) { 
         real_sys_newfstatat = (mattx_sys_newfstatat_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 
-    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_faccessat2";
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_faccessat2";
     if (register_kprobe(&kp) == 0) { 
         real_sys_faccessat2 = (mattx_sys_faccessat2_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 
-    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_readlink";
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_readlink";
     if (register_kprobe(&kp) == 0) { 
         real_sys_readlink = (mattx_sys_readlink_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 
-    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_readlinkat";
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_readlinkat";
     if (register_kprobe(&kp) == 0) { 
         real_sys_readlinkat = (mattx_sys_readlinkat_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
+   
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_getdents64";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_getdents64 = (mattx_sys_getdents64_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_pipe2";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_pipe2 = (mattx_sys_pipe2_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
 }
 
