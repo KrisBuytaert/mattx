@@ -26,6 +26,15 @@
 #define SYS_faccessat2 439
 #endif
 
+// glibc hides this struct, so we define it manually for the raw syscall!
+struct linux_dirent64 {
+    uint64_t        d_ino;
+    int64_t         d_off;
+    unsigned short  d_reclen;
+    unsigned char   d_type;
+    char            d_name[];
+};
+
 
 void setup_test_files() {
     printf("[Master] Setting up test files in /tmp...\n");
@@ -159,6 +168,55 @@ void worker_process() {
             rla_buf[rla_len] = '\0';
             printf("[Worker] readlinkat(AT_FDCWD, '/tmp/mattx_test_link') -> '%s'\n", rla_buf);
         } else { perror("[Worker] readlinkat failed"); }
+
+
+        // ==========================================
+        // BATCH 2.3: Complex Creators (pipe2 & getdents64)
+        // ==========================================
+        
+        // 1. pipe2 (The Twin Injector Test)
+        int pipefd[2] = {-1, -1};
+        if (pipe2(pipefd, O_CLOEXEC) == 0) {
+            printf("[Worker] pipe2() -> fd0 (read): %d, fd1 (write): %d\n", pipefd[0], pipefd[1]);
+            
+            // Let's prove the pipe actually works across the Wormhole!
+            if (write(pipefd[1], "Twin", 4) == 4) {
+                char pipe_buf[8] = {0};
+                if (read(pipefd[0], pipe_buf, 4) == 4) {
+                    printf("[Worker] pipe2 data test -> Successfully read: '%s'\n", pipe_buf);
+                } else {
+                    perror("[Worker] pipe2 read failed");
+                }
+            } else {
+                perror("[Worker] pipe2 write failed");
+            }
+            close(pipefd[0]);
+            close(pipefd[1]);
+        } else { 
+            perror("[Worker] pipe2 failed"); 
+        }
+
+        // 2. getdents64 (The Directory Streamer Test)
+        int dir_fd = open("/tmp", O_RDONLY | O_DIRECTORY);
+        if (dir_fd >= 0) {
+            char d_buf[1024];
+            long nread = syscall(SYS_getdents64, dir_fd, d_buf, sizeof(d_buf));
+            if (nread > 0) {
+                struct linux_dirent64 *d = (struct linux_dirent64 *)d_buf;
+                // Just print the very first entry in the directory to prove we got data!
+                printf("[Worker] getdents64('/tmp') -> Read %ld bytes. First entry: '%s' (inode: %lu)\n", 
+                       nread, d->d_name, (unsigned long)d->d_ino);
+            } else if (nread == 0) {
+                printf("[Worker] getdents64('/tmp') -> End of directory\n");
+            } else { 
+                perror("[Worker] getdents64 failed"); 
+            }
+            close(dir_fd);
+        } else { 
+            perror("[Worker] open('/tmp') failed for getdents64 test"); 
+        }
+
+
 
         printf("----------------------------\n");
         
