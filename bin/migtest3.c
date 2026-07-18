@@ -20,6 +20,7 @@
 #include <sys/stat.h>   // For stat
 #include <fcntl.h>      // For AT_FDCWD and open
 #include <sys/ioctl.h>
+#include <stdint.h>
 
 // Fallback for faccessat2 if headers are too old (439 on x86_64)
 #ifndef SYS_faccessat2
