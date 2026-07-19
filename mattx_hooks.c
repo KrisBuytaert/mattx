@@ -3984,6 +3984,74 @@ static int ret_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 
+// ============================================================================
+// BATCH 3.1: LOCAL MEMORY ALLOCATORS (Executes natively on VM2)
+// ============================================================================
+
+// --- 1. BRK ---
+static struct kretprobe brk_kprobe;
+static int entry_handler_brk(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    // We let brk execute natively on VM2 to allocate local heap memory.
+    // (Logging this would spam dmesg and crash the node, as malloc calls it constantly!)
+    return 0;
+}
+static int ret_handler_brk(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 2. MUNMAP ---
+static struct kretprobe munmap_kprobe;
+static int entry_handler_munmap(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    // Let the kernel free the local memory natively.
+    return 0;
+}
+static int ret_handler_munmap(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 3. MREMAP ---
+static struct kretprobe mremap_kprobe;
+static int entry_handler_mremap(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    // Let the kernel resize the local memory natively.
+    return 0;
+}
+static int ret_handler_mremap(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 4. MMAP (The Guardrail) ---
+struct mmap_kretprobe_data { bool is_ghost; int fd; };
+static struct kretprobe mmap_kprobe;
+
+static int entry_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct mmap_kretprobe_data *data = (struct mmap_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        
+        // In x86_64, the mmap arguments are:
+        // rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=offset
+        int local_fd = (int)sys_regs->r8;
+        data->fd = local_fd;
+        data->is_ghost = false;
+
+        if (local_fd >= 0) {
+            data->is_ghost = is_wormhole_fd(local_fd, NULL);
+        }
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] mmap: Ghost FD %d detected! Blocking local mmap (DSM not supported yet).\n", local_fd);
+            // Sabotage the syscall so the kernel fails it safely
+            sys_regs->di = -1; // Invalid address
+            sys_regs->si = 0;  // Zero length
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct mmap_kretprobe_data *data = (struct mmap_kretprobe_data *)ri->data;
+        if (data->is_ghost) {
+            // Force Permission Denied! The app must handle the error.
+            regs->ax = -EACCES; 
+        }
+    }
+    return 0;
+}
 
 
 
@@ -4427,6 +4495,38 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&pipe2_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pipe2, returned %d\n", ret);
 
+    memset(&brk_kprobe, 0, sizeof(brk_kprobe));
+    brk_kprobe.kp.symbol_name = "__x64_sys_brk";
+    brk_kprobe.entry_handler = entry_handler_brk;
+    brk_kprobe.handler = ret_handler_brk;
+    brk_kprobe.maxactive = 64;
+    ret = register_kretprobe(&brk_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for brk, returned %d\n", ret);
+
+    memset(&munmap_kprobe, 0, sizeof(munmap_kprobe));
+    munmap_kprobe.kp.symbol_name = "__x64_sys_munmap";
+    munmap_kprobe.entry_handler = entry_handler_munmap;
+    munmap_kprobe.handler = ret_handler_munmap;
+    munmap_kprobe.maxactive = 64;
+    ret = register_kretprobe(&munmap_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for munmap, returned %d\n", ret);
+
+    memset(&mremap_kprobe, 0, sizeof(mremap_kprobe));
+    mremap_kprobe.kp.symbol_name = "__x64_sys_mremap";
+    mremap_kprobe.entry_handler = entry_handler_mremap;
+    mremap_kprobe.handler = ret_handler_mremap;
+    mremap_kprobe.maxactive = 64;
+    ret = register_kretprobe(&mremap_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mremap, returned %d\n", ret);
+
+    memset(&mmap_kprobe, 0, sizeof(mmap_kprobe));
+    mmap_kprobe.kp.symbol_name = "__x64_sys_mmap";
+    mmap_kprobe.entry_handler = entry_handler_mmap;
+    mmap_kprobe.handler = ret_handler_mmap;
+    mmap_kprobe.data_size = sizeof(struct mmap_kretprobe_data);
+    mmap_kprobe.maxactive = 64;
+    ret = register_kretprobe(&mmap_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mmap, returned %d\n", ret);
 
 
 
@@ -4435,6 +4535,10 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&brk_kprobe);
+    unregister_kretprobe(&munmap_kprobe);
+    unregister_kretprobe(&mremap_kprobe);
+    unregister_kretprobe(&mmap_kprobe);
     unregister_kretprobe(&getdents64_kprobe);
     unregister_kretprobe(&pipe2_kprobe);
     unregister_kretprobe(&statfs_kprobe);
