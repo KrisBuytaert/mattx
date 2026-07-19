@@ -4100,6 +4100,45 @@ static int ret_handler_mbind(struct kretprobe_instance *ri, struct pt_regs *regs
 
 
 
+// ============================================================================
+// BATCH 3.3: LOCAL SCHEDULER CONTROLS (Executes natively on VM2)
+// ============================================================================
+
+// --- 1. SCHED_GETAFFINITY ---
+static struct kretprobe sched_getaffinity_kprobe;
+static int entry_handler_sched_getaffinity(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        // x86_64 args: rdi=pid, rsi=len, rdx=user_mask_ptr
+        mattx_dbg("[HOOK] sched_getaffinity: Local execution on VM2 (pid: %d, len: %u)\n",
+                  (int)sys_regs->di, (unsigned int)sys_regs->si);
+    }
+    return 0; // Let it execute natively!
+}
+static int ret_handler_sched_getaffinity(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 2. SCHED_SETAFFINITY ---
+static struct kretprobe sched_setaffinity_kprobe;
+static int entry_handler_sched_setaffinity(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        // x86_64 args: rdi=pid, rsi=len, rdx=user_mask_ptr
+        mattx_dbg("[HOOK] sched_setaffinity: Local execution on VM2 (pid: %d, len: %u)\n",
+                  (int)sys_regs->di, (unsigned int)sys_regs->si);
+    }
+    return 0; // Let it execute natively!
+}
+static int ret_handler_sched_setaffinity(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 3. SCHED_YIELD ---
+static struct kretprobe sched_yield_kprobe;
+static int entry_handler_sched_yield(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        mattx_dbg("[HOOK] sched_yield: Local execution on VM2. Yielding CPU.\n");
+    }
+    return 0; // Let it execute natively!
+}
+static int ret_handler_sched_yield(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
 
 
 
@@ -4608,6 +4647,33 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&mbind_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mbind, returned %d\n", ret);
 
+    memset(&sched_getaffinity_kprobe, 0, sizeof(sched_getaffinity_kprobe));
+    sched_getaffinity_kprobe.kp.symbol_name = "__x64_sys_sched_getaffinity";
+    sched_getaffinity_kprobe.entry_handler = entry_handler_sched_getaffinity;
+    sched_getaffinity_kprobe.handler = ret_handler_sched_getaffinity;
+    sched_getaffinity_kprobe.maxactive = 64;
+    ret = register_kretprobe(&sched_getaffinity_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_getaffinity, returned %d\n", ret);
+
+    memset(&sched_setaffinity_kprobe, 0, sizeof(sched_setaffinity_kprobe));
+    sched_setaffinity_kprobe.kp.symbol_name = "__x64_sys_sched_setaffinity";
+    sched_setaffinity_kprobe.entry_handler = entry_handler_sched_setaffinity;
+    sched_setaffinity_kprobe.handler = ret_handler_sched_setaffinity;
+    sched_setaffinity_kprobe.maxactive = 64;
+    ret = register_kretprobe(&sched_setaffinity_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_setaffinity, returned %d\n", ret);
+
+    memset(&sched_yield_kprobe, 0, sizeof(sched_yield_kprobe));
+    sched_yield_kprobe.kp.symbol_name = "__x64_sys_sched_yield";
+    sched_yield_kprobe.entry_handler = entry_handler_sched_yield;
+    sched_yield_kprobe.handler = ret_handler_sched_yield;
+    sched_yield_kprobe.maxactive = 64;
+    ret = register_kretprobe(&sched_yield_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_yield, returned %d\n", ret);
+
+
+
+
 
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
@@ -4615,6 +4681,9 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&sched_getaffinity_kprobe);
+    unregister_kretprobe(&sched_setaffinity_kprobe);
+    unregister_kretprobe(&sched_yield_kprobe);
     unregister_kretprobe(&mprotect_kprobe);
     unregister_kretprobe(&madvise_kprobe);
     unregister_kretprobe(&mbind_kprobe);
