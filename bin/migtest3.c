@@ -2,6 +2,7 @@
  * migtest3.c - MattX Batch 1 & Batch 2.2 Syscall QA Tester
  * Tests: getpid, gettid, uname, getrandom, prlimit64, arch_prctl, prctl
  *        statfs, fstatfs, newfstatat, faccessat2, readlink, readlinkat
+ *       pipe2, getdents64
  */
 
 #define _GNU_SOURCE
