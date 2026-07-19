@@ -36,6 +36,10 @@ void worker_process() {
         if (ptr != MAP_FAILED) {
             printf("[Worker] mmap(4096 bytes) -> Success at %p\n", ptr);
             
+            // print message to migrate while the memory is allocated
+            printf("[Worker] Memory allocated. You can now migrate PID: %d\n", getpid());
+            sleep(5); // Give time for migration
+
             // mremap (Expand the 4KB allocation to 8KB)
             void *new_ptr = mremap(ptr, 4096, 8192, MREMAP_MAYMOVE);
             if (new_ptr != MAP_FAILED) {
