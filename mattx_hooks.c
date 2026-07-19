@@ -4055,6 +4055,61 @@ static int ret_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 
 
+// ============================================================================
+// BATCH 3.2: LOCAL MEMORY TUNERS (Executes natively on VM2)
+// ============================================================================
+
+// --- 1. MPROTECT ---
+static struct kretprobe mprotect_kprobe;
+static int entry_handler_mprotect(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        // x86_64 args: rdi=addr, rsi=len, rdx=prot
+        mattx_dbg("[HOOK] mprotect: Local execution on VM2 (addr: 0x%lx, len: %lu, prot: %d)\n",
+                  sys_regs->di, sys_regs->si, (int)sys_regs->dx);
+    }
+    return 0; // Let it execute natively!
+}
+static int ret_handler_mprotect(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 2. MADVISE ---
+static struct kretprobe madvise_kprobe;
+static int entry_handler_madvise(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        // x86_64 args: rdi=addr, rsi=length, rdx=advice
+        mattx_dbg("[HOOK] madvise: Local execution on VM2 (addr: 0x%lx, len: %lu, advice: %d)\n",
+                  sys_regs->di, sys_regs->si, (int)sys_regs->dx);
+    }
+    return 0; // Let it execute natively!
+}
+static int ret_handler_madvise(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+// --- 3. MBIND ---
+static struct kretprobe mbind_kprobe;
+static int entry_handler_mbind(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->pid)) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        // x86_64 args: rdi=addr, rsi=len, rdx=mode
+        mattx_dbg("[HOOK] mbind: Local execution on VM2 (addr: 0x%lx, len: %lu, mode: %d)\n",
+                  sys_regs->di, sys_regs->si, (int)sys_regs->dx);
+    }
+    return 0; // Let it execute natively!
+}
+static int ret_handler_mbind(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // --- KPROBE REGISTRATION ---
@@ -4528,6 +4583,31 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&mmap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mmap, returned %d\n", ret);
 
+    // --- BATCH 3.2 KPROBES ---
+    memset(&mprotect_kprobe, 0, sizeof(mprotect_kprobe));
+    mprotect_kprobe.kp.symbol_name = "__x64_sys_mprotect";
+    mprotect_kprobe.entry_handler = entry_handler_mprotect;
+    mprotect_kprobe.handler = ret_handler_mprotect;
+    mprotect_kprobe.maxactive = 64;
+    ret = register_kretprobe(&mprotect_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mprotect, returned %d\n", ret);
+
+    memset(&madvise_kprobe, 0, sizeof(madvise_kprobe));
+    madvise_kprobe.kp.symbol_name = "__x64_sys_madvise";
+    madvise_kprobe.entry_handler = entry_handler_madvise;
+    madvise_kprobe.handler = ret_handler_madvise;
+    madvise_kprobe.maxactive = 64;
+    ret = register_kretprobe(&madvise_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for madvise, returned %d\n", ret);
+
+    memset(&mbind_kprobe, 0, sizeof(mbind_kprobe));
+    mbind_kprobe.kp.symbol_name = "__x64_sys_mbind";
+    mbind_kprobe.entry_handler = entry_handler_mbind;
+    mbind_kprobe.handler = ret_handler_mbind;
+    mbind_kprobe.maxactive = 64;
+    ret = register_kretprobe(&mbind_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mbind, returned %d\n", ret);
+
 
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
@@ -4535,6 +4615,9 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&mprotect_kprobe);
+    unregister_kretprobe(&madvise_kprobe);
+    unregister_kretprobe(&mbind_kprobe);
     unregister_kretprobe(&brk_kprobe);
     unregister_kretprobe(&munmap_kprobe);
     unregister_kretprobe(&mremap_kprobe);
