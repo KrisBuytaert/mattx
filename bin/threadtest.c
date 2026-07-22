@@ -18,10 +18,13 @@ void *thread_function(void *arg) {
     
     printf("  [Thread %d] Born and ticking! (TID: %d)\n", thread_id, tid);
     
-    // The thread just stays alive, sleeping until the Master cancels it.
-    // (sleep() internally uses futexes and signals!)
+    int seconds_alive = 0;
+    // The thread stays alive, ticking every 5 seconds until the Master cancels it.
     while (1) {
-        sleep(1);
+        sleep(5);
+        seconds_alive += 5;
+        printf("  [Thread %d] (TID: %d) Still alive and calculating... (%d seconds)\n", 
+               thread_id, tid, seconds_alive);
     }
     return NULL;
 }
@@ -45,10 +48,10 @@ void worker_process(int num_threads) {
             }
         }
 
-        printf("[Worker] Threads spawned. Ticking for 60 seconds...\n");
+        printf("[Worker] Threads spawned. Mother is ticking for 60 seconds...\n");
         for (int i = 0; i < 6; i++) {
             sleep(10);
-            printf("[Worker] Tick %d/60 seconds... (Mother PID: %d)\n", (i + 1) * 10, getpid());
+            printf("[Worker] Mother Tick %d/60 seconds... (Mother PID: %d)\n", (i + 1) * 10, getpid());
         }
 
         printf("[Worker] --- TEARING DOWN THREADS (futex / exit) ---\n");
@@ -94,3 +97,4 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+
