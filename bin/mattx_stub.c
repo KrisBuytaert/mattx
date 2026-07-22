@@ -73,6 +73,7 @@ struct mattx_cpu_regs {
 
 struct mattx_thread_info {
     uint32_t tid;
+    uint32_t pad_tid; // Force 8-byte alignment for regs
     struct mattx_cpu_regs regs;
     uint64_t fsbase;
     uint64_t gsbase;
@@ -86,6 +87,7 @@ struct mattx_migration_req {
     
     // --- The Gang Array ---
     uint32_t thread_count;
+    uint32_t pad_threads; // Force 8-byte alignment for threads array
     struct mattx_thread_info threads[MAX_GANG_THREADS];
     
     uint64_t arg_start; 
@@ -97,6 +99,7 @@ struct mattx_migration_req {
     uint32_t vma_count;
     uint8_t mattxfs_enabled;
     uint8_t pad[3];
+    uint8_t pad_vmas[7]; // Force 8-byte alignment for vmas array
     struct mattx_vma_info vmas[]; 
 };
 
