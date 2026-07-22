@@ -222,37 +222,33 @@ struct mattx_cpu_regs {
 };
 
 
-
 struct mattx_thread_info {
     u32 tid;
-    u32 pad_tid; // Force 8-byte alignment for regs
     struct mattx_cpu_regs regs;
     uint64_t fsbase;
     uint64_t gsbase;
-};
+} __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 
 struct mattx_migration_req {
     u32 orig_pid;
     u32 uid; 
     u32 gid; 
-    u32 home_node; // Tell the stub where home is!
+    u32 home_node; 
+    
     u32 thread_count;
-    u32 pad_threads; // Force 8-byte alignment for threads array    
     struct mattx_thread_info threads[MAX_GANG_THREADS]; 
-    uint64_t fsbase; 
-    uint64_t gsbase; 
+    
     uint64_t arg_start; 
     uint64_t arg_end;   
     char comm[16]; 
-    char dfsa_dir[256]; // Tell the stub what to bind-mount!
+    char dfsa_dir[256]; 
     u32 fd_count;          
     u32 open_fds[MAX_FDS]; 
     u32 vma_count;
-    u8 mattxfs_enabled; // Tell the stub if it should build the illusion
-    u8 pad[3];          // Alignment padding
-    u8 pad_vmas[7]; // Force 8-byte alignment for vmas array (4412 + 4 + 1 + 7 = 4424)
+    u8 mattxfs_enabled; 
     struct mattx_vma_info vmas[]; 
-};
+} __attribute__((packed)); // <-- FORCE EXACT LAYOUT
+
 
 struct mattx_page_header {
     uint64_t absolute_addr; // <--: The exact memory address!
