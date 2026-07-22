@@ -214,8 +214,7 @@ int main() {
             perror("MattX-Stub: mmap MAP_FIXED failed");
         } else {
             printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX%s)\n", 
-                   i, v->vm_start, v->vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
-        }
+                   i, (unsigned long)v.vm_start, (unsigned long)v.vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
     }
 
     printf("MattX-Stub: Spawning %u dummy threads for Gang Migration...\n", received_req->thread_count);

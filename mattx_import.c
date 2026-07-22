@@ -386,9 +386,9 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         }
         rcu_read_unlock();
         
-        // --- FIXED: Use the Mother's registers from the Blueprint! ---
+        // --- Use the Mother's registers from the Blueprint! ---
         if (pending_migration->thread_count > 0) {
-            mattx_dbg("[IMPORT] Deputy Brain Restored. New Mother RIP: 0x%lx\n", pending_migration->threads[0].regs.rip);
+            mattx_dbg("[IMPORT] Deputy Brain Restored. New Mother RIP: 0x%lx\n", (unsigned long)pending_migration->threads[0].regs.rip);
         }
         
         spin_lock(&export_lock);
