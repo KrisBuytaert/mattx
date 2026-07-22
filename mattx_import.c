@@ -108,29 +108,28 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
     mattx_dbg("[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
     
     if (hijacked_stub_task && pending_migration) {
-        struct pt_regs *regs;
         struct cred *new_cred;
         const struct cred *old_cred;
         int retries = 50;
         unsigned char rip_buf[8] = {0}; 
         struct file **fake_files; 
         int i;
+        int current_threads = 0;
+        struct task_struct *t;
 
         mattx_dbg("[IMPORT] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
 
+        // Wait for the Mother to stop
         while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
             msleep(10);
             retries--;
         }
 
-
-        // --- NEW: WAIT FOR STUB TO SPAWN THREADS ---
-        int current_threads = 0;
+        // --- WAIT FOR STUB TO SPAWN THREADS ---
         retries = 50;
         while (retries > 0) {
             current_threads = 0;
             rcu_read_lock();
-            struct task_struct *t;
             for_each_thread(hijacked_stub_task, t) { current_threads++; }
             rcu_read_unlock();
             
@@ -139,8 +138,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             retries--;
         }
 
-        // --- NEW: GANG INJECTION ---
-        struct task_struct *t;
+        // --- GANG INJECTION ---
         int t_idx = 0;
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
@@ -155,6 +153,14 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             }
         }
         rcu_read_unlock();
+
+        // --- MOTHER SETUP (Comm, MM, Creds, FDs) ---
+        strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
+        
+        if (hijacked_stub_task->mm) {
+            hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
+            hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
+        }
         
         new_cred = prepare_creds();
         if (new_cred) {
@@ -212,8 +218,12 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             kfree(fake_files); 
         }
 
-        if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-            mattx_dbg("[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+        // --- FIXED: Use the Mother's registers from the Blueprint! ---
+        if (pending_migration->thread_count > 0) {
+            unsigned long mother_rip = pending_migration->threads[0].regs.rip;
+            if (access_process_vm(hijacked_stub_task, mother_rip, rip_buf, 8, FOLL_FORCE) == 8) {
+                mattx_dbg("[DEBUG] Target RIP (0x%lx) contains: %8ph\n", mother_rip, rip_buf);
+            }
         }
 
         mattx_dbg("[IMPORT] IT'S ALIVE! Waking %d threads in Gang PID %d\n", current_threads, hijacked_stub_task->pid);
@@ -222,11 +232,10 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             send_sig(SIGCONT, t, 0);
         }
         rcu_read_unlock();
-
-
+        
         add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
 
-
+        // --- CLEANUP ---
         put_task_struct(hijacked_stub_task);
         hijacked_stub_task = NULL;
         kvfree(pending_migration);
@@ -234,6 +243,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         pending_source_node = -1;
     }
 }
+
 
 static void handle_return_blueprint(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -359,12 +369,11 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
     if (hijacked_stub_task && pending_migration) {
-
-
-        // --- GANG RETURN INJECTION ---
         struct task_struct *t;
         int t_idx = 0;
         int i;
+
+        // --- GANG RETURN INJECTION ---
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
             if (t_idx < pending_migration->thread_count) {
@@ -376,6 +385,11 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             }
         }
         rcu_read_unlock();
+        
+        // --- FIXED: Use the Mother's registers from the Blueprint! ---
+        if (pending_migration->thread_count > 0) {
+            mattx_dbg("[IMPORT] Deputy Brain Restored. New Mother RIP: 0x%lx\n", pending_migration->threads[0].regs.rip);
+        }
         
         spin_lock(&export_lock);
         for (i = 0; i < export_count; i++) {
@@ -392,7 +406,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             send_sig(SIGCONT, t, 0);
         }
         rcu_read_unlock();
-
+        
         put_task_struct(hijacked_stub_task);
         hijacked_stub_task = NULL;
         kvfree(pending_migration);
@@ -402,6 +416,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         printk(KERN_ERR "MattX: [RECALL] FATAL: Missing stub task or blueprint in return_done!\n");
     }
 }
+
 
 void mattx_import_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_MIGRATE_REQ, handle_migrate_req);
