@@ -123,85 +123,109 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             retries--;
         }
 
-        regs = task_pt_regs(hijacked_stub_task);
-        if (regs) {
-            memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
+
+        // --- NEW: WAIT FOR STUB TO SPAWN THREADS ---
+        int current_threads = 0;
+        retries = 50;
+        while (retries > 0) {
+            current_threads = 0;
+            rcu_read_lock();
+            struct task_struct *t;
+            for_each_thread(hijacked_stub_task, t) { current_threads++; }
+            rcu_read_unlock();
             
-            hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
-            hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
-            
-            strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
-            
-            if (hijacked_stub_task->mm) {
-                hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
-                hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
+            if (current_threads >= pending_migration->thread_count) break;
+            msleep(10);
+            retries--;
+        }
+
+        // --- NEW: GANG INJECTION ---
+        struct task_struct *t;
+        int t_idx = 0;
+        rcu_read_lock();
+        for_each_thread(hijacked_stub_task, t) {
+            if (t_idx < pending_migration->thread_count) {
+                struct pt_regs *t_regs = task_pt_regs(t);
+                if (t_regs) {
+                    memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
+                    t->thread.fsbase = pending_migration->threads[t_idx].fsbase;
+                    t->thread.gsbase = pending_migration->threads[t_idx].gsbase;
+                }
+                t_idx++;
             }
+        }
+        rcu_read_unlock();
+        
+        new_cred = prepare_creds();
+        if (new_cred) {
+            new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
+            new_cred->euid = new_cred->uid;
+            new_cred->suid = new_cred->uid;
+            new_cred->fsuid = new_cred->uid;
             
-            new_cred = prepare_creds();
-            if (new_cred) {
-                new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
-                new_cred->euid = new_cred->uid;
-                new_cred->suid = new_cred->uid;
-                new_cred->fsuid = new_cred->uid;
+            new_cred->gid = make_kgid(&init_user_ns, pending_migration->gid);
+            new_cred->egid = new_cred->gid;
+            new_cred->sgid = new_cred->gid;
+            new_cred->fsgid = new_cred->gid;
+
+            rcu_read_lock();
+            old_cred = rcu_dereference(hijacked_stub_task->cred);
+            rcu_assign_pointer(hijacked_stub_task->real_cred, get_cred(new_cred));
+            rcu_assign_pointer(hijacked_stub_task->cred, get_cred(new_cred));
+            rcu_read_unlock();
+
+            put_cred(old_cred);
+            put_cred(old_cred);
+            put_cred(new_cred);
+        }
+
+        fake_files = kmalloc_array(pending_migration->fd_count, sizeof(struct file *), GFP_KERNEL);
+        if (fake_files) {
+            memset(fake_files, 0, pending_migration->fd_count * sizeof(struct file *));
+            
+            for (i = 0; i < pending_migration->fd_count; i++) {
+                u32 fd_num = pending_migration->open_fds[i];
                 
-                new_cred->gid = make_kgid(&init_user_ns, pending_migration->gid);
-                new_cred->egid = new_cred->gid;
-                new_cred->sgid = new_cred->gid;
-                new_cred->fsgid = new_cred->gid;
-
-                rcu_read_lock();
-                old_cred = rcu_dereference(hijacked_stub_task->cred);
-                rcu_assign_pointer(hijacked_stub_task->real_cred, get_cred(new_cred));
-                rcu_assign_pointer(hijacked_stub_task->cred, get_cred(new_cred));
-                rcu_read_unlock();
-
-                put_cred(old_cred);
-                put_cred(old_cred);
-                put_cred(new_cred);
+                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                if (fd_info) {
+                    fd_info->home_node = pending_source_node;
+                    fd_info->orig_pid = pending_migration->orig_pid;
+                    fd_info->remote_fd = fd_num;
+                    fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+                }
             }
 
-            fake_files = kmalloc_array(pending_migration->fd_count, sizeof(struct file *), GFP_KERNEL);
-            if (fake_files) {
-                memset(fake_files, 0, pending_migration->fd_count * sizeof(struct file *));
+            if (hijacked_stub_task->files) {
+                spin_lock(&hijacked_stub_task->files->file_lock);
+                struct fdtable *fdt = files_fdtable(hijacked_stub_task->files);
                 
                 for (i = 0; i < pending_migration->fd_count; i++) {
                     u32 fd_num = pending_migration->open_fds[i];
-                    
-                    struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
-                    if (fd_info) {
-                        fd_info->home_node = pending_source_node;
-                        fd_info->orig_pid = pending_migration->orig_pid;
-                        fd_info->remote_fd = fd_num;
-                        fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+                    if (fd_num < fdt->max_fds && fake_files[i] && !IS_ERR(fake_files[i])) {
+                        rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
+                        __set_bit(fd_num, fdt->open_fds);                        
                     }
                 }
-
-                if (hijacked_stub_task->files) {
-                    spin_lock(&hijacked_stub_task->files->file_lock);
-                    struct fdtable *fdt = files_fdtable(hijacked_stub_task->files);
-                    
-                    for (i = 0; i < pending_migration->fd_count; i++) {
-                        u32 fd_num = pending_migration->open_fds[i];
-                        if (fd_num < fdt->max_fds && fake_files[i] && !IS_ERR(fake_files[i])) {
-                            rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
-                            __set_bit(fd_num, fdt->open_fds);                        
-                        }
-                    }
-                    spin_unlock(&hijacked_stub_task->files->file_lock);
-                    mattx_dbg("[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
-                }
-                kfree(fake_files); 
+                spin_unlock(&hijacked_stub_task->files->file_lock);
+                mattx_dbg("[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
             }
-
-            if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-                mattx_dbg("[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
-            }
-
-            mattx_dbg("[IMPORT] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
-            send_sig(SIGCONT, hijacked_stub_task, 0);
-            
-            add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
+            kfree(fake_files); 
         }
+
+        if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
+            mattx_dbg("[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+        }
+
+        mattx_dbg("[IMPORT] IT'S ALIVE! Waking %d threads in Gang PID %d\n", current_threads, hijacked_stub_task->pid);
+        rcu_read_lock();
+        for_each_thread(hijacked_stub_task, t) {
+            send_sig(SIGCONT, t, 0);
+        }
+        rcu_read_unlock();
+
+
+        add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
+
 
         put_task_struct(hijacked_stub_task);
         hijacked_stub_task = NULL;
@@ -335,27 +359,40 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
     if (hijacked_stub_task && pending_migration) {
-        struct pt_regs *regs = task_pt_regs(hijacked_stub_task);
+
+
+        // --- GANG RETURN INJECTION ---
+        struct task_struct *t;
+        int t_idx = 0;
         int i;
-
-        if (regs) {
-            memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
-            
-            mattx_dbg("[IMPORT] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
-            
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == hijacked_stub_task->pid) {
-                    remove_export_process(i);
-                    break;
+        rcu_read_lock();
+        for_each_thread(hijacked_stub_task, t) {
+            if (t_idx < pending_migration->thread_count) {
+                struct pt_regs *t_regs = task_pt_regs(t);
+                if (t_regs) {
+                    memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
                 }
+                t_idx++;
             }
-            spin_unlock(&export_lock);
-
-            mattx_dbg("[IMPORT] Welcome home! Sending SIGCONT to Deputy PID %d\n", hijacked_stub_task->pid);
-            send_sig(SIGCONT, hijacked_stub_task, 0);
         }
+        rcu_read_unlock();
         
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == hijacked_stub_task->pid) {
+                remove_export_process(i);
+                break;
+            }
+        }
+        spin_unlock(&export_lock);
+
+        mattx_dbg("[IMPORT] Welcome home! Waking Gang Deputy PID %d\n", hijacked_stub_task->pid);
+        rcu_read_lock();
+        for_each_thread(hijacked_stub_task, t) {
+            send_sig(SIGCONT, t, 0);
+        }
+        rcu_read_unlock();
+
         put_task_struct(hijacked_stub_task);
         hijacked_stub_task = NULL;
         kvfree(pending_migration);

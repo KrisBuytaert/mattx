@@ -81,7 +81,7 @@
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 1024 
 #define MAX_GUESTS 1024 
-
+#define MAX_GANG_THREADS 16
 #define MAX_FDS 256
 
 #define MATTX_MAGIC 0x4D415454 
@@ -221,12 +221,20 @@ struct mattx_cpu_regs {
 
 };
 
+struct mattx_thread_info {
+    u32 tid;
+    struct mattx_cpu_regs regs;
+    uint64_t fsbase;
+    uint64_t gsbase;
+};
+
 struct mattx_migration_req {
     u32 orig_pid;
     u32 uid; 
     u32 gid; 
     u32 home_node; // Tell the stub where home is!
-    struct mattx_cpu_regs regs; 
+    u32 thread_count;
+    struct mattx_thread_info threads[MAX_GANG_THREADS]; 
     uint64_t fsbase; 
     uint64_t gsbase; 
     uint64_t arg_start; 

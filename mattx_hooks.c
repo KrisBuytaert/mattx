@@ -1594,7 +1594,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
         
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == my_pid) {
+            if (guest_registry[i].local_pid == current->tgid) {
                 home_node = guest_registry[i].home_node;
                 orig_pid = guest_registry[i].orig_pid;
                 guest_registry[i].rpc_done = false; 
@@ -1704,7 +1704,7 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -1788,7 +1788,7 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
     if (strncpy_from_user(filename, data->pathname, sizeof(filename) - 1) > 0) {
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == my_pid) {
+            if (guest_registry[i].local_pid == current->tgid) {
                 home_node = guest_registry[i].home_node;
                 orig_pid = guest_registry[i].orig_pid;
                 guest_registry[i].rpc_done = false; 
@@ -1859,7 +1859,7 @@ static int ret_handler_socket(struct kretprobe_instance *ri, struct pt_regs *reg
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -1946,7 +1946,7 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2022,7 +2022,7 @@ static int ret_handler_bind(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2098,7 +2098,7 @@ static int ret_handler_listen(struct kretprobe_instance *ri, struct pt_regs *reg
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2177,7 +2177,7 @@ static int ret_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *reg
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2258,7 +2258,7 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2339,7 +2339,7 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2433,7 +2433,7 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2514,7 +2514,7 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2626,7 +2626,7 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2740,7 +2740,7 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2823,7 +2823,7 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -2885,7 +2885,7 @@ static int entry_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *r
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     data->is_wormhole = false;
 
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         data->fd = (int)sys_regs->di;
         if (data->fd >= 0) {
             struct file *f = fget(data->fd);
@@ -2918,7 +2918,7 @@ static int ret_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *reg
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -2960,7 +2960,7 @@ static int entry_handler_epoll_create(struct kretprobe_instance *ri, struct pt_r
     struct epoll_create_kretprobe_data *data = (struct epoll_create_kretprobe_data *)ri->data;
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     
-    data->is_guest = is_guest_process(current->pid);
+    data->is_guest = is_guest_process(current->tgid);
     data->is_epolltest = (strcmp(current->comm, "epolltest") == 0);
 
     // STERILE LABORATORY: Only intercept if it's a guest AND it's exactly "epolltest"
@@ -2983,7 +2983,7 @@ static int ret_handler_epoll_create(struct kretprobe_instance *ri, struct pt_reg
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -3039,7 +3039,7 @@ static int entry_handler_epoll_ctl(struct kretprobe_instance *ri, struct pt_regs
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     data->is_ghost = false;
 
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         int epfd = (int)sys_regs->di;
         if (is_wormhole_fd(epfd, NULL)) {
             data->is_ghost = true;
@@ -3068,7 +3068,7 @@ static int ret_handler_epoll_ctl(struct kretprobe_instance *ri, struct pt_regs *
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -3117,7 +3117,7 @@ static int entry_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_reg
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     data->is_ghost = false;
 
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         int epfd = (int)sys_regs->di;
         if (is_wormhole_fd(epfd, NULL)) {
             data->is_ghost = true;
@@ -3147,7 +3147,7 @@ static int ret_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs 
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; 
@@ -3195,7 +3195,7 @@ static int entry_handler_sockname(struct kretprobe_instance *ri, struct pt_regs 
     struct sockname_kretprobe_data *data = (struct sockname_kretprobe_data *)ri->data;
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     data->is_ghost = false;
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         data->fd = (int)sys_regs->di;
         if (is_wormhole_fd(data->fd, &data->remote_fd)) {
             data->is_ghost = true;
@@ -3215,7 +3215,7 @@ static int ret_handler_sockname(struct kretprobe_instance *ri, struct pt_regs *r
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3248,7 +3248,7 @@ static int entry_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *
     struct sockopt_kretprobe_data *data = (struct sockopt_kretprobe_data *)ri->data;
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     data->is_ghost = false;
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         data->fd = (int)sys_regs->di;
         if (is_wormhole_fd(data->fd, &data->remote_fd)) {
             data->is_ghost = true;
@@ -3270,7 +3270,7 @@ static int ret_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *re
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3315,7 +3315,7 @@ static int entry_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs
     struct msg_kretprobe_data *data = (struct msg_kretprobe_data *)ri->data;
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     data->is_ghost = false;
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         data->fd = (int)sys_regs->di;
         if (is_wormhole_fd(data->fd, &data->remote_fd)) {
             data->is_ghost = true;
@@ -3335,7 +3335,7 @@ static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) 
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3375,10 +3375,10 @@ static struct kretprobe gettid_kprobe;
 
 static int entry_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
 static int ret_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == current->pid) {
+            if (guest_registry[i].local_pid == current->tgid) {
                 regs->ax = guest_registry[i].orig_pid; // Spoof the PID instantly!
                 break;
             }
@@ -3392,7 +3392,7 @@ static int ret_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *reg
 struct uname_kretprobe_data { void __user *buf; };
 static struct kretprobe uname_kprobe;
 static int entry_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         ((struct uname_kretprobe_data *)ri->data)->buf = (void __user *)SYSCALL_REGS(regs)->di;
         SYSCALL_REGS(regs)->di = 0; // Sabotage!
     }
@@ -3410,7 +3410,7 @@ static int ret_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3434,7 +3434,7 @@ static int ret_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs
 struct prlimit_kretprobe_data { pid_t pid; int resource; void __user *new_rlim; void __user *old_rlim; };
 static struct kretprobe prlimit64_kprobe;
 static int entry_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct prlimit_kretprobe_data *data = (struct prlimit_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         data->pid = (pid_t)sys_regs->di; data->resource = (int)sys_regs->si;
@@ -3456,7 +3456,7 @@ static int ret_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3481,7 +3481,7 @@ static int ret_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *
 struct prctl_kretprobe_data { int option; unsigned long arg2, arg3, arg4, arg5; };
 static struct kretprobe prctl_kprobe;
 static int entry_handler_prctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct prctl_kretprobe_data *data = (struct prctl_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         data->option = (int)sys_regs->di; data->arg2 = sys_regs->si; data->arg3 = sys_regs->dx;
@@ -3503,7 +3503,7 @@ static int ret_handler_prctl(struct kretprobe_instance *ri, struct pt_regs *regs
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3531,7 +3531,7 @@ static struct kretprobe fcntl_kprobe;
 static struct kretprobe ioctl_kprobe;
 
 static int entry_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct fcntl_kretprobe_data *data = (struct fcntl_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         data->fd = (int)sys_regs->di; data->cmd = (int)sys_regs->si; data->arg = sys_regs->dx;
@@ -3543,13 +3543,13 @@ static int entry_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *re
 
 static int ret_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct fcntl_kretprobe_data *data = (struct fcntl_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3584,7 +3584,7 @@ struct pread64_kretprobe_data { int fd; void __user *buf; size_t count; loff_t p
 static struct kretprobe pread64_kprobe;
 
 static int entry_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pread64_kretprobe_data *data = (struct pread64_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         data->fd = (int)sys_regs->di; data->buf = (void __user *)sys_regs->si;
@@ -3597,13 +3597,13 @@ static int entry_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *
 
 static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct pread64_kretprobe_data *data = (struct pread64_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) {
+        if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
             guest_registry[i].rpc_done = false; break;
         }
@@ -3632,7 +3632,7 @@ static struct kretprobe statfs_kprobe, fstatfs_kprobe, newfstatat_kprobe, facces
 
 struct statfs_kretprobe_data { const char __user *path; void __user *buf; };
 static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
         data->path = (const char __user *)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
         SYSCALL_REGS(regs)->di = 0; // Sabotage
@@ -3642,12 +3642,12 @@ static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *r
 
 static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->tgid)) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
@@ -3672,7 +3672,7 @@ static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *reg
 
 struct fstatfs_kretprobe_data { int fd; void __user *buf; bool is_ghost; };
 static int entry_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
         int local_fd = (int)SYSCALL_REGS(regs)->di;
         data->fd = local_fd;
@@ -3693,12 +3693,12 @@ static int entry_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *
 
 static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct fstatfs_kretprobe_data *data = (struct fstatfs_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
@@ -3717,7 +3717,7 @@ static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *re
 
 struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user *buf; int flags; bool is_ghost; };
 static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
@@ -3738,12 +3738,12 @@ static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_reg
 
 static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
@@ -3767,7 +3767,7 @@ static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs 
 
 struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; int flags; bool is_ghost; };
 static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
@@ -3788,12 +3788,12 @@ static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_reg
 
 static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
@@ -3817,7 +3817,7 @@ static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs 
 
 struct readlink_kretprobe_data { const char __user *path; void __user *buf; size_t bufsiz; };
 static int entry_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
         data->path = (const char __user *)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
         data->bufsiz = (size_t)SYSCALL_REGS(regs)->dx;
@@ -3828,12 +3828,12 @@ static int entry_handler_readlink(struct kretprobe_instance *ri, struct pt_regs 
 
 static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->tgid)) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
@@ -3857,7 +3857,7 @@ static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *r
 
 struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user *buf; size_t bufsiz; bool is_ghost; };
 static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
@@ -3878,12 +3878,12 @@ static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_reg
 
 static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
@@ -3909,7 +3909,7 @@ struct getdents64_kretprobe_data { int fd; void __user *dirp; u32 count; bool is
 static struct kretprobe getdents64_kprobe;
 
 static int entry_handler_getdents64(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct getdents64_kretprobe_data *data = (struct getdents64_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         data->fd = (int)sys_regs->di; data->dirp = (void __user *)sys_regs->si; data->count = (u32)sys_regs->dx;
@@ -3922,13 +3922,13 @@ static int entry_handler_getdents64(struct kretprobe_instance *ri, struct pt_reg
 
 static int ret_handler_getdents64(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct getdents64_kretprobe_data *data = (struct getdents64_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
 
@@ -3950,7 +3950,7 @@ struct pipe2_kretprobe_data { void __user *pipefd; int flags; };
 static struct kretprobe pipe2_kprobe;
 
 static int entry_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pipe2_kretprobe_data *data = (struct pipe2_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         data->pipefd = (void __user *)sys_regs->di; data->flags = (int)sys_regs->si;
@@ -3961,13 +3961,13 @@ static int entry_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *re
 
 static int ret_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct pipe2_kretprobe_data *data = (struct pipe2_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->pid)) return 0;
+    if (!is_guest_process(current->tgid)) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->pid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
+        if (guest_registry[i].local_pid == current->tgid) { home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid; guest_registry[i].rpc_done = false; break; }
     }
     spin_unlock(&guest_lock);
 
@@ -4018,7 +4018,7 @@ struct mmap_kretprobe_data { bool is_ghost; int fd; };
 static struct kretprobe mmap_kprobe;
 
 static int entry_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct mmap_kretprobe_data *data = (struct mmap_kretprobe_data *)ri->data;
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         
@@ -4043,7 +4043,7 @@ static int entry_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *reg
 }
 
 static int ret_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct mmap_kretprobe_data *data = (struct mmap_kretprobe_data *)ri->data;
         if (data->is_ghost) {
             // Force Permission Denied! The app must handle the error.
@@ -4062,7 +4062,7 @@ static int ret_handler_mmap(struct kretprobe_instance *ri, struct pt_regs *regs)
 // --- 1. MPROTECT ---
 static struct kretprobe mprotect_kprobe;
 static int entry_handler_mprotect(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         // x86_64 args: rdi=addr, rsi=len, rdx=prot
         mattx_dbg("[HOOK] mprotect: Local execution on VM2 (addr: 0x%lx, len: %lu, prot: %d)\n",
@@ -4075,7 +4075,7 @@ static int ret_handler_mprotect(struct kretprobe_instance *ri, struct pt_regs *r
 // --- 2. MADVISE ---
 static struct kretprobe madvise_kprobe;
 static int entry_handler_madvise(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         // x86_64 args: rdi=addr, rsi=length, rdx=advice
         mattx_dbg("[HOOK] madvise: Local execution on VM2 (addr: 0x%lx, len: %lu, advice: %d)\n",
@@ -4088,7 +4088,7 @@ static int ret_handler_madvise(struct kretprobe_instance *ri, struct pt_regs *re
 // --- 3. MBIND ---
 static struct kretprobe mbind_kprobe;
 static int entry_handler_mbind(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         // x86_64 args: rdi=addr, rsi=len, rdx=mode
         mattx_dbg("[HOOK] mbind: Local execution on VM2 (addr: 0x%lx, len: %lu, mode: %d)\n",
@@ -4107,7 +4107,7 @@ static int ret_handler_mbind(struct kretprobe_instance *ri, struct pt_regs *regs
 // --- 1. SCHED_GETAFFINITY ---
 static struct kretprobe sched_getaffinity_kprobe;
 static int entry_handler_sched_getaffinity(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         // x86_64 args: rdi=pid, rsi=len, rdx=user_mask_ptr
         mattx_dbg("[HOOK] sched_getaffinity: Local execution on VM2 (pid: %d, len: %u)\n",
@@ -4120,7 +4120,7 @@ static int ret_handler_sched_getaffinity(struct kretprobe_instance *ri, struct p
 // --- 2. SCHED_SETAFFINITY ---
 static struct kretprobe sched_setaffinity_kprobe;
 static int entry_handler_sched_setaffinity(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         struct pt_regs *sys_regs = SYSCALL_REGS(regs);
         // x86_64 args: rdi=pid, rsi=len, rdx=user_mask_ptr
         mattx_dbg("[HOOK] sched_setaffinity: Local execution on VM2 (pid: %d, len: %u)\n",
@@ -4133,7 +4133,7 @@ static int ret_handler_sched_setaffinity(struct kretprobe_instance *ri, struct p
 // --- 3. SCHED_YIELD ---
 static struct kretprobe sched_yield_kprobe;
 static int entry_handler_sched_yield(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->pid)) {
+    if (is_guest_process(current->tgid)) {
         mattx_dbg("[HOOK] sched_yield: Local execution on VM2. Yielding CPU.\n");
     }
     return 0; // Let it execute natively!

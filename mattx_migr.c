@@ -375,7 +375,6 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
 
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
-    struct pt_regs *regs;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
@@ -432,16 +431,38 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         mattx_dbg("[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
     }
 
-    regs = task_pt_regs(task);
-    if (regs) {
-        memcpy(&req->regs, regs, sizeof(struct pt_regs));
-        req->fsbase = task->thread.fsbase;
-        req->gsbase = task->thread.gsbase;
-        
-        if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
-            mattx_dbg("[DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
+    // --- GANG EXTRACTION ---
+    struct task_struct *threads[MAX_GANG_THREADS];
+    int t_count = 0;
+    struct task_struct *t;
+    
+    rcu_read_lock();
+    for_each_thread(task, t) {
+        if (t_count < MAX_GANG_THREADS) {
+            get_task_struct(t);
+            threads[t_count++] = t;
         }
     }
+    rcu_read_unlock();
+
+    req->thread_count = t_count;
+    for (int i = 0; i < t_count; i++) {
+        if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
+        
+        req->threads[i].tid = threads[i]->pid;
+        struct pt_regs *t_regs = task_pt_regs(threads[i]);
+        if (t_regs) {
+            memcpy(&req->threads[i].regs, t_regs, sizeof(struct pt_regs));
+            req->threads[i].fsbase = threads[i]->thread.fsbase;
+            req->threads[i].gsbase = threads[i]->thread.gsbase;
+            
+            if (threads[i] == task && access_process_vm(task, t_regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
+                mattx_dbg("[DEBUG] Mother Source RIP (0x%lx) contains: %8ph\n", (unsigned long)t_regs->ip, rip_buf);
+            }
+        }
+        put_task_struct(threads[i]);
+    }
+    mattx_dbg("[EXTRACT] Packed %d threads into the Gang Blueprint!\n", t_count);
 
     mm = task->mm;
     if (mm) {
@@ -484,7 +505,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 }
 
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
-    struct pt_regs *regs;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
@@ -522,11 +542,34 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
     // Pack the DFSA path into the Blueprint! ---
     strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
+
+    // --- GANG RETURN EXTRACTION ---
+    struct task_struct *threads[MAX_GANG_THREADS];
+    int t_count = 0;
+    struct task_struct *t;
     
-    regs = task_pt_regs(task);
-    if (regs) {
-        memcpy(&req->regs, regs, sizeof(struct pt_regs));
+    rcu_read_lock();
+    for_each_thread(task, t) {
+        if (t_count < MAX_GANG_THREADS) {
+            get_task_struct(t);
+            threads[t_count++] = t;
+        }
     }
+    rcu_read_unlock();
+
+    req->thread_count = t_count;
+    for (int i = 0; i < t_count; i++) {
+        if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
+        
+        req->threads[i].tid = threads[i]->pid;
+        struct pt_regs *t_regs = task_pt_regs(threads[i]);
+        if (t_regs) {
+            memcpy(&req->threads[i].regs, t_regs, sizeof(struct pt_regs));
+        }
+        put_task_struct(threads[i]);
+    }
+    mattx_dbg("[EXTRACT] Packed %d threads into the Return Blueprint!\n", t_count);
+
 
     mm = task->mm;
     if (mm) {
@@ -721,10 +764,14 @@ int mattx_expel_guest(pid_t local_pid) {
         return -ENOTCONN;
     }
 
+
     // 2. Grab the task struct
     rcu_read_lock();
     surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID);
-    if (surrogate) get_task_struct(surrogate);
+    if (surrogate) {
+        surrogate = surrogate->group_leader; // Grab the Mother!
+        get_task_struct(surrogate);
+    }
     rcu_read_unlock();
 
     if (surrogate) {

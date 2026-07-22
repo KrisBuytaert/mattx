@@ -77,6 +77,7 @@ u32 mattx_calc_local_load(void) {
     
     rcu_read_lock();
     for_each_process(p) {
+        if (p->pid != p->tgid) continue; // Only count/migrate Mother tasks!
         if ((p->flags & PF_KTHREAD) || !p->mm) continue;
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
         
@@ -118,6 +119,7 @@ static struct task_struct* mattx_find_candidate_task(void) {
 
     rcu_read_lock();
     for_each_process(p) {
+        if (p->pid != p->tgid) continue; // Only count/migrate Mother tasks!
         if ((p->flags & PF_KTHREAD) || !p->mm) continue;
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
         if (is_guest_process(p->pid)) continue;

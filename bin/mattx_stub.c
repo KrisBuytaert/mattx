@@ -35,6 +35,13 @@
 #include <sys/mman.h> 
 #include <signal.h>
 #include <sched.h>      // For unshare()
+#include <sys/syscall.h>
+
+// Safe fallback just in case the glibc headers are weird
+#ifndef SYS_clone
+#define SYS_clone 56
+#endif
+
 #include <sys/mount.h>  // For mount()
 #include <sys/stat.h>   // For mkdir()
 #include <netlink/netlink.h>
@@ -43,6 +50,7 @@
 
 // Match the kernel's new MAX_FDS ---
 #define MAX_FDS 256
+#define MAX_GANG_THREADS 16
 
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
@@ -62,14 +70,24 @@ struct mattx_cpu_regs {
     uint64_t rip, cs, eflags, rsp, ss;
 };
 
+
+struct mattx_thread_info {
+    uint32_t tid;
+    struct mattx_cpu_regs regs;
+    uint64_t fsbase;
+    uint64_t gsbase;
+};
+
 struct mattx_migration_req {
     uint32_t orig_pid;
     uint32_t uid; 
     uint32_t gid; 
     uint32_t home_node;
-    struct mattx_cpu_regs regs;
-    uint64_t fsbase; 
-    uint64_t gsbase; 
+    
+    // --- The Gang Array ---
+    uint32_t thread_count;
+    struct mattx_thread_info threads[MAX_GANG_THREADS];
+    
     uint64_t arg_start; 
     uint64_t arg_end;   
     char comm[16];
@@ -81,6 +99,7 @@ struct mattx_migration_req {
     uint8_t pad[3];
     struct mattx_vma_info vmas[]; 
 };
+
 
 static struct mattx_migration_req *received_req = NULL;
 
@@ -199,6 +218,17 @@ int main() {
         } else {
             printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX%s)\n", 
                    i, v->vm_start, v->vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
+        }
+    }
+
+    printf("MattX-Stub: Spawning %u dummy threads for Gang Migration...\n", received_req->thread_count);
+    int clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    
+    for (uint32_t i = 1; i < received_req->thread_count; i++) {
+        void *dummy_stack = malloc(4096);
+        if (syscall(SYS_clone, clone_flags, (char *)dummy_stack + 4096, NULL, NULL, NULL) == 0) {
+            // Child thread: Just sleep until the kernel hijacks my brain!
+            while(1) sleep(1); 
         }
     }
 

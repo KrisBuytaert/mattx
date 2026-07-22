@@ -226,6 +226,7 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
                     rcu_read_lock();
                     task = pid_task(find_vpid(arg1), PIDTYPE_PID);
                     if (task) get_task_struct(task);
+                    task = task->group_leader; // Grab the Mother!
                     rcu_read_unlock();
 
                     if (task) {
