@@ -184,9 +184,6 @@ int main() {
     printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', UID: %u, GID: %u, VMAs: %u, FDs: %u\n", 
            received_req->orig_pid, received_req->comm, received_req->uid, received_req->gid, received_req->vma_count, received_req->fd_count);
 
-    // Get the approximate memory address of our own code to prevent suicide!
-    uint64_t my_brain_addr = (uint64_t)&main & ~(0xFFFULL); 
-
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         // --- FIXED: Copy by value to avoid unaligned pointer warnings! ---
         struct mattx_vma_info v = received_req->vmas[i]; 
