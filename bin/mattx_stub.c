@@ -192,16 +192,6 @@ int main() {
         struct mattx_vma_info v = received_req->vmas[i]; 
         size_t size = v.vm_end - v.vm_start;
 
-        // --- THE ALMA ANOMALY SHIELD ---
-        if (my_brain_addr >= v->vm_start && my_brain_addr < v->vm_end) {
-            fprintf(stderr, "\n=======================================================\n");
-            fprintf(stderr, "MattX-Stub: FATAL ALMA ANOMALY DETECTED! 🚨\n");
-            fprintf(stderr, "VMA 0x%lx - 0x%lx overlaps with my own brain (0x%lx)!\n", v->vm_start, v->vm_end, my_brain_addr);
-            fprintf(stderr, "I refuse to overwrite my own memory. Please compile mattx-stub with '-fPIE -pie'!\n");
-            fprintf(stderr, "=======================================================\n\n");
-            exit(1);
-        }
-
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
 
