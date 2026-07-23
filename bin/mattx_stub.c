@@ -188,8 +188,9 @@ int main() {
     uint64_t my_brain_addr = (uint64_t)&main & ~(0xFFFULL); 
 
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
-        struct mattx_vma_info *v = &received_req->vmas[i];
-        size_t size = v->vm_end - v->vm_start;
+        // --- FIXED: Copy by value to avoid unaligned pointer warnings! ---
+        struct mattx_vma_info v = received_req->vmas[i]; 
+        size_t size = v.vm_end - v.vm_start;
 
         // --- THE ALMA ANOMALY SHIELD ---
         if (my_brain_addr >= v->vm_start && my_brain_addr < v->vm_end) {
@@ -205,16 +206,17 @@ int main() {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
 
         // The Stack Growth Protector ---
-        if (v->vm_flags & 0x0100) {
+        if (v.vm_flags & 0x0100) {
             flags |= MAP_GROWSDOWN;
         }
 
-        void *addr = mmap((void *)v->vm_start, size, prot, flags, -1, 0);        
+        void *addr = mmap((void *)v.vm_start, size, prot, flags, -1, 0);        
         if (addr == MAP_FAILED) {
             perror("MattX-Stub: mmap MAP_FIXED failed");
         } else {
             printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX%s)\n", 
                    i, (unsigned long)v.vm_start, (unsigned long)v.vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
+        }
     }
 
     printf("MattX-Stub: Spawning %u dummy threads for Gang Migration...\n", received_req->thread_count);
