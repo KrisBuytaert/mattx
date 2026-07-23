@@ -468,6 +468,8 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (mm) {
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
+        req->start_brk = mm->start_brk; // Capture Heap Start
+        req->brk = mm->brk;             // Capture Heap End
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
@@ -575,6 +577,8 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     if (mm) {
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
+        req->start_brk = mm->start_brk; // Capture Heap Start
+        req->brk = mm->brk;             // Capture Heap End
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);

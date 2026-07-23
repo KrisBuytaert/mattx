@@ -160,6 +160,8 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         if (hijacked_stub_task->mm) {
             hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
             hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
+            hijacked_stub_task->mm->start_brk = pending_migration->start_brk;
+            hijacked_stub_task->mm->brk = pending_migration->brk;
         }
         
         new_cred = prepare_creds();
@@ -390,7 +392,13 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         if (pending_migration->thread_count > 0) {
             mattx_dbg("[IMPORT] Deputy Brain Restored. New Mother RIP: 0x%lx\n", (unsigned long)pending_migration->threads[0].regs.rip);
         }
-        
+
+        // Restore the Heap boundaries on the Deputy! ---
+        if (hijacked_stub_task->mm) {
+            hijacked_stub_task->mm->start_brk = pending_migration->start_brk;
+            hijacked_stub_task->mm->brk = pending_migration->brk;
+        }
+
         spin_lock(&export_lock);
         for (i = 0; i < export_count; i++) {
             if (export_registry[i].orig_pid == hijacked_stub_task->pid) {

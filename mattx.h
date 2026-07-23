@@ -240,6 +240,8 @@ struct mattx_migration_req {
     
     uint64_t arg_start; 
     uint64_t arg_end;   
+    uint64_t start_brk; // The start of the Heap
+    uint64_t brk;       // The current end of the Heap
     char comm[16]; 
     char dfsa_dir[256]; 
     u32 fd_count;          
