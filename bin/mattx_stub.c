@@ -77,6 +77,9 @@ struct mattx_thread_info {
     uint64_t gsbase;
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 
+
+// --- IN mattx_stub.c ---
+
 struct mattx_migration_req {
     uint32_t orig_pid;
     uint32_t uid; 
@@ -88,6 +91,8 @@ struct mattx_migration_req {
     
     uint64_t arg_start; 
     uint64_t arg_end;   
+    uint64_t start_brk;
+    uint64_t brk;
     char comm[16];
     char dfsa_dir[256];    
     uint32_t fd_count;          
