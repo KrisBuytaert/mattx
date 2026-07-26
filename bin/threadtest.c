@@ -34,6 +34,8 @@ void worker_process(int num_threads) {
     
     printf("[Worker] Sleeping 10 seconds for migration prep...\n");
     sleep(10);
+    printf("[Worker] Sleeping 5 seconds for migration prep...\n");
+    sleep(5);
 
     pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
     int *thread_ids = malloc(num_threads * sizeof(int));
