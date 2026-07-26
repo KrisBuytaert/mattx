@@ -72,7 +72,7 @@ epolltest: bin/epolltest.c
 	gcc -o bin/epolltest bin/epolltest.c
 
 threadtest: bin/threadtest.c
-	gcc -o bin/threadtest bin/threadtest.c -lpthread
+	gcc -o bin/threadtest bin/threadtest.c -lpthread -lgcc_s
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
