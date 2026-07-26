@@ -1,0 +1,3 @@
+#!/bin/bash
+
+watch "ps -eLF | grep threadtest | grep -v grep"
