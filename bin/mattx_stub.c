@@ -131,6 +131,13 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
     return NL_OK;
 }
 
+
+static int dummy_thread_fn(void *arg) {
+    // Child thread: Just sleep until the kernel hijacks my brain!
+    while(1) sleep(1); 
+    return 0;
+}
+
 int main() {
     // Redirect stdout and stderr to a log file for debugging
     if (freopen("/tmp/mattx_stub.log", "a", stdout) == NULL) {
@@ -216,9 +223,10 @@ int main() {
     
     for (uint32_t i = 1; i < received_req->thread_count; i++) {
         void *dummy_stack = malloc(4096);
-        if (syscall(SYS_clone, clone_flags, (char *)dummy_stack + 4096, NULL, NULL, NULL) == 0) {
-            // Child thread: Just sleep until the kernel hijacks my brain!
-            while(1) sleep(1); 
+        
+        // Use the glibc clone() wrapper! It safely handles the stack return address.
+        if (clone(dummy_thread_fn, (char *)dummy_stack + 4096, clone_flags, NULL) == -1) {
+            perror("MattX-Stub: clone failed");
         }
     }
 
