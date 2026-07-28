@@ -148,6 +148,9 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
                     t->thread.fsbase = pending_migration->threads[t_idx].fsbase;
                     t->thread.gsbase = pending_migration->threads[t_idx].gsbase;
+                    // Inject the Futex Pointers! ---
+                    t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
+                    t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
                 }
                 t_idx++;
             }
@@ -382,6 +385,9 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
                 struct pt_regs *t_regs = task_pt_regs(t);
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
+                    // Inject the Futex Pointers on Return! ---
+                    t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
+                    t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
                 }
                 t_idx++;
             }

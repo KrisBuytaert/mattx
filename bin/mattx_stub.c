@@ -75,7 +75,10 @@ struct mattx_thread_info {
     struct mattx_cpu_regs regs;
     uint64_t fsbase;
     uint64_t gsbase;
-} __attribute__((packed)); // <-- FORCE EXACT LAYOUT
+    uint64_t clear_child_tid; // The Futex Wake Pointer!
+    uint64_t set_child_tid;   // The Thread Init Pointer!
+} __attribute__((packed)); // FORCE EXACT LAYOUT
+
 
 
 // --- IN mattx_stub.c ---
