@@ -1591,7 +1591,13 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
     if (!is_guest_process(my_pid)) return 0;
 
     if (strncpy_from_user(filename, data->filename_ptr, sizeof(filename) - 1) > 0) {
-        
+
+        // --- THE HPC FAST-PATH ---
+        if (config_hpc_local_libs && is_hpc_local_lib(filename)) {
+            mattx_dbg("[HOOK] HPC Fast-Path: Executing openat('%s') locally on remote VM.\n", filename);
+            return 0; // Let it execute natively!
+        }
+
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
@@ -3659,6 +3665,10 @@ static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *reg
             if (data->path) {
                 if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
                     mattx_dbg("[HOOK] Warning: Failed to read path for statfs!\n");
+                } else if (config_hpc_local_libs && is_hpc_local_lib(rpc->meta_path)) {
+                    mattx_dbg("[HOOK] HPC Fast-Path: Executing statfs('%s') locally.\n", rpc->meta_path);
+                    kfree(rpc);
+                    return 0;
                 }
             }
             send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
@@ -3755,6 +3765,10 @@ static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs 
             if (data->path) {
                 if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
                     mattx_dbg("[HOOK] Warning: Failed to read path for newfstatat!\n");
+                } else if (config_hpc_local_libs && is_hpc_local_lib(rpc->meta_path)) {
+                    mattx_dbg("[HOOK] HPC Fast-Path: Executing newfstatat('%s') locally.\n", rpc->meta_path);
+                    kfree(rpc);
+                    return 0;
                 }
             }
             send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
@@ -3805,6 +3819,10 @@ static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs 
             if (data->path) {
                 if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
                     mattx_dbg("[HOOK] Warning: Failed to read path for faccessat2!\n");
+                } else if (config_hpc_local_libs && is_hpc_local_lib(rpc->meta_path)) {
+                    mattx_dbg("[HOOK] HPC Fast-Path: Executing faccessat2('%s') locally.\n", rpc->meta_path);
+                    kfree(rpc);
+                    return 0;
                 }
             }
             send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
@@ -3845,6 +3863,10 @@ static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *r
             if (data->path) {
                 if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
                     mattx_dbg("[HOOK] Warning: Failed to read path for readlink!\n");
+                } else if (config_hpc_local_libs && is_hpc_local_lib(rpc->meta_path)) {
+                    mattx_dbg("[HOOK] HPC Fast-Path: Executing readlink('%s') locally.\n", rpc->meta_path);
+                    kfree(rpc);
+                    return 0;
                 }
             }
             send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
@@ -3895,6 +3917,10 @@ static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs 
             if (data->path) {
                 if (strncpy_from_user(rpc->meta_path, data->path, sizeof(rpc->meta_path) - 1) < 0) {
                     mattx_dbg("[HOOK] Warning: Failed to read path for readlinkat!\n");
+                } else if (config_hpc_local_libs && is_hpc_local_lib(rpc->meta_path)) {
+                    mattx_dbg("[HOOK] HPC Fast-Path: Executing readlinkat('%s') locally.\n", rpc->meta_path);
+                    kfree(rpc);
+                    return 0;
                 }
             }
             send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);

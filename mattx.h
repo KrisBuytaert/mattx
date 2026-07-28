@@ -1225,6 +1225,13 @@ extern bool config_migrate_file_io;
 extern bool config_migrate_network_io;
 extern bool config_mpi_support;
 extern bool config_accept_guests;
+extern bool config_hpc_local_libs; // The HPC Fast-Path Toggle!
+
+// Expose the balancer thread so we can borrow its host root filesystem!
+extern struct task_struct *balancer_thread;
+
+// The HPC Fast-Path Helper
+bool is_hpc_local_lib(const char *path);
 
 int mattx_expel_guest(pid_t local_pid);
 

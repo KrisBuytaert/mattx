@@ -61,6 +61,7 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
     seq_printf(m, "MPI Support: %s\n", config_mpi_support ? "YES" : "NO");
     seq_printf(m, "Accept Guests: %s\n", config_accept_guests ? "YES" : "NO");
+    seq_printf(m, "HPC Local Libs: %s\n", config_hpc_local_libs ? "ON" : "OFF");
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
@@ -205,6 +206,10 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
         else if (strcmp(cmd, "accept") == 0 && arg1 != -1) {
             config_accept_guests = (arg1 != 0);
             mattx_dbg(" [ADMIN] Accept Guests set to: %s\n", config_accept_guests ? "YES" : "NO");
+        }
+        else if (strcmp(cmd, "locallibs") == 0 && arg1 != -1) { // <-- NEW
+            config_hpc_local_libs = (arg1 != 0);
+            mattx_dbg(" [ADMIN] HPC Local Libs Fast-Path set to: %s\n", config_hpc_local_libs ? "ON" : "OFF");
         }
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             

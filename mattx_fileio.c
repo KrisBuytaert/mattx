@@ -26,6 +26,19 @@
 #include <linux/poll.h>
 #include <linux/namei.h> // For kern_path
 
+// --- THE HPC FAST-PATH HELPER ---
+bool is_hpc_local_lib(const char *path) {
+    if (!path) return false;
+    if (strncmp(path, "/lib/", 5) == 0) return true;
+    if (strncmp(path, "/lib64/", 7) == 0) return true;
+    if (strncmp(path, "/usr/lib/", 9) == 0) return true;
+    if (strncmp(path, "/usr/lib64/", 11) == 0) return true;
+    if (strncmp(path, "/etc/ld.so.cache", 16) == 0) return true;
+    if (strncmp(path, "/usr/share/locale/", 18) == 0) return true;
+    return false;
+}
+EXPORT_SYMBOL(is_hpc_local_lib);
+
 // --- The VFS Proxy (Fake FDs) ---
 
 // Forward declaration for the universal remote file fetcher
@@ -3612,13 +3625,28 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
     u64 req_id;
     struct mattx_vfs_getattr_req req;
 
-    // The Local Fast-Path! ---
-    if (node_id == my_node_id) {
+    bool is_local_hpc = (config_hpc_local_libs && is_hpc_local_lib(path));
+
+    // The Local Fast-Path (With Chroot Escape!) ---
+    if (node_id == my_node_id || is_local_hpc) {
+        struct fs_struct *old_fs = NULL;
+        
+        if (is_local_hpc && node_id != my_node_id && balancer_thread) {
+            old_fs = current->fs;
+            task_lock(balancer_thread);
+            current->fs = balancer_thread->fs;
+            task_unlock(balancer_thread);
+        }
+
         struct path local_path;
         int err = kern_path(path, LOOKUP_FOLLOW, &local_path);
         if (!err) {
             err = vfs_getattr(&local_path, stat_out, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
             path_put(&local_path);
+        }
+        
+        if (old_fs) {
+            current->fs = old_fs;
         }
         return err;
     }
@@ -3748,9 +3776,27 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
     u64 req_id;
     struct mattx_vfs_open_req req;
 
-    // --- NEW: The Local Fast-Path! ---
-    if (node_id == my_node_id) {
+    bool is_local_hpc = (config_hpc_local_libs && is_hpc_local_lib(path));
+
+    // The Local Fast-Path (With Chroot Escape!) ---
+    if (node_id == my_node_id || is_local_hpc) {
+        struct fs_struct *old_fs = NULL;
+        
+        // If we are on VM2 (chrooted) and using the HPC fast-path, borrow the host's root!
+        if (is_local_hpc && node_id != my_node_id && balancer_thread) {
+            old_fs = current->fs;
+            task_lock(balancer_thread);
+            current->fs = balancer_thread->fs;
+            task_unlock(balancer_thread);
+        }
+
         struct file *f = filp_open(path, flags, mode);
+        
+        // Restore the chroot!
+        if (old_fs) {
+            current->fs = old_fs;
+        }
+
         if (IS_ERR(f)) return PTR_ERR(f);
         
         spin_lock(&mfs_file_lock);
