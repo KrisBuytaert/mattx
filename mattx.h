@@ -1209,6 +1209,10 @@ extern mattx_sys_getdents64_fn real_sys_getdents64;
 typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
 extern mattx_sys_pipe2_fn real_sys_pipe2;
 
+// --- THE THREAD GHOST EXORCIST RESOLVER ---
+typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
+extern mattx_sys_exit_fn real_sys_exit;
+
 
 
 // The Extreme Debugging Macro ---

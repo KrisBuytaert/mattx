@@ -64,6 +64,7 @@ mattx_sys_readlink_fn real_sys_readlink = NULL;
 mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
 mattx_sys_getdents64_fn real_sys_getdents64 = NULL;
 mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
+mattx_sys_exit_fn real_sys_exit = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -186,7 +187,10 @@ static void mattx_resolve_hidden_symbols(void) {
 
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_sendmsg";
-    if (register_kprobe(&kp) == 0) { real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; unregister_kprobe(&kp); }
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_recvmsg";
@@ -296,6 +300,14 @@ static void mattx_resolve_hidden_symbols(void) {
     kp.symbol_name = "__x64_sys_pipe2";
     if (register_kprobe(&kp) == 0) { 
         real_sys_pipe2 = (mattx_sys_pipe2_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+    
+    // --- THE THREAD GHOST EXORCIST ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_exit";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_exit = (mattx_sys_exit_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 

@@ -370,6 +370,40 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
 }
 
 
+// ==============================================================================
+// 👻 THE GHOST EXORCIST (Silent Thread Assassin)
+// ==============================================================================
+struct mattx_exorcist_ctx {
+    struct callback_head cb;
+};
+
+static void mattx_exorcist_cb(struct callback_head *cb) {
+    struct mattx_exorcist_ctx *ctx = container_of(cb, struct mattx_exorcist_ctx, cb);
+    struct pt_regs regs;
+    
+    mattx_dbg("[EXORCIST] Executing clean thread exit for Ghost Thread %d...\n", current->pid);
+    kfree(ctx);
+    
+    // --- THE SILENT ASSASSIN ---
+    // Prevent the kernel from writing to clear_child_tid, because this thread 
+    // already died on VM2 and the user-space memory might have been reused!
+    current->clear_child_tid = NULL;
+    current->set_child_tid = NULL;
+    
+    memset(&regs, 0, sizeof(regs));
+    regs.di = 0; // Exit code 0
+    
+    if (real_sys_exit) {
+        real_sys_exit(&regs); // Pull the trigger! (This function never returns)
+    }
+    
+    // Fallback just in case
+    set_current_state(TASK_INTERRUPTIBLE);
+    schedule();
+}
+// ==============================================================================
+
+
 static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
@@ -385,15 +419,26 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
                 struct pt_regs *t_regs = task_pt_regs(t);
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
+                    
                     // Inject the Futex Pointers on Return! ---
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
                 }
-                t_idx++;
+            } else {
+                // --- DEPLOY THE GHOST EXORCIST ---
+                // This thread exists on VM1 but died on VM2! We must assassinate it cleanly.
+                struct mattx_exorcist_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+                if (ctx) {
+                    init_task_work(&ctx->cb, mattx_exorcist_cb);
+                    if (real_task_work_add) {
+                        real_task_work_add(t, &ctx->cb, TWA_SIGNAL);
+                    }
+                }
             }
+            t_idx++;
         }
         rcu_read_unlock();
-        
+
         // --- Use the Mother's registers from the Blueprint! ---
         if (pending_migration->thread_count > 0) {
             mattx_dbg("[IMPORT] Deputy Brain Restored. New Mother RIP: 0x%lx\n", (unsigned long)pending_migration->threads[0].regs.rip);
