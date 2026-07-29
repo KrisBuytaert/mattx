@@ -34,7 +34,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest
+all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
