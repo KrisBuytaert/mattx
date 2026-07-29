@@ -74,9 +74,13 @@ epolltest: bin/epolltest.c
 threadtest: bin/threadtest.c
 	gcc -o bin/threadtest bin/threadtest.c -lpthread -lgcc_s
 
+threadtest2: bin/threadtest2.c
+	gcc -o bin/threadtest2 bin/threadtest2.c -lpthread -lgcc_s
+
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2
 	rm -f mattxfs/Module.symvers
 
 install:
@@ -87,6 +91,8 @@ install:
 	sudo rm -f /usr/local/bin/servertestpoll
 	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/mattx-stub
+	sudo rm -f /usr/local/bin/threadtest
+	sudo rm -f /usr/local/bin/threadtest2
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
 	sudo rm -f /usr/local/bin/dfsatest
@@ -100,6 +106,7 @@ install:
 	sudo cp -f bin/dfsatest /usr/local/bin/dfsatest
 	sudo cp -f bin/epolltest /usr/local/bin/epolltest
 	sudo cp -f bin/threadtest /usr/local/bin/threadtest
+	sudo cp -f bin/threadtest2 /usr/local/bin/threadtest2
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
 	sudo cp -f bin/mattx-admin /usr/local/bin/mattx-admin
@@ -136,6 +143,7 @@ uninstall:
 	sudo rm -f /usr/local/bin/dfsatest
 	sudo rm -f /usr/local/bin/epolltest
 	sudo rm -f /usr/local/bin/threadtest
+	sudo rm -f /usr/local/bin/threadtest2
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
