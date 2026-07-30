@@ -4167,7 +4167,54 @@ static int entry_handler_sched_yield(struct kretprobe_instance *ri, struct pt_re
 static int ret_handler_sched_yield(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
 
 
+// ==============================================================================
+// 👶 THE CRADLE INTERCEPTOR (Newborn Thread Freezer)
+// ==============================================================================
+static struct kprobe wake_up_new_task_kprobe;
 
+struct mattx_newborn_ctx {
+    struct callback_head cb;
+};
+
+static void mattx_newborn_cb(struct callback_head *cb) {
+    struct mattx_newborn_ctx *ctx = container_of(cb, struct mattx_newborn_ctx, cb);
+    kfree(ctx);
+    mattx_dbg("[CRADLE] Newborn thread %d freezing at user-space boundary!\n", current->pid);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+static int entry_handler_wake_up_new_task(struct kprobe *p, struct pt_regs *regs) {
+    // In wake_up_new_task(struct task_struct *p), the child task is in regs->di
+    struct task_struct *child = (struct task_struct *)regs->di;
+    bool is_growing = false;
+
+    // Check if the current task (the Mother) is actively growing a gang!
+    spin_lock(&export_lock);
+    for (int i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == current->tgid) {
+            is_growing = export_registry[i].is_growing_gang;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+
+    if (is_growing && child) {
+        struct mattx_newborn_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            init_task_work(&ctx->cb, mattx_newborn_cb);
+            if (real_task_work_add) {
+                // Inject the freeze callback directly into the child's brain!
+                real_task_work_add(child, &ctx->cb, TWA_SIGNAL);
+                mattx_dbg("[CRADLE] Injected freeze callback into newborn thread %d\n", child->pid);
+            } else {
+                kfree(ctx);
+            }
+        }
+    }
+    return 0;
+}
+// ==============================================================================
 
 
 
@@ -4697,7 +4744,12 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&sched_yield_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_yield, returned %d\n", ret);
 
-
+    // --- THE CRADLE INTERCEPTOR ---
+    memset(&wake_up_new_task_kprobe, 0, sizeof(wake_up_new_task_kprobe));
+    wake_up_new_task_kprobe.symbol_name = "wake_up_new_task";
+    wake_up_new_task_kprobe.pre_handler = entry_handler_wake_up_new_task;
+    ret = register_kprobe(&wake_up_new_task_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kprobe failed for wake_up_new_task, returned %d\n", ret);
 
 
 
@@ -4707,6 +4759,7 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kprobe(&wake_up_new_task_kprobe);
     unregister_kretprobe(&sched_getaffinity_kprobe);
     unregister_kretprobe(&sched_setaffinity_kprobe);
     unregister_kretprobe(&sched_yield_kprobe);

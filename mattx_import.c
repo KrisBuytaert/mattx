@@ -250,6 +250,58 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
 }
 
 
+// ==============================================================================
+// 🌱 THE GANG GROWER (Native Thread Spawner)
+// ==============================================================================
+struct mattx_gang_grower_ctx {
+    struct callback_head cb;
+    struct completion done;
+    int missing_threads;
+};
+
+static void mattx_gang_grower_cb(struct callback_head *cb) {
+    struct mattx_gang_grower_ctx *ctx = container_of(cb, struct mattx_gang_grower_ctx, cb);
+    struct pt_regs regs;
+    int i;
+
+    mattx_dbg("[GROWER] Mother %d waking up to spawn %d missing threads...\n", current->pid, ctx->missing_threads);
+
+    for (i = 0; i < ctx->missing_threads; i++) {
+        // Carve a tiny 4KB dummy stack in user-space for the new thread
+        unsigned long dummy_stack = vm_mmap(NULL, 0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+        if (!IS_ERR_VALUE(dummy_stack)) {
+            memset(&regs, 0, sizeof(regs));
+            // The exact flags pthread_create uses!
+            regs.di = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+            regs.si = dummy_stack + 4096;
+            
+            if (real_sys_clone) {
+                real_sys_clone(&regs); // Birth the thread!
+            }
+        } else {
+            printk(KERN_ERR "MattX:[GROWER] Failed to allocate dummy stack!\n");
+        }
+    }
+
+    // Clear the growing flag so the Cradle Interceptor stands down
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == current->tgid) {
+            export_registry[i].is_growing_gang = false;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+
+    complete(&ctx->done);
+    
+    // Go back to sleep!
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+// ==============================================================================
+
+
 static void handle_return_blueprint(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
@@ -287,6 +339,61 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                 }
             }
             spin_unlock(&export_lock);
+
+            
+            // --- THE GANG GROWER ---
+            int local_thread_count = 0;
+            struct task_struct *t;
+            rcu_read_lock();
+            for_each_thread(deputy, t) { local_thread_count++; }
+            rcu_read_unlock();
+
+            if (req->thread_count > local_thread_count) {
+                int missing = req->thread_count - local_thread_count;
+                mattx_dbg("[RECALL] Gang Grower: VM1 has %d threads, Blueprint has %d. Spawning %d dummies...\n", 
+                          local_thread_count, req->thread_count, missing);
+                
+                spin_lock(&export_lock);
+                for (int i = 0; i < export_count; i++) {
+                    if (export_registry[i].orig_pid == req->orig_pid) {
+                        export_registry[i].is_growing_gang = true;
+                        break;
+                    }
+                }
+                spin_unlock(&export_lock);
+
+                struct mattx_gang_grower_ctx *grow_ctx = kmalloc(sizeof(*grow_ctx), GFP_KERNEL);
+                if (grow_ctx) {
+                    grow_ctx->missing_threads = missing;
+                    init_completion(&grow_ctx->done);
+                    init_task_work(&grow_ctx->cb, mattx_gang_grower_cb);
+                    if (real_task_work_add) {
+                        real_task_work_add(deputy, &grow_ctx->cb, TWA_SIGNAL);
+                        send_sig(SIGCONT, deputy, 0);
+                        wait_for_completion(&grow_ctx->done);
+                        mattx_dbg("[RECALL] Gang Grower finished. Mother is frozen again.\n");
+                        
+                        // Wait for all newborn threads to reach TASK_STOPPED
+                        int retries = 50;
+                        while (retries > 0) {
+                            bool all_stopped = true;
+                            rcu_read_lock();
+                            for_each_thread(deputy, t) {
+                                if (!(READ_ONCE(t->__state) & __TASK_STOPPED)) {
+                                    all_stopped = false;
+                                    break;
+                                }
+                            }
+                            rcu_read_unlock();
+                            if (all_stopped) break;
+                            msleep(10);
+                            retries--;
+                        }
+                    }
+                    kfree(grow_ctx);
+                }
+            }
+
 
             // --- THE DYNAMIC BRAIN CARVER (Deadlock-Free Edition) ---
             // The Surrogate may have allocated NEW memory while running on VM2!

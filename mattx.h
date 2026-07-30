@@ -945,6 +945,7 @@ struct mattx_export_info {
     int target_node;
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
+    bool is_growing_gang; // The Gang Grower Flag!
 };
 
 struct mattx_vfs_getattr_req {
@@ -1212,6 +1213,12 @@ extern mattx_sys_pipe2_fn real_sys_pipe2;
 // --- THE THREAD GHOST EXORCIST RESOLVER ---
 typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
 extern mattx_sys_exit_fn real_sys_exit;
+
+// --- THE GANG GROWER RESOLVER ---
+typedef long (*mattx_sys_clone_fn)(const struct pt_regs *regs);
+extern mattx_sys_clone_fn real_sys_clone;
+
+
 
 
 
