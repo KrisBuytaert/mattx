@@ -511,7 +511,7 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
         // Check if the process is currently migrating (Recall phase)
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == current->pid) {
+            if (guest_registry[i].local_pid == current->tgid) {
                 is_migrating = guest_registry[i].is_migrating;
                 break;
             }
