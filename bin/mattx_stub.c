@@ -96,6 +96,7 @@ struct mattx_migration_req {
     uint64_t arg_end;   
     uint64_t start_brk;
     uint64_t brk;
+    uint64_t vdso_addr; // The vDSO Transplant Address!
     char comm[16];
     char dfsa_dir[256];    
     uint32_t fd_count;          

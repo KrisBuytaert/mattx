@@ -243,6 +243,8 @@ struct mattx_migration_req {
     uint64_t arg_end;   
     uint64_t start_brk; // The start of the Heap
     uint64_t brk;       // The current end of the Heap
+    uint64_t vdso_addr; // The vDSO Transplant Address!
+
     char comm[16]; 
     char dfsa_dir[256]; 
     u32 fd_count;          
@@ -1218,7 +1220,9 @@ extern mattx_sys_exit_fn real_sys_exit;
 typedef long (*mattx_sys_clone_fn)(const struct pt_regs *regs);
 extern mattx_sys_clone_fn real_sys_clone;
 
-
+// --- THE vDSO TRANSPLANT RESOLVER ---
+typedef long (*mattx_sys_mremap_fn)(const struct pt_regs *regs);
+extern mattx_sys_mremap_fn real_sys_mremap;
 
 
 

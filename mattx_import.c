@@ -104,6 +104,48 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
 }
 
 
+// ==============================================================================
+// 🛸 THE vDSO TRANSPLANT (Memory Remapper)
+// ==============================================================================
+struct mattx_vdso_transplant_ctx {
+    struct callback_head cb;
+    struct completion done;
+    unsigned long old_vdso;
+    unsigned long new_vdso;
+    unsigned long vdso_size;
+};
+
+static void mattx_vdso_transplant_cb(struct callback_head *cb) {
+    struct mattx_vdso_transplant_ctx *ctx = container_of(cb, struct mattx_vdso_transplant_ctx, cb);
+    struct pt_regs regs;
+    
+    mattx_dbg("[TRANSPLANT] Moving vDSO from 0x%lx to 0x%lx (Size: %lu)...\n", ctx->old_vdso, ctx->new_vdso, ctx->vdso_size);
+    
+    memset(&regs, 0, sizeof(regs));
+    // sys_mremap(old_addr, old_size, new_size, flags, new_addr)
+    regs.di = ctx->old_vdso;
+    regs.si = ctx->vdso_size;
+    regs.dx = ctx->vdso_size;
+    regs.r10 = MREMAP_MAYMOVE | MREMAP_FIXED; // Force it to the exact address!
+    regs.r8 = ctx->new_vdso;
+    
+    if (real_sys_mremap) {
+        long ret = real_sys_mremap(&regs);
+        if (ret == ctx->new_vdso) {
+            current->mm->context.vdso = (void *)ctx->new_vdso;
+            mattx_dbg("[TRANSPLANT] vDSO successfully moved!\n");
+        } else {
+            printk(KERN_ERR "MattX:[TRANSPLANT] Failed to move vDSO! (ret: %ld)\n", ret);
+        }
+    }
+    
+    complete(&ctx->done);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+// ==============================================================================
+
+
 static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
     
@@ -137,6 +179,42 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             msleep(10);
             retries--;
         }
+
+        // --- THE vDSO TRANSPLANT ---
+        if (hijacked_stub_task->mm && hijacked_stub_task->mm->context.vdso != (void *)pending_migration->vdso_addr) {
+            unsigned long old_vdso = (unsigned long)hijacked_stub_task->mm->context.vdso;
+            unsigned long new_vdso = pending_migration->vdso_addr;
+            unsigned long vdso_size = PAGE_SIZE; // Fallback
+            
+            mmap_read_lock(hijacked_stub_task->mm);
+            struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, old_vdso);
+            if (vma && vma->vm_start <= old_vdso && vma->vm_end > old_vdso) {
+                vdso_size = vma->vm_end - vma->vm_start;
+            }
+            mmap_read_unlock(hijacked_stub_task->mm);
+            
+            struct mattx_vdso_transplant_ctx *vdso_ctx = kmalloc(sizeof(*vdso_ctx), GFP_KERNEL);
+            if (vdso_ctx) {
+                vdso_ctx->old_vdso = old_vdso;
+                vdso_ctx->new_vdso = new_vdso;
+                vdso_ctx->vdso_size = vdso_size;
+                init_completion(&vdso_ctx->done);
+                init_task_work(&vdso_ctx->cb, mattx_vdso_transplant_cb);
+                
+                if (real_task_work_add) {
+                    real_task_work_add(hijacked_stub_task, &vdso_ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, hijacked_stub_task, 0);
+                    wait_for_completion(&vdso_ctx->done);
+                    
+                    int retries = 50;
+                    while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
+                        msleep(10);
+                        retries--;
+                    }
+                }
+                kfree(vdso_ctx);
+            }
+        }        
 
         // --- GANG INJECTION ---
         int t_idx = 0;
@@ -518,6 +596,42 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         struct task_struct *t;
         int t_idx = 0;
         int i;
+
+        // --- THE vDSO TRANSPLANT ---
+        if (hijacked_stub_task->mm && hijacked_stub_task->mm->context.vdso != (void *)pending_migration->vdso_addr) {
+            unsigned long old_vdso = (unsigned long)hijacked_stub_task->mm->context.vdso;
+            unsigned long new_vdso = pending_migration->vdso_addr;
+            unsigned long vdso_size = PAGE_SIZE; // Fallback
+            
+            mmap_read_lock(hijacked_stub_task->mm);
+            struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, old_vdso);
+            if (vma && vma->vm_start <= old_vdso && vma->vm_end > old_vdso) {
+                vdso_size = vma->vm_end - vma->vm_start;
+            }
+            mmap_read_unlock(hijacked_stub_task->mm);
+            
+            struct mattx_vdso_transplant_ctx *vdso_ctx = kmalloc(sizeof(*vdso_ctx), GFP_KERNEL);
+            if (vdso_ctx) {
+                vdso_ctx->old_vdso = old_vdso;
+                vdso_ctx->new_vdso = new_vdso;
+                vdso_ctx->vdso_size = vdso_size;
+                init_completion(&vdso_ctx->done);
+                init_task_work(&vdso_ctx->cb, mattx_vdso_transplant_cb);
+                
+                if (real_task_work_add) {
+                    real_task_work_add(hijacked_stub_task, &vdso_ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, hijacked_stub_task, 0);
+                    wait_for_completion(&vdso_ctx->done);
+                    
+                    int retries = 50;
+                    while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
+                        msleep(10);
+                        retries--;
+                    }
+                }
+                kfree(vdso_ctx);
+            }
+        }
 
         // --- GANG RETURN INJECTION ---
         rcu_read_lock();

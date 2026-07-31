@@ -66,6 +66,7 @@ mattx_sys_getdents64_fn real_sys_getdents64 = NULL;
 mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
 mattx_sys_exit_fn real_sys_exit = NULL;
 mattx_sys_clone_fn real_sys_clone = NULL;
+mattx_sys_mremap_fn real_sys_mremap = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -320,6 +321,15 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // --- THE vDSO TRANSPLANT ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_mremap";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_mremap = (mattx_sys_mremap_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+
 
 }
 
@@ -496,6 +506,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         req->arg_end = mm->arg_end;
         req->start_brk = mm->start_brk; // Capture Heap Start
         req->brk = mm->brk;             // Capture Heap End
+        req->vdso_addr = (uint64_t)mm->context.vdso; // Capture the vDSO!
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
@@ -608,6 +619,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
         req->arg_end = mm->arg_end;
         req->start_brk = mm->start_brk; // Capture Heap Start
         req->brk = mm->brk;             // Capture Heap End
+        req->vdso_addr = (uint64_t)mm->context.vdso; // Capture the vDSO!
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
