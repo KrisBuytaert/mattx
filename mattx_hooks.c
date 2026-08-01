@@ -1546,10 +1546,12 @@ static bool is_wormhole_fd(int fd, int *remote_fd_out) {
     return wormhole;
 }
 
+
 struct kretprobe_data {
     const char __user *filename_ptr;
     int flags;
     int mode;
+    bool is_hpc_fastpath; // <-- NEW
 };
 
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -1557,25 +1559,35 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
     struct kretprobe_data *data = (struct kretprobe_data *)ri->data;
 
     if (!is_guest_process(my_pid)) return 0; 
-
-    // The Bypass! ---
     if (config_mattxfs_enabled) return 0; 
 
-    // Extract the original arguments from do_sys_openat2
-    // args: dfd (di), filename (si), open_how (dx)
     data->filename_ptr = (const char __user *)regs->si;
     
-    // In do_sys_openat2, the third argument (dx) is a kernel-space pointer to struct open_how
     struct open_how *how = (struct open_how *)regs->dx;
     if (how) {
         data->flags = how->flags;
         data->mode = how->mode;
     } else {
-        data->flags = O_RDONLY; // Safe default
+        data->flags = O_RDONLY;
         data->mode = 0;
     }
 
-    regs->si = 0; // Sabotage the syscall!
+    // --- THE HPC FAST-PATH EVALUATION ---
+    data->is_hpc_fastpath = false;
+    if (config_hpc_local_libs && data->filename_ptr) {
+        char tmp_path[256] = {0};
+        if (strncpy_from_user(tmp_path, data->filename_ptr, sizeof(tmp_path) - 1) > 0) {
+            if (is_hpc_local_lib(tmp_path)) {
+                data->is_hpc_fastpath = true;
+                mattx_dbg("[HOOK] HPC Fast-Path: Allowing native openat('%s')\n", tmp_path);
+            }
+        }
+    }
+
+    // Only sabotage if it's NOT a local library!
+    if (!data->is_hpc_fastpath) {
+        regs->si = 0; // Sabotage the syscall!
+    }
 
     return 0;
 }
@@ -1589,15 +1601,12 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
     int i;
 
     if (!is_guest_process(my_pid)) return 0;
+    if (config_mattxfs_enabled) return 0;
+
+    // --- THE HPC FAST-PATH BYPASS ---
+    if (data->is_hpc_fastpath) return 0; // Let the native result flow back to the app!
 
     if (strncpy_from_user(filename, data->filename_ptr, sizeof(filename) - 1) > 0) {
-
-        // --- THE HPC FAST-PATH ---
-        if (config_hpc_local_libs && is_hpc_local_lib(filename)) {
-            mattx_dbg("[HOOK] HPC Fast-Path: Executing openat('%s') locally on remote VM.\n", filename);
-            return 0; // Let it execute natively!
-        }
-
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
@@ -1610,6 +1619,8 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
         spin_unlock(&guest_lock);
 
         if (home_node != -1) {
+            if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
             if (!config_migrate_file_io) {
                 // Local Breakout! 🏎️
                 // User disabled File I/O Wormhole routing. Let the Surrogate execute
@@ -1635,16 +1646,15 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 rpc->mode = data->mode;
                 strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
 
-                mattx_dbg("[HOOK] Intercepted open('%s'). Freezing Surrogate %d and escaping to Workqueue...\n", filename, my_pid);
-                
+                mattx_dbg("[HOOK] Intercepted open('%s'). Freezing Surrogate %d...\n", filename, my_pid);
                 send_sig(SIGSTOP, current, 0);
                 schedule_work(&rpc->work);
             }
         }
     }
-
     return 0;
 }
+
 
 // Removed statx hooks
 
@@ -3635,13 +3645,22 @@ static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *re
 static struct kretprobe statfs_kprobe, fstatfs_kprobe, newfstatat_kprobe, faccessat2_kprobe, readlink_kprobe, readlinkat_kprobe;
 
 
+struct statfs_kretprobe_data { const char __user *path; void __user *buf; bool is_hpc_fastpath; };
 
-struct statfs_kretprobe_data { const char __user *path; void __user *buf; };
 static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
-        data->path = (const char __user *)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
-        SYSCALL_REGS(regs)->di = 0; // Sabotage
+        data->path = (const char __user *)SYSCALL_REGS(regs)->di; 
+        data->buf = (void __user *)SYSCALL_REGS(regs)->si;
+        
+        data->is_hpc_fastpath = false;
+        if (config_hpc_local_libs && data->path) {
+            char tmp_path[256] = {0};
+            if (strncpy_from_user(tmp_path, data->path, sizeof(tmp_path) - 1) > 0) {
+                if (is_hpc_local_lib(tmp_path)) data->is_hpc_fastpath = true;
+            }
+        }
+        if (!data->is_hpc_fastpath) SYSCALL_REGS(regs)->di = 0; // Sabotage
     }
     return 0;
 }
@@ -3649,6 +3668,7 @@ static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *r
 static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
     if (!is_guest_process(current->tgid)) return 0;
+    if (data->is_hpc_fastpath) return 0; // BYPASS
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3725,30 +3745,43 @@ static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *re
 
 
 
-struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user *buf; int flags; bool is_ghost; };
+struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user *buf; int flags; bool is_ghost; bool is_hpc_fastpath; };
+
 static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
         data->is_ghost = false;
-
-        if (local_dfd == AT_FDCWD) data->is_ghost = true;
-        else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
-
-        if (data->is_ghost) {
-            mattx_dbg("[HOOK] newfstatat: Intercepted Ghost DFD %d. Tunneling to VM1...\n", local_dfd);
-            SYSCALL_REGS(regs)->di = -1; // Sabotage
-        }
+        data->is_hpc_fastpath = false;
         data->path = (const char __user *)SYSCALL_REGS(regs)->si;
-        data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
+        data->buf = (void __user *)SYSCALL_REGS(regs)->dx; 
+        data->flags = (int)SYSCALL_REGS(regs)->r10;
+
+        if (config_hpc_local_libs && data->path) {
+            char tmp_path[256] = {0};
+            if (strncpy_from_user(tmp_path, data->path, sizeof(tmp_path) - 1) > 0) {
+                if (is_hpc_local_lib(tmp_path)) data->is_hpc_fastpath = true;
+            }
+        }
+
+        if (!data->is_hpc_fastpath) {
+            if (local_dfd == AT_FDCWD) data->is_ghost = true;
+            else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
+
+            if (data->is_ghost) {
+                SYSCALL_REGS(regs)->di = -1; // Sabotage
+            }
+        }
     }
     return 0;
 }
 
 static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid)) return 0;
+    if (data->is_hpc_fastpath) return 0; // BYPASS
+    if (!data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3779,30 +3812,43 @@ static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs 
 
 
 
-struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; int flags; bool is_ghost; };
+struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; int flags; bool is_ghost; bool is_hpc_fastpath; };
+
 static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
         data->is_ghost = false;
-
-        if (local_dfd == AT_FDCWD) data->is_ghost = true;
-        else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
-
-        if (data->is_ghost) {
-            mattx_dbg("[HOOK] faccessat2: Intercepted Ghost DFD %d. Tunneling to VM1...\n", local_dfd);
-            SYSCALL_REGS(regs)->di = -1; // Sabotage
-        }
+        data->is_hpc_fastpath = false;
         data->path = (const char __user *)SYSCALL_REGS(regs)->si;
-        data->mode = (int)SYSCALL_REGS(regs)->dx; data->flags = (int)SYSCALL_REGS(regs)->r10;
+        data->mode = (int)SYSCALL_REGS(regs)->dx; 
+        data->flags = (int)SYSCALL_REGS(regs)->r10;
+
+        if (config_hpc_local_libs && data->path) {
+            char tmp_path[256] = {0};
+            if (strncpy_from_user(tmp_path, data->path, sizeof(tmp_path) - 1) > 0) {
+                if (is_hpc_local_lib(tmp_path)) data->is_hpc_fastpath = true;
+            }
+        }
+
+        if (!data->is_hpc_fastpath) {
+            if (local_dfd == AT_FDCWD) data->is_ghost = true;
+            else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
+
+            if (data->is_ghost) {
+                SYSCALL_REGS(regs)->di = -1; // Sabotage
+            }
+        }
     }
     return 0;
 }
 
 static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid)) return 0;
+    if (data->is_hpc_fastpath) return 0; // BYPASS
+    if (!data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3833,13 +3879,24 @@ static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs 
 
 
 
-struct readlink_kretprobe_data { const char __user *path; void __user *buf; size_t bufsiz; };
+struct readlink_kretprobe_data { const char __user *path; void __user *buf; size_t bufsiz; bool is_hpc_fastpath; };
+
 static int entry_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
-        data->path = (const char __user *)SYSCALL_REGS(regs)->di; data->buf = (void __user *)SYSCALL_REGS(regs)->si;
+        data->path = (const char __user *)SYSCALL_REGS(regs)->di; 
+        data->buf = (void __user *)SYSCALL_REGS(regs)->si;
         data->bufsiz = (size_t)SYSCALL_REGS(regs)->dx;
-        SYSCALL_REGS(regs)->di = 0; // Sabotage
+        data->is_hpc_fastpath = false;
+
+        if (config_hpc_local_libs && data->path) {
+            char tmp_path[256] = {0};
+            if (strncpy_from_user(tmp_path, data->path, sizeof(tmp_path) - 1) > 0) {
+                if (is_hpc_local_lib(tmp_path)) data->is_hpc_fastpath = true;
+            }
+        }
+
+        if (!data->is_hpc_fastpath) SYSCALL_REGS(regs)->di = 0; // Sabotage
     }
     return 0;
 }
@@ -3847,6 +3904,7 @@ static int entry_handler_readlink(struct kretprobe_instance *ri, struct pt_regs 
 static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
     if (!is_guest_process(current->tgid)) return 0;
+    if (data->is_hpc_fastpath) return 0; // BYPASS
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
@@ -3877,30 +3935,41 @@ static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *r
 
 
 
-struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user *buf; size_t bufsiz; bool is_ghost; };
+struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user *buf; size_t bufsiz; bool is_ghost; bool is_hpc_fastpath; };
+
 static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
         data->is_ghost = false;
-
-        if (local_dfd == AT_FDCWD) data->is_ghost = true;
-        else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
-
-        if (data->is_ghost) {
-            mattx_dbg("[HOOK] readlinkat: Intercepted Ghost DFD %d. Tunneling to VM1...\n", local_dfd);
-            SYSCALL_REGS(regs)->di = -1; // Sabotage
-        }
+        data->is_hpc_fastpath = false;
         data->path = (const char __user *)SYSCALL_REGS(regs)->si;
-        data->buf = (void __user *)SYSCALL_REGS(regs)->dx; data->bufsiz = (size_t)SYSCALL_REGS(regs)->r10;
+        data->buf = (void __user *)SYSCALL_REGS(regs)->dx; 
+        data->bufsiz = (size_t)SYSCALL_REGS(regs)->r10;
+
+        if (config_hpc_local_libs && data->path) {
+            char tmp_path[256] = {0};
+            if (strncpy_from_user(tmp_path, data->path, sizeof(tmp_path) - 1) > 0) {
+                if (is_hpc_local_lib(tmp_path)) data->is_hpc_fastpath = true;
+            }
+        }
+
+        if (!data->is_hpc_fastpath) {
+            if (local_dfd == AT_FDCWD) data->is_ghost = true;
+            else if (local_dfd >= 0) data->is_ghost = is_wormhole_fd(local_dfd, &data->dfd);
+
+            if (data->is_ghost) SYSCALL_REGS(regs)->di = -1; // Sabotage
+        }
     }
     return 0;
 }
 
 static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
+    if (!is_guest_process(current->tgid)) return 0;
+    if (data->is_hpc_fastpath) return 0; // BYPASS
+    if (!data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
     int home_node = -1; u32 orig_pid = 0;
     spin_lock(&guest_lock);
