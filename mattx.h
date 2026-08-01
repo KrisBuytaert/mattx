@@ -940,6 +940,12 @@ struct mattx_guest_info {
     struct statx *rpc_statx_buf;
     int rpc_fsync_res;
     bool is_migrating; // The Migration Lock!
+
+    // The TID Translation Map ---
+    int thread_count;
+    u32 orig_tids[MAX_GANG_THREADS];
+    pid_t local_tids[MAX_GANG_THREADS];    
+
 };
 
 struct mattx_export_info {
@@ -1223,6 +1229,12 @@ extern mattx_sys_clone_fn real_sys_clone;
 // --- THE vDSO TRANSPLANT RESOLVER ---
 typedef long (*mattx_sys_mremap_fn)(const struct pt_regs *regs);
 extern mattx_sys_mremap_fn real_sys_mremap;
+
+// --- THE TLS HARDWARE SYNC RESOLVERS ---
+typedef void (*mattx_x86_fsbase_write_task_fn)(struct task_struct *task, unsigned long fsbase);
+typedef void (*mattx_x86_gsbase_write_task_fn)(struct task_struct *task, unsigned long gsbase);
+extern mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task;
+extern mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task;
 
 
 

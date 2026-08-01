@@ -4286,7 +4286,42 @@ static int entry_handler_wake_up_new_task(struct kprobe *p, struct pt_regs *regs
 // ==============================================================================
 
 
+// ==============================================================================
+// 🎯 THE TGKILL TRANSLATOR (Signal Router)
+// ==============================================================================
+static struct kretprobe tgkill_kprobe;
 
+static int entry_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    
+    if (is_guest_process(current->tgid)) {
+        u32 target_tid = (u32)sys_regs->si; // The spoofed VM1 TID
+        
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                // Found our gang! Let's translate the TID.
+                for (int j = 0; j < guest_registry[i].thread_count; j++) {
+                    if (guest_registry[i].orig_tids[j] == target_tid) {
+                        sys_regs->si = guest_registry[i].local_tids[j]; // Inject real VM2 TID!
+                        sys_regs->di = current->tgid; // Translate TGID too, just in case!
+                        mattx_dbg("[HOOK] tgkill translated VM1 TID %u -> VM2 TID %u\n", 
+                                  target_tid, (u32)sys_regs->si);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+    return 0;
+}
+
+static int ret_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    return 0; // We only need to modify the entry arguments!
+}
+// ==============================================================================
 
 
 
@@ -4820,7 +4855,14 @@ int mattx_hooks_init(void) {
     ret = register_kprobe(&wake_up_new_task_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kprobe failed for wake_up_new_task, returned %d\n", ret);
 
-
+    // --- THE TGKILL TRANSLATOR ---
+    memset(&tgkill_kprobe, 0, sizeof(tgkill_kprobe));
+    tgkill_kprobe.kp.symbol_name = "__x64_sys_tgkill";
+    tgkill_kprobe.entry_handler = entry_handler_tgkill;
+    tgkill_kprobe.handler = ret_handler_tgkill;
+    tgkill_kprobe.maxactive = 64;
+    ret = register_kretprobe(&tgkill_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for tgkill, returned %d\n", ret);
 
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
@@ -4828,6 +4870,7 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&tgkill_kprobe);
     unregister_kprobe(&wake_up_new_task_kprobe);
     unregister_kretprobe(&sched_getaffinity_kprobe);
     unregister_kretprobe(&sched_setaffinity_kprobe);

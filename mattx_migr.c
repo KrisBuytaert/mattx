@@ -67,6 +67,9 @@ mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
 mattx_sys_exit_fn real_sys_exit = NULL;
 mattx_sys_clone_fn real_sys_clone = NULL;
 mattx_sys_mremap_fn real_sys_mremap = NULL;
+mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task = NULL;
+mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task = NULL;
+
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -329,7 +332,21 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // --- THE TLS HARDWARE SYNC ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "x86_fsbase_write_task";
+    if (register_kprobe(&kp) == 0) { 
+        real_x86_fsbase_write_task = (mattx_x86_fsbase_write_task_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "x86_gsbase_write_task";
+    if (register_kprobe(&kp) == 0) { 
+        real_x86_gsbase_write_task = (mattx_x86_gsbase_write_task_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+    
 
 }
 

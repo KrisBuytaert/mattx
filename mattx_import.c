@@ -226,18 +226,23 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
                     t->thread.fsbase = pending_migration->threads[t_idx].fsbase;
                     t->thread.gsbase = pending_migration->threads[t_idx].gsbase;
-                    // Inject the Futex Pointers! ---
+                    
+                    // TLS Hardware Sync! ---
+                    if (real_x86_fsbase_write_task) real_x86_fsbase_write_task(t, t->thread.fsbase);
+                    if (real_x86_gsbase_write_task) real_x86_gsbase_write_task(t, t->thread.gsbase);
+
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
                 }
+                
+                // Child Comm Fix! ---
+                strscpy(t->comm, pending_migration->comm, sizeof(t->comm));
+                
                 t_idx++;
             }
         }
         rcu_read_unlock();
 
-        // --- MOTHER SETUP (Comm, MM, Creds, FDs) ---
-        strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
-        
         if (hijacked_stub_task->mm) {
             hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
             hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
@@ -317,6 +322,27 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         rcu_read_unlock();
         
         add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
+
+        // Populate the TID Translation Map ---
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == hijacked_stub_task->pid) {
+                guest_registry[i].thread_count = pending_migration->thread_count;
+                int map_idx = 0;
+                struct task_struct *t_map;
+                rcu_read_lock();
+                for_each_thread(hijacked_stub_task, t_map) {
+                    if (map_idx < pending_migration->thread_count) {
+                        guest_registry[i].orig_tids[map_idx] = pending_migration->threads[map_idx].tid;
+                        guest_registry[i].local_tids[map_idx] = t_map->pid;
+                        map_idx++;
+                    }
+                }
+                rcu_read_unlock();
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
 
         // --- CLEANUP ---
         put_task_struct(hijacked_stub_task);
@@ -633,6 +659,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             }
         }
 
+
         // --- GANG RETURN INJECTION ---
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
@@ -641,10 +668,18 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
                     
-                    // Inject the Futex Pointers on Return! ---
+                    // TLS Hardware Sync on Return! ---
+                    t->thread.fsbase = pending_migration->threads[t_idx].fsbase;
+                    t->thread.gsbase = pending_migration->threads[t_idx].gsbase;
+                    if (real_x86_fsbase_write_task) real_x86_fsbase_write_task(t, t->thread.fsbase);
+                    if (real_x86_gsbase_write_task) real_x86_gsbase_write_task(t, t->thread.gsbase);
+
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
                 }
+                
+                // Child Comm Fix on Return! ---
+                strscpy(t->comm, pending_migration->comm, sizeof(t->comm));
             } else {
                 // --- DEPLOY THE GHOST EXORCIST ---
                 // This thread exists on VM1 but died on VM2! We must assassinate it cleanly.
