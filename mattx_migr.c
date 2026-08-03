@@ -621,6 +621,11 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
         struct pt_regs *t_regs = task_pt_regs(threads[i]);
         if (t_regs) {
             memcpy(&req->threads[i].regs, t_regs, sizeof(struct pt_regs));
+
+            // --- The "Lazy Oracle" TLS Capture! ---
+            req->threads[i].fsbase = threads[i]->thread.fsbase;
+            req->threads[i].gsbase = threads[i]->thread.gsbase;
+
             // Capture the Futex Pointers on Return! ---
             req->threads[i].clear_child_tid = (uint64_t)threads[i]->clear_child_tid;
             req->threads[i].set_child_tid   = (uint64_t)threads[i]->set_child_tid;            

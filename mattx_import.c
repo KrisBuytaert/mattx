@@ -536,14 +536,15 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         // 1. Take the READ lock to check if the VMA exists
                         mmap_read_lock(deputy->mm);
                         struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                        
-                        // ONLY carve if there is literally no memory mapped at this starting address!
-                        // If vma->vm_start > start, it means there is a hole in the memory map.
-                        needs_mapping = (!vma || vma->vm_start > start);
+                    
+                        // --- FIXED: The Robust Brain Carver! ---
+                        // Thread stacks grow! We must carve if there is no VMA, if it starts too late, 
+                        // OR if the local VMA is too small to hold the incoming memory!
+                        needs_mapping = (!vma || vma->vm_start > start || vma->vm_end < start + size);
+                    
                         mmap_read_unlock(deputy->mm); // DROP THE LOCK!
 
                     }
-
 
                     
                     // 2. If it's missing, carve it out safely!
