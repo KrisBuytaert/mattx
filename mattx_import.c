@@ -553,7 +553,12 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         
                         // We must temporarily adopt the Deputy's memory context to call vm_mmap
                         kthread_use_mm(deputy->mm);
-                        
+
+                        // THE SURGICAL UNMAPPER ---
+                        // Clear the land before we build! This prevents VMA fragmentation
+                        // and executable memory corruption during overlaps!
+                        vm_munmap(start, size);
+
                         unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
                         unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
                         
