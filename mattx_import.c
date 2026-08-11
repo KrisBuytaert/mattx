@@ -181,7 +181,9 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         }
 
         // --- THE vDSO TRANSPLANT ---
-        if (hijacked_stub_task->mm && hijacked_stub_task->mm->context.vdso != (void *)pending_migration->vdso_addr) {
+        // disabled vDSO transplant for testing
+        if (false) {
+        // if (hijacked_stub_task->mm && hijacked_stub_task->mm->context.vdso != (void *)pending_migration->vdso_addr) {
             unsigned long old_vdso = (unsigned long)hijacked_stub_task->mm->context.vdso;
             unsigned long new_vdso = pending_migration->vdso_addr;
             unsigned long vdso_size = PAGE_SIZE; // Fallback
@@ -630,7 +632,9 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         int i;
 
         // --- THE vDSO TRANSPLANT ---
-        if (hijacked_stub_task->mm && hijacked_stub_task->mm->context.vdso != (void *)pending_migration->vdso_addr) {
+        // disabled vDSO transplant for testing
+        if (false) {
+        // if (hijacked_stub_task->mm && hijacked_stub_task->mm->context.vdso != (void *)pending_migration->vdso_addr) {
             unsigned long old_vdso = (unsigned long)hijacked_stub_task->mm->context.vdso;
             unsigned long new_vdso = pending_migration->vdso_addr;
             unsigned long vdso_size = PAGE_SIZE; // Fallback
