@@ -516,60 +516,59 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     // not just the start address. This is because MPI applications may have large contiguous memory
                     // regions that need to be preserved during migration. If the entire VMA does not exist, we will
                     // carve it out to ensure the Deputy has the necessary memory mapped before we inject data.
-                    bool needs_mapping = true;
+                    // --- THE DYNAMIC BRAIN CARVER (The Hole Carver Edition) ---
+                    bool needs_mapping = false;
+                    unsigned long carve_start = start;
+                    unsigned long carve_size = size;
+
                     if (config_mpi_support) {
-                        //  "mpitest working / migtest segfaults on returning home"
-                        // 1. Take the READ lock to check if the ENTIRE VMA exists
+                        // MPI apps might need the whole block checked
                         mmap_read_lock(deputy->mm);
                         struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                        
-                        // It only exists if the start matches AND the end covers the whole size!
                         if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
                             needs_mapping = false; 
+                        } else {
+                            needs_mapping = true;
                         }
-                        mmap_read_unlock(deputy->mm); // DROP THE LOCK!
-
+                        mmap_read_unlock(deputy->mm);
                     } else {
-
-                        // regular processes only need to check if the start address exists, 
-                        // as they typically don't have large contiguous memory regions like MPI applications.
-
-                        // migtest working / mpitest hangs on returning home
-                        // 1. Take the READ lock to check if the VMA exists
+                        // The Hole Carver: Only carve exactly what is missing!
                         mmap_read_lock(deputy->mm);
                         struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    
-                        // --- FIXED: The Robust Brain Carver! ---
-                        // Thread stacks grow! We must carve if there is no VMA, if it starts too late, 
-                        // OR if the local VMA is too small to hold the incoming memory!
-                        needs_mapping = (!vma || vma->vm_start > start || vma->vm_end < start + size);
-                    
-                        mmap_read_unlock(deputy->mm); // DROP THE LOCK!
-
+                        
+                        if (!vma || vma->vm_start >= start + size) {
+                            // Completely missing (e.g., new thread stack from VM2)
+                            needs_mapping = true;
+                        } else if (vma->vm_start > start) {
+                            // Missing at the beginning (e.g., stack grew down)
+                            needs_mapping = true;
+                            carve_size = vma->vm_start - start;
+                        } else if (vma->vm_end < start + size) {
+                            // Missing at the end (e.g., heap grew up)
+                            needs_mapping = true;
+                            carve_start = vma->vm_end;
+                            carve_size = (start + size) - vma->vm_end;
+                        }
+                        mmap_read_unlock(deputy->mm);
                     }
 
-                    
-                    // 2. If it's missing, carve it out safely!
                     if (needs_mapping) {
-                        mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
+                        mattx_dbg("[RECALL] Carving missing memory hole: 0x%lx (Size: %lu)\n", carve_start, carve_size);
                         
-                        // We must temporarily adopt the Deputy's memory context to call vm_mmap
                         kthread_use_mm(deputy->mm);
-
-                        // THE SURGICAL UNMAPPER ---
-                        // Clear the land before we build! This prevents VMA fragmentation
-                        // and executable memory corruption during overlaps!
-                        vm_munmap(start, size);
-
-                        unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                        unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
                         
+                        // Dynamically translate VM_FLAGS to PROT_FLAGS to allow VMA merging!
+                        unsigned long prot = 0;
+                        if (flags & 0x00000001) prot |= PROT_READ;  // VM_READ
+                        if (flags & 0x00000002) prot |= PROT_WRITE; // VM_WRITE
+                        if (flags & 0x00000004) prot |= PROT_EXEC;  // VM_EXEC
+                        
+                        unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
                         if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
                         
-                        // vm_mmap handles its own locking internally!
-                        unsigned long ret = vm_mmap(NULL, start, size, prot, map_flags, 0);
+                        unsigned long ret = vm_mmap(NULL, carve_start, carve_size, prot, map_flags, 0);
                         if (IS_ERR_VALUE(ret)) {
-                            printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", start, ret);
+                            printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", carve_start, ret);
                         }
                         
                         kthread_unuse_mm(deputy->mm);
