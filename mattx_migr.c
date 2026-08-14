@@ -372,9 +372,7 @@ static void mattx_drain_callback(struct callback_head *cb) {
     // 1. Tell the migrator thread that we have safely reached the boundary
     complete(&ctx->done);
     
-    // 2. Put ourselves into a deep, stable freeze
-    set_current_state(TASK_STOPPED);
-    schedule();
+    // 2. Return normally! Do NOT sleep here, to avoid the SIGCONT ricochet.
 }
 
 static void mattx_freeze_task_safely(struct task_struct *task) {
@@ -387,9 +385,6 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
         msleep(50);
     }
 
-    // We REMOVED the old TASK_STOPPED check here, because if it was stopped by an RPC, 
-    // it wasn't at the user-space boundary! We must force it through the Task Work.
-
     init_completion(&ctx.done);
     init_task_work(&ctx.cb, mattx_drain_callback);
 
@@ -399,6 +394,7 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
     } else {
         ret = -ENOSYS; // Force the fallback if the resolver failed
     }
+    
     if (ret == 0) {
         mattx_dbg("[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
         
@@ -409,7 +405,23 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
         }
         
         wait_for_completion(&ctx.done);
-        mattx_dbg("[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
+        
+        // --- THE TRUE FREEZE ---
+        // Explicitly freeze the task from the outside to override any lingering SIGCONT!
+        send_sig(SIGSTOP, task, 0);
+        
+        // Ironclad Verification: Wait until the CPU confirms the task is unconscious!
+        int retries = 500; // 5 seconds max
+        while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
+            msleep(10);
+            retries--;
+        }
+        
+        if (retries == 0) {
+            printk(KERN_WARNING "MattX:[DRAIN] WARNING: PID %d took too long to freeze!\n", task->pid);
+        } else {
+            mattx_dbg("[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
+        }
     } else {
         printk(KERN_WARNING "MattX:[DRAIN] task_work_add failed for PID %d. Falling back to SIGSTOP.\n", task->pid);
         send_sig(SIGSTOP, task, 0);
