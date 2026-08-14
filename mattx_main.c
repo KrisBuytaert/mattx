@@ -154,6 +154,19 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
 
     mattx_dbg(" [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
 
+    // THE STUB SYNCHRONIZER ---
+    // We MUST wait for the stub to execute raise(SIGSTOP) in user-space!
+    // If we send READY_FOR_DATA too early, the data pump will hit a moving target!
+    int retries = 500; // 5 seconds max
+    while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
+        msleep(10);
+        retries--;
+    }
+
+    if (retries == 0) {
+        printk(KERN_WARNING "MattX:[HIJACK] WARNING: Stub PID %u took too long to freeze!\n", stub_pid);
+    }
+
     if (pending_source_node != -1 && cluster_map[pending_source_node]) {
         mattx_dbg(" [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
         mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
