@@ -1267,6 +1267,7 @@ int mattx_balancer_loop(void *data);
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node); 
 void mattx_send_vma_data(void); 
+void mattx_freeze_task_safely(struct task_struct *task); // Expose the Freezer!
 
 bool is_guest_process(pid_t pid);
 bool is_rpc_pending(pid_t pid); // Check if a Wormhole is open!

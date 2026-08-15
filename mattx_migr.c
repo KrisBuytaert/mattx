@@ -365,21 +365,18 @@ struct mattx_drain_ctx {
     struct completion done;
 };
 
+
 // This function runs INSIDE the target process, right at the user-space boundary!
 static void mattx_drain_callback(struct callback_head *cb) {
     struct mattx_drain_ctx *ctx = container_of(cb, struct mattx_drain_ctx, cb);
-    
-    // 1. Tell the migrator thread that we have safely reached the boundary
     complete(&ctx->done);
-    
-    // 2. Return normally! Do NOT sleep here, to avoid the SIGCONT ricochet.
+    // Return normally! Do NOT sleep here, to avoid the SIGCONT ricochet.
 }
 
-static void mattx_freeze_task_safely(struct task_struct *task) {
+void mattx_freeze_task_safely(struct task_struct *task) {
     struct mattx_drain_ctx ctx;
     int ret;
 
-    // --- NEW: Wait for any open RPC Wormholes to close! ---
     while (is_rpc_pending(task->pid)) {
         printk_once(KERN_INFO "MattX:[DRAIN] Waiting for RPC Wormhole to close for PID %d...\n", task->pid);
         msleep(50);
@@ -388,18 +385,15 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
     init_completion(&ctx.done);
     init_task_work(&ctx.cb, mattx_drain_callback);
 
-    // Call the dynamically resolved pointer! ---
     if (real_task_work_add) {
         ret = real_task_work_add(task, &ctx.cb, TWA_SIGNAL);
     } else {
-        ret = -ENOSYS; // Force the fallback if the resolver failed
+        ret = -ENOSYS; 
     }
     
     if (ret == 0) {
         mattx_dbg("[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
         
-        // If the task was stopped by something else (like job control), we must nudge it 
-        // so it wakes up and executes our Task Work!
         if (READ_ONCE(task->__state) & __TASK_STOPPED) {
             send_sig(SIGCONT, task, 0);
         }
@@ -433,6 +427,7 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
         }
     }
 }
+EXPORT_SYMBOL(mattx_freeze_task_safely);
 
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {

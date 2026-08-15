@@ -140,8 +140,6 @@ static void mattx_vdso_transplant_cb(struct callback_head *cb) {
     }
     
     complete(&ctx->done);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 // ==============================================================================
 
@@ -207,14 +205,19 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     real_task_work_add(hijacked_stub_task, &vdso_ctx->cb, TWA_SIGNAL);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                     wait_for_completion(&vdso_ctx->done);
-                    send_sig(SIGSTOP, hijacked_stub_task, 0);
                     
-                    int retries = 50;
+                    // --- THE TRUE FREEZE ---
+                    send_sig(SIGSTOP, hijacked_stub_task, 0);
+                    mattx_dbg("[TRANSPLANT] vDSO Transplant finished. Surrogate is freezing...\n");
+                    
+                    // Ironclad Verification: Wait until the CPU confirms the task is unconscious!
+                    int retries = 500; // 5 seconds max
                     while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
                         msleep(10);
                         retries--;
                     }
                 }
+
                 kfree(vdso_ctx);
             }
         }        
@@ -483,7 +486,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         mattx_dbg("[RECALL] Gang Grower finished. Mother is freezing...\n");
                         
                         // Wait for all newborn threads AND the Mother to reach TASK_STOPPED
-                        int retries = 500; // 5 seconds max
+                        int retries = 500;
                         while (retries > 0) {
                             bool all_stopped = true;
                             rcu_read_lock();
@@ -661,12 +664,18 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                     wait_for_completion(&vdso_ctx->done);
                     
-                    int retries = 50;
+                    // --- THE TRUE FREEZE ---
+                    send_sig(SIGSTOP, hijacked_stub_task, 0);
+                    mattx_dbg("[TRANSPLANT] vDSO Transplant finished. Surrogate is freezing...\n");
+                    
+                    // Ironclad Verification: Wait until the CPU confirms the task is unconscious!
+                    int retries = 500; // 5 seconds max
                     while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
                         msleep(10);
                         retries--;
                     }
                 }
+
                 kfree(vdso_ctx);
             }
         }

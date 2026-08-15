@@ -303,10 +303,9 @@ int main() {
     nl_socket_free(sock);
     free(received_req);
 
-    raise(SIGSTOP); 
-    
-    printf("MattX-Stub: ERROR - I woke up but I am still the stub!\n");
+    // --- THE SYMMETRICAL FREEZE ---
+    // Just loop peacefully. The kernel will inject a Task Work and freeze us natively!
     while (1) sleep(1); 
+    
     return 0;
 }
-

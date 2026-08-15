@@ -136,6 +136,29 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
     return genlmsg_reply(reply_skb, info);
 }
 
+
+// THE HIJACK KWORKER ---
+struct mattx_hijack_work {
+    struct work_struct work;
+    u32 stub_pid;
+};
+
+static void mattx_hijack_kworker(struct work_struct *work) {
+    struct mattx_hijack_work *hw = container_of(work, struct mattx_hijack_work, work);
+    
+    if (hijacked_stub_task) {
+        mattx_dbg(" [HIJACK] Freezing Stub PID %u safely...\n", hw->stub_pid);
+        mattx_freeze_task_safely(hijacked_stub_task);
+        mattx_dbg(" [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", hw->stub_pid);
+    }
+
+    if (pending_source_node != -1 && cluster_map[pending_source_node]) {
+        mattx_dbg(" [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+        mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
+    }
+    kfree(hw);
+}
+
 static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     u32 stub_pid = nla_get_u32(info->attrs[MATTX_ATTR_STUB_PID]);
     struct task_struct *stub_task = NULL;
@@ -152,28 +175,18 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
     hijacked_stub_task = stub_task;
 
-    mattx_dbg(" [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
-
-    // THE STUB SYNCHRONIZER ---
-    // We MUST wait for the stub to execute raise(SIGSTOP) in user-space!
-    // If we send READY_FOR_DATA too early, the data pump will hit a moving target!
-    int retries = 50; // half a seconds max
-    while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
-        msleep(10);
-        retries--;
-    }
-
-    if (retries == 0) {
-        printk(KERN_WARNING "MattX:[HIJACK] WARNING: Stub PID %u took long to freeze!\n", stub_pid);
-    }
-
-    if (pending_source_node != -1 && cluster_map[pending_source_node]) {
-        mattx_dbg(" [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
-        mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
+    // --- THE SYMMETRICAL FREEZE ---
+    // Spawn a Kworker to freeze the stub safely, allowing the Netlink handler to return instantly!
+    struct mattx_hijack_work *hw = kmalloc(sizeof(*hw), GFP_KERNEL);
+    if (hw) {
+        hw->stub_pid = stub_pid;
+        INIT_WORK(&hw->work, mattx_hijack_kworker);
+        schedule_work(&hw->work);
     }
 
     return 0;
 }
+
 
 static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info) {
     if (info->attrs[MATTX_ATTR_LOCAL_IP]) {

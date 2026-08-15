@@ -2125,10 +2125,7 @@ static void mattx_epoll_hijack_cb(struct callback_head *cb) {
     }
 
     kfree(ctx);
-    
-    // The Puppet goes back to sleep!
-    set_current_state(TASK_STOPPED);
-    schedule();
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 static void handle_sys_epoll_create_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -2226,8 +2223,7 @@ static void mattx_epoll_ctl_cb(struct callback_head *cb) {
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 
@@ -2315,8 +2311,7 @@ static void mattx_epoll_wait_cb(struct callback_head *cb) {
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 
@@ -2534,8 +2529,7 @@ static void mattx_sockname_cb(struct callback_head *cb) {
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 static void handle_sys_getsockname_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -2629,8 +2623,7 @@ static void mattx_setsockopt_cb(struct callback_head *cb) {
     if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SETSOCKOPT_REPLY, &reply, sizeof(reply));
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 static void handle_sys_setsockopt_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -2704,8 +2697,7 @@ static void mattx_getsockopt_cb(struct callback_head *cb) {
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 
@@ -3042,7 +3034,8 @@ static void mattx_prlimit_cb(struct callback_head *cb) {
         }
     }
     if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PRLIMIT64_REPLY, &reply, sizeof(reply));
-    kfree(ctx); set_current_state(TASK_STOPPED); schedule();
+    kfree(ctx);
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 // (Add handle_sys_prlimit64_req to allocate ctx and task_work_add it to the Deputy)
 
@@ -3061,7 +3054,8 @@ static void mattx_prctl_cb(struct callback_head *cb) {
 
     reply.orig_pid = ctx->req.orig_pid; reply.error = ret;
     if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PRCTL_REPLY, &reply, sizeof(reply));
-    kfree(ctx); set_current_state(TASK_STOPPED); schedule();
+    kfree(ctx);
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 // (Add handle_sys_prctl_req to allocate ctx and task_work_add it to the Deputy)
 
@@ -3184,7 +3178,8 @@ static void mattx_fio_cb(struct callback_head *cb) {
     u32 msg_type = ctx->is_ioctl ? MATTX_MSG_SYS_IOCTL_REPLY : MATTX_MSG_SYS_FCNTL_REPLY;
     if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], msg_type, &reply, sizeof(reply));
     
-    kfree(ctx); set_current_state(TASK_STOPPED); schedule();
+    kfree(ctx);
+    send_sig(SIGSTOP, current, 0); // Let the kernel freeze us natively!
 }
 
 static void handle_sys_fcntl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
