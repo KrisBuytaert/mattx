@@ -115,8 +115,19 @@ static int mattx_receiver_loop(void *data) {
         }
     }
     
-    mattx_dbg(" [COMM] Receiver thread exiting for Node %d\n", link->node_id);
-    return 0;
+    mattx_dbg("[COMM] Receiver thread for Node %d entering Zombie Halt...\n", link->node_id);
+    
+    // ==============================================================================
+    // 🧟‍♂️ THE ZOMBIE HALT - https://github.com/brainmatt/mattx/issues/5
+    // ==============================================================================
+    // Do NOT return and let the kernel reap the task_struct! 
+    // If the socket died, we sleep here at 0% CPU until mattx_comm_disconnect 
+    // officially executes kthread_stop(). This prevents the NULL-deref Oops!
+    while (!kthread_should_stop()) {
+        set_current_state(TASK_INTERRUPTIBLE);
+        schedule();
+    }
+    // ==============================================================================
 }
 
 // --- NEW: Global Mutex to prevent TCP stream collisions! ---
