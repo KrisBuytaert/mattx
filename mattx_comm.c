@@ -128,6 +128,9 @@ static int mattx_receiver_loop(void *data) {
         schedule();
     }
     // ==============================================================================
+
+    mattx_dbg("[COMM] Receiver thread officially exiting for Node %d\n", link->node_id);
+    return 0;
 }
 
 // --- NEW: Global Mutex to prevent TCP stream collisions! ---
