@@ -606,6 +606,10 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     // Pack the DFSA path into the Blueprint! ---
     strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
 
+    // --- The "Lazy Oracle" Nametag Capture! ---
+    get_task_comm(req->comm, task);
+    mattx_dbg("[EXTRACT] Captured RETURN process name: '%s'\n", req->comm);
+
     // --- GANG RETURN EXTRACTION ---
     struct task_struct *threads[MAX_GANG_THREADS];
     int t_count = 0;
