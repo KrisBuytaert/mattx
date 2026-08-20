@@ -76,65 +76,78 @@ case "$1" in
       exit 1
     fi
 
+    TARGET_PID=$2
+    TARGET_NODE=$3
+
     re='^[0-9]+$'
-    if ! [[ $2 =~ $re ]] ; then
-        echo "error: <PID> is not a number" >&2; exit 1
+    if ! [[ $TARGET_PID =~ $re ]] ; then
+        echo "ERROR: <PID> is not a number" >&2; exit 1
     fi
-    if ! [[ $3 =~ $re ]] ; then
-        if [ "$3" != "home" ] && [ "$3" != "best" ]; then
-            echo "error: <NODE_ID> must be a number or 'home' or 'best'" >&2; exit 1
+
+    # 1) Check if PID exists locally
+    if [ ! -d "/proc/$TARGET_PID" ]; then
+        echo "ERROR: PID $TARGET_PID does not exist on this system." >&2
+        exit 1
+    fi
+
+    # 2) Check if PID is a thread, find Mother (TGID)
+    TGID=$(grep -s '^Tgid:' "/proc/$TARGET_PID/status" | awk '{print $2}')
+    if [ -n "$TGID" ] && [ "$TGID" != "$TARGET_PID" ]; then
+        echo "NOTICE: PID $TARGET_PID is a thread. Targeting Mother TGID $TGID instead."
+        TARGET_PID=$TGID
+    fi
+
+    if ! [[ $TARGET_NODE =~ $re ]] ; then
+        if [ "$TARGET_NODE" != "home" ] && [ "$TARGET_NODE" != "best" ]; then
+            echo "ERROR: <NODE_ID> must be a number or 'home' or 'best'" >&2; exit 1
+        fi
+    else
+        # 3) Check if NODE_ID exists in /proc/mattx/nodes
+        # We parse the nodes file and check if the requested node ID is currently connected
+        if ! awk 'NR>4 {print $1}' /proc/mattx/nodes | grep -qw "$TARGET_NODE"; then
+            echo "ERROR: Target Node $TARGET_NODE is not connected to the cluster." >&2
             exit 1
         fi
     fi
 
+    # 4) Check if PID is already remote to prevent double forward migration
+    # We use -w to ensure we match the exact PID, not a substring!
+    pid_node=$(cat /proc/mattx/remote | grep -w "^$TARGET_PID" | cut -d: -f2)
 
-    # if $3 is not "home" or "best"
-    # check that PID is not remote, if it is we call it back home first
-    if [ "$3" != "home" ] && [ "$3" != "best" ]; then
-        pid_node=$(cat /proc/mattx/remote | grep $2 | cut -d: -f2)
+    if [ "$TARGET_NODE" != "home" ] && [ "$TARGET_NODE" != "best" ]; then
         if [ "$pid_node" != "" ]; then
-            echo "NOTICE: PID $2 is currently remote on node $pid_node, migrating it back home first"
-            echo "migrate $2 home" > /proc/mattx/admin
-            echo "NOTICE: migrating PID $2 to node $3"
-            echo "migrate $2 $3" > /proc/mattx/admin
+            echo "ERROR: PID $TARGET_PID is already migrated to node $pid_node. Please migrate it 'home' first." >&2
+            exit 1
         else
-            echo "NOTICE: PID $2 is currently running locally, migrating it to node $3"
-            echo "migrate $2 $3" > /proc/mattx/admin
+            echo "NOTICE: PID $TARGET_PID is currently running locally, migrating it to node $TARGET_NODE"
+            echo "migrate $TARGET_PID $TARGET_NODE" > /proc/mattx/admin
         fi
-    elif [ "$3" == "home" ]; then
-        pid_node=$(cat /proc/mattx/remote | grep $2 | cut -d: -f2)
+    elif [ "$TARGET_NODE" == "home" ]; then
         if [ "$pid_node" == "" ]; then
-            echo "ERROR: PID $2 is not currently remote, cannot migrate it home" >&2; exit 1
+            echo "ERROR: PID $TARGET_PID is not currently remote, cannot migrate it home" >&2; exit 1
         else
-            echo "NOTICE: migrating PID $2 back home"
-            echo "migrate $2 home" > /proc/mattx/admin
+            echo "NOTICE: migrating PID $TARGET_PID back home"
+            echo "migrate $TARGET_PID home" > /proc/mattx/admin
             exit 0
         fi
-    elif [ "$3" == "best" ]; then
-        # check that is not already running on the best node.
+    elif [ "$TARGET_NODE" == "best" ]; then
         output=$(cat /proc/mattx/nodes)
         best_node=$(get_lowest_cpu_node "$output")
-        current_node=$(cat /proc/mattx/remote | grep $2 | cut -d: -f2)
-        if [ "$best_node" == "$current_node" ]; then
-            echo "NOTICE: PID $2 is currently remote on node $best_node which is already the best node, no migration needed"
+        if [ "$best_node" == "$pid_node" ]; then
+            echo "NOTICE: PID $TARGET_PID is currently remote on node $best_node which is already the best node, no migration needed"
             exit 0
-        elif [ "$current_node" == "" ]; then
-            echo "NOTICE: PID $2 is currently running locally, migrating it to the best node $best_node"
-            echo "migrate $2 $best_node" > /proc/mattx/admin
+        elif [ "$pid_node" == "" ]; then
+            echo "NOTICE: PID $TARGET_PID is currently running locally, migrating it to the best node $best_node"
+            echo "migrate $TARGET_PID $best_node" > /proc/mattx/admin
             exit 0
         else
-            echo "NOTICE: PID $2 is currently remote on node $best_node, migrating it back home first"
-            echo "migrate $2 home" > /proc/mattx/admin
-            sleep 2
-            echo "NOTICE: migrating PID $2 to $best_node"
-            echo "migrate $2 $best_node" > /proc/mattx/admin
-            exit 0
+            # Prevent double migration even when using 'best'
+            echo "ERROR: PID $TARGET_PID is already migrated to node $pid_node. Cannot migrate to best node $best_node directly. Migrate 'home' first." >&2
+            exit 1
         fi
-    else
-        echo "Usage: $0 migrate <PID> <NODE_ID>/home/best"
-        exit 1
     fi
     ;;
+
   *)
     echo "Usage: $0 {status|migrate}"
     exit 1
