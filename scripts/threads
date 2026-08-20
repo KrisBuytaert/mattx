@@ -1,3 +1,3 @@
 #!/bin/bash
 
-watch "ps -eLF | grep threadtest | grep -v grep"
+watch "ps -eLo pid,tgid,state,tname,time,command | grep threadtest | grep -v grep | grep -v ' T '"

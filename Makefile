@@ -34,7 +34,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2
+all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -77,10 +77,14 @@ threadtest: bin/threadtest.c
 threadtest2: bin/threadtest2.c
 	gcc -o bin/threadtest2 bin/threadtest2.c -lpthread -lgcc_s
 
+threadtest_nofork: bin/threadtest_nofork.c
+	gcc -o bin/threadtest_nofork bin/threadtest_nofork.c -lpthread -lgcc_s
+
+
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork
 	rm -f mattxfs/Module.symvers
 
 install:
@@ -93,6 +97,7 @@ install:
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/bin/threadtest
 	sudo rm -f /usr/local/bin/threadtest2
+	sudo rm -f /usr/local/bin/threadtest_nofork
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
 	sudo rm -f /usr/local/bin/dfsatest
@@ -107,6 +112,7 @@ install:
 	sudo cp -f bin/epolltest /usr/local/bin/epolltest
 	sudo cp -f bin/threadtest /usr/local/bin/threadtest
 	sudo cp -f bin/threadtest2 /usr/local/bin/threadtest2
+	sudo cp -f bin/threadtest_nofork /usr/local/bin/threadtest_nofork
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
 	sudo cp -f bin/mattx-admin /usr/local/bin/mattx-admin
@@ -144,6 +150,7 @@ uninstall:
 	sudo rm -f /usr/local/bin/epolltest
 	sudo rm -f /usr/local/bin/threadtest
 	sudo rm -f /usr/local/bin/threadtest2
+	sudo rm -f /usr/local/bin/threadtest_nofork
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
