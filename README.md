@@ -18,6 +18,15 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ## 🚀 MattX 1.8 now supports thread migration!
 
+<div style="display: inline-flex; align-items: center;">
+  <!-- Video Thumbnail -->
+  <a href="https://www.youtube.com/watch?v=am8meoc2H1s" target="_blank" style="display: inline-block;">
+    <img src="./web/media/MattX-SSI-Live-Process-Migration1.jpeg" style="width: 100%; display: block;">
+  </a>
+
+</div>
+
+*August 2026*
 The impossible has been achieved. Historically, multi-threaded applications were the ultimate boogeyman of Single System Image (SSI) clustering. Splitting threads across a network meant split-brain deadlocks, shattered memory spaces, and kernel panics. Not anymore. 
 
 With MattX 1.8, we are incredibly proud to introduce **Native Gang Migration**! 🐙
