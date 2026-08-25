@@ -20,7 +20,7 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 <div style="display: inline-flex; align-items: center;">
   <!-- Video Thumbnail -->
-  <a href="https://www.youtube.com/watch?v=am8meoc2H1s" target="_blank" style="display: inline-block;">
+  <a href="https://www.youtube.com/watch?v=_uAQgJN24HY" target="_blank" style="display: inline-block;">
     <img src="./web/media/MattX-SSI-Live-Process-Migration1.jpeg" style="width: 100%; display: block;">
   </a>
 
