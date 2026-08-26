@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # MattX - The Modern Single System Image (SSI) Cluster
 # 
@@ -22,6 +21,20 @@
 # Commercial licensing options are available upon request.
 #
 
-export MPICH_NO_LOCAL=1
+[Unit]
+Description=MattX Cluster Discovery Daemon
+After=network.target
 
-mpirun -np 1 ./mpitest
+[Service]
+ExecStart=/usr/local/etc/init.d/mattx start
+ExecStop=/usr/local/etc/init.d/mattx stop
+ExecReload=/etc/init.d/mattx reload
+PIDFile=/var/run/mattx.pid
+RemainAfterExit=no
+Restart=always
+Type=forking
+
+[Install]
+WantedBy=multi-user.target
+
+

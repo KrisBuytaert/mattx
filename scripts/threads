@@ -1,0 +1,3 @@
+#!/bin/bash
+
+watch "ps -eLo lwp,state,command | grep threadtest | grep -v grep | grep -v ' T '"

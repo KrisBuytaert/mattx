@@ -22,6 +22,8 @@
 # Commercial licensing options are available upon request.
 #
 
-export MPICH_NO_LOCAL=1
+while true; do
+	echo "go" > /dev/stdout
+	sleep 2
+done
 
-mpirun -np 1 ./mpitest

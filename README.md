@@ -16,6 +16,44 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ## 📰 Latest News
 
+## 🚀 MattX 1.8 now supports thread migration!
+
+<div style="display: inline-flex; align-items: center;">
+  <!-- Video Thumbnail -->
+  <a href="https://www.youtube.com/watch?v=_uAQgJN24HY" target="_blank" style="display: inline-block;">
+    <img src="./web/media/MattX-SSI-Live-Process-Migration1.jpeg" style="width: 100%; display: block;">
+  </a>
+
+</div>
+
+*August 2026*
+The impossible has been achieved. Historically, multi-threaded applications were the ultimate boogeyman of Single System Image (SSI) clustering. Splitting threads across a network meant split-brain deadlocks, shattered memory spaces, and kernel panics. Not anymore. 
+
+With MattX 1.8, we are incredibly proud to introduce **Native Gang Migration**! 🐙
+
+We have completely re-engineered the MattX core to support complex, multi-threaded workloads, bringing us one massive step closer to full MPI/MPICH cluster compatibility.
+
+### 👯‍♂️ The Threading Monsters Tamed
+In MattX, threads sharing a `TGID` are considered a "Gang" and are never split up. When the Mother task migrates, the entire Gang teleports through the TCP Wormhole with her. 
+* **Native Futex Synchronization:** Because the entire Gang shares the same physical RAM on the remote node, local synchronizers like `futex` and `rseq` execute 100% natively. No network tunneling required!
+* **The Gang Grower 🌱 & Ghost Exorcist 👻:** MattX dynamically adapts to thread lifecycles. If threads are born on the remote node, the Home Node natively spawns missing dummy threads during Recall. If threads die remotely, the Home Node silently assassinates the leftovers.
+* **The True Freeze 🧊:** Ironclad kernel-level synchronization guarantees threads are perfectly frozen at the user-space boundary before a single byte of memory is carved.
+
+### 🏎️ The HPC Fast-Path (Local Library Optimization)
+Why tunnel static, read-only system libraries over the network? MattX 1.8 introduces a configurable bypass that allows the remote node to natively load system libraries (e.g., `/lib/libc.so.6`, `/etc/ld.so.cache`) from its own local disk. This saves massive amounts of Wormhole bandwidth, drops latency to zero, and allows complex C++ stack unwinders to execute flawlessly!
+
+### 🧠 The Dynamic Brain Carver
+Our memory injection pipeline has been upgraded with a surgical "Hole Carver". It dynamically detects growing thread stacks and heap expansions, carving out exact memory holes using `MAP_FIXED` without fragmenting the VMA tree or destroying file-backed executable memory.
+
+### 🛠️ Massive Syscall Arsenal for MPI/MPICH Support
+To achieve our goal of full MPI/MPICH compatibility, MattX 1.8 introduces a massive array of newly intercepted and routed syscalls, ensuring complex HPC apps feel right at home:
+* **Advanced Networking:** `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `sendmsg`, `recvmsg`
+* **Event Loops (epoll):** `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`
+* **Metadata & VFS:** `statfs`, `fstatfs`, `newfstatat`, `faccessat2`, `readlink`, `readlinkat`, `getdents64`, `pipe2`, `pread64`
+* **Process Control:** `uname`, `prlimit64`, `prctl`, `fcntl`, `ioctl`
+* **Local Memory & Sched (Native VM2 Execution):** `mprotect`, `madvise`, `mbind`, `sched_getaffinity`, `sched_setaffinity`, `sched_yield`
+
+
 ### 🚀 MattX v1.7 Released: The "Native Injector" & Alma Linux Support!
 
 <div style="display: inline-flex; align-items: center;">
@@ -45,10 +83,13 @@ https://github.com/KrisBuytaert/mattx-testsuite
 
 ---
 
-## ✨ Key Features (MattX v1.7)
+## ✨ Key Features (MattX v1.8)
 
 ### 🧠 Live Process Teleportation & The Syscall Drainer
 MattX migrates running processes safely using a custom **Syscall Drainer**. Instead of violently freezing processes with `SIGSTOP` while they hold kernel locks, MattX uses modern `task_work_add(TWA_SIGNAL)` to gently guide the process to the user-space boundary. Once in a 100% stable state, its memory map (VMAs), CPU registers (`pt_regs`), and credentials (`struct cred`) are extracted and streamed over a custom TCP data pump to the target node.
+
+### 👯‍♂️ Thread Migration
+Historically, multi-threaded applications have been the "boogeyman" of Single System Image (SSI) clustering. Because threads share memory, file descriptors, and signal handlers, splitting them across a network introduces catastrophic latency and split-brain deadlocks. MattX solves this natively using a strict **Gang Migration** architecture.
 
 ### 🗂️ MattXFS & The Namespace Illusion
 To ensure migrated processes can still access their original files, MattX introduces **MattXFS**, a custom Virtual File System (VFS). 

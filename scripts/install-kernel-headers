@@ -1,0 +1,17 @@
+#!/bin/bash
+
+KERNEL="$(uname -r)"
+printf 'Running kernel: %s\n' "$KERNEL"
+
+if dpkg-query -W -f='${db:Status-Abbrev}\n' "linux-headers-$KERNEL" 2>/dev/null | grep -q '^ii'; then
+  echo "Matching header package is installed"
+else
+  echo "Matching header package is missing - installing it now ..."
+  sudo apt install linux-headers-$(uname -r)
+
+fi
+
+test -d "/usr/src/linux-headers-$KERNEL" && echo "Matching header directory found"
+test -f "/usr/src/linux-headers-$KERNEL/scripts/sign-file" && echo "sign-file is available"
+
+

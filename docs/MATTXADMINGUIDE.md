@@ -37,27 +37,35 @@
         * [Returning home](#returning-home)
         * ["The Exit Code (the Funeral)"](#the-exit-code-the-funeral)
         * ["Backward funeral" aka "Assassination Order"](#backward-funeral-aka-assassination-order)
-6. [MattXFS](#mattxfs)
+
+
+6. [Thread Migration](#thread-migration)
+    * [General Design, Architecture, and Implementation](#general-design-architecture-and-implementation)
+    * [Scenarios: Migration Before and After Thread Creation](#scenarios-migration-before-and-after-thread-creation)
+    * [Edge-Cases: Gang Growers, Exorcists, and Futexes](#edge-cases-gang-growers-exorcists-and-futexes)
+
+
+7. [MattXFS](#mattxfs)
     * [Completing the SSI Illusion - a cluster wide POSIX filesystem](#completing-the-ssi-illusion---a-cluster-wide-posix-filesystem)
     * ["Overlay cluster filesystem" on process level](#overlay-cluster-filesystem-on-process-level)
     * [The "bind mount root" magic](#the-bind-mount-root-magic)
     * [Remote VFS handler and functions](#remote-vfs-handler-and-functions)
     * ["Linux VFS" vs "kprobe/kretprobe" - MattX let you choose](#linux-vfs-vs-kprobekretprobe---mattx-let-you-choose)
     * [Using MattXFS for "loadbalancing data distribution"](#using-mattxfs-for-loadbalancing-data-distribution)
-7. [Loadbalancing](#loadbalancing)
+8. [Loadbalancing](#loadbalancing)
     * [Automatic migration vs manual migration](#automatic-migration-vs-manual-migration)
     * [Loadbalancing administration](#loadbalancing-administration)
-8. [Administration](#administration)
+9. [Administration](#administration)
     * [The MattX "/proc/mattx" interface](#the-mattx-procmattx-interface)
     * [MattX tools](#mattx-tools)
-9. [Monitoring](#monitoring)
+10. [Monitoring](#monitoring)
     * [3DMattX - a very much different MattX cluster visualization](#3dmattx---a-very-much-different-mattx-cluster-visualization)
     * [3D Wormhole Viewer - a realtime process migration visualization](#3d-wormhole-viewer---a-realtime-process-migration-visualization)
-10. [Configuration](#configuration)
+11. [Configuration](#configuration)
     * [Network- and File IO path optimization](#network--and-file-io-path-optimization)
-11. [Internal Function Documentation](#internal-function-documentation)
-12. [The VFS Wormhole -Syscall Routing Architecture](#the-vfs-wormhole)
-12. [FAQ](#faq)
+12. [Internal Function Documentation](#internal-function-documentation)
+13. [The VFS Wormhole -Syscall Routing Architecture](#the-vfs-wormhole)
+14. [FAQ](#faq)
 
 ---
 
@@ -456,6 +464,40 @@ What happens if the sysadmin on the Home Node types `kill -9 <PID>`? The Deputy 
 To prevent ghost processes from haunting the cluster, MattX implements the **Assassination Order**. The moment the Deputy is killed, the Home Node's Watcher thread detects the death. It instantly fires a `MATTX_MSG_KILL_SURROGATE` command to the Target Node. The Target Node receives the order, hunts down the Surrogate, and executes it with extreme prejudice. 
 
 No memory leaks. No orphaned processes. Perfect lifecycle symmetry. 🔫🧟‍♂️
+
+---
+
+## Thread Migration
+
+Historically, multi-threaded applications have been the "boogeyman" of Single System Image (SSI) clustering. Because threads share memory, file descriptors, and signal handlers, splitting them across a network introduces catastrophic latency and split-brain deadlocks. MattX solves this natively using a strict **Gang Migration** architecture.
+
+### General Design, Architecture, and Implementation
+
+In MattX, threads that share a Thread Group ID (`TGID`) are considered a "Gang" and are **never** split up. The Load Balancer and the Admin tools only target the "Mother" task (`pid == tgid`). When the Mother migrates, the entire Gang migrates with her.
+
+**The Extraction Phase (Home Node):**
+When a migration is triggered, the MattX kernel module uses a `for_each_thread` loop to safely freeze the Mother and all her children at the user-space boundary using Task Work Add (TWA) injections. The kernel then packs their individual CPU registers, Thread Local Storage (TLS) hardware bases (`fsbase`/`gsbase`), and `futex` pointers into an array of `mattx_thread_info` structs within the migration blueprint.
+
+**The Injection Phase (Remote Node):**
+On the target node, the user-space `mattx-stub` reads the thread count from the blueprint and natively spawns the exact number of required dummy threads using the glibc `clone()` wrapper. Once the dummy Gang is asleep, the kernel takes over, carves the shared memory, injects the individual thread registers, synchronizes the CPU hardware MSRs, and wakes the entire Gang simultaneously. 
+
+Because the entire Gang shares the same physical RAM on the remote node, local synchronizers like `futex` and `rseq` execute **100% natively and locally**. No network tunneling is required for thread-to-thread communication!
+
+### Scenarios: Migration Before and After Thread Creation
+
+MattX dynamically adapts to the lifecycle of multi-threaded applications, allowing seamless migration regardless of when threads are spawned.
+
+*   **Migration After Thread Creation:** If an application spawns its threads on the Home Node, the entire Gang is frozen, packed into the blueprint, and transplanted into dummy threads on the remote node as described above.
+*   **Migration Before Thread Creation:** If the Mother task migrates to a remote node *before* spawning threads, she arrives as a single process. When she eventually calls `pthread_create()` (or `clone3()`), the syscall is executed **natively on the remote node**. The remote kernel spawns the new thread, sharing the carved memory perfectly. MattX intercepts the `tgkill` syscalls to ensure that signal routing (like `pthread_cancel`) translates the spoofed Home Node TIDs to the real Remote Node TIDs, ensuring flawless execution.
+
+### Edge-Cases: Gang Growers, Exorcists, and Futexes
+
+Migrating threads back and forth across a cluster introduces severe edge cases regarding thread lifecycles. MattX handles these using advanced kernel-level synchronization:
+
+*   **The Futex/Wait & TLS Sync:** To ensure that `pthread_join` and `pthread_cancel` work natively on the remote node, MattX captures the `clear_child_tid` and `set_child_tid` pointers from user-space memory. During the brain transplant, MattX natively synchronizes the `x86_fsbase_write_task` hardware registers so the glibc stack canaries survive the TCP Wormhole, preventing stack-smashing panics.
+*   **The Gang Grower (Spawning Missing Threads):** If threads are created natively on the remote node, the remote node will have a larger Gang than the Home Node. During a Return Migration (Recall), the Home Node detects this deficit. MattX injects a TWA callback into the frozen Mother Deputy, forcing her to natively call `sys_clone` to birth the missing dummy threads *before* the incoming brains are injected.
+*   **The Ghost Exorcist (Cleaning Dead Threads):** If a thread dies naturally on the remote node, the Home Node will have *too many* frozen Deputy threads during a Recall. To prevent these leftover threads from waking up and corrupting memory, MattX deploys the "Ghost Exorcist"—a TWA callback that wipes their `futex` pointers and forces them to silently execute `sys_exit(0)`, vanishing without a trace.
+*   **The True Freeze:** To prevent the Linux scheduler's `SIGCONT` ricochet from accidentally waking up Deputy threads while the kernel is actively carving their memory map, MattX utilizes an ironclad "True Freeze" mechanism. The kernel explicitly waits for the CPU to confirm the `__TASK_STOPPED` state before a single byte of memory is modified.
 
 ---
 

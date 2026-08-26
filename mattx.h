@@ -55,11 +55,13 @@
 #include <linux/kprobes.h>       
 #include <linux/workqueue.h>     
 #include <linux/bitops.h>        
-#include <linux/stat.h>          
+#include <linux/stat.h>
+#include <linux/statfs.h>          
 #include <linux/version.h>
 #include <linux/time64.h> // Ensure we have time64_t
 #include <linux/task_work.h>
-
+#include <linux/utsname.h>
+#include <linux/resource.h>
 
 // --- KERNEL COMPATIBILITY: The Sockaddr Evolution ---
 // In late 2025 (Linux 6.18/6.19+), the kernel replaced 'struct sockaddr *' 
@@ -79,7 +81,7 @@
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 1024 
 #define MAX_GUESTS 1024 
-
+#define MAX_GANG_THREADS 16
 #define MAX_FDS 256
 
 #define MATTX_MAGIC 0x4D415454 
@@ -162,6 +164,34 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_SENDMSG_REPLY,
     MATTX_MSG_SYS_RECVMSG_REQ,
     MATTX_MSG_SYS_RECVMSG_REPLY,
+    MATTX_MSG_SYS_UNAME_REQ,
+    MATTX_MSG_SYS_UNAME_REPLY,
+    MATTX_MSG_SYS_PRLIMIT64_REQ,
+    MATTX_MSG_SYS_PRLIMIT64_REPLY,
+    MATTX_MSG_SYS_PRCTL_REQ,
+    MATTX_MSG_SYS_PRCTL_REPLY,
+    MATTX_MSG_SYS_FCNTL_REQ,
+    MATTX_MSG_SYS_FCNTL_REPLY,
+    MATTX_MSG_SYS_IOCTL_REQ,
+    MATTX_MSG_SYS_IOCTL_REPLY,
+    MATTX_MSG_SYS_PREAD64_REQ,
+    MATTX_MSG_SYS_PREAD64_REPLY,
+    MATTX_MSG_SYS_STATFS_REQ, 
+    MATTX_MSG_SYS_STATFS_REPLY,
+    MATTX_MSG_SYS_FSTATFS_REQ, 
+    MATTX_MSG_SYS_FSTATFS_REPLY,
+    MATTX_MSG_SYS_NEWFSTATAT_REQ, 
+    MATTX_MSG_SYS_NEWFSTATAT_REPLY,
+    MATTX_MSG_SYS_FACCESSAT2_REQ, 
+    MATTX_MSG_SYS_FACCESSAT2_REPLY,
+    MATTX_MSG_SYS_READLINK_REQ, 
+    MATTX_MSG_SYS_READLINK_REPLY,
+    MATTX_MSG_SYS_READLINKAT_REQ, 
+    MATTX_MSG_SYS_READLINKAT_REPLY,
+    MATTX_MSG_SYS_GETDENTS64_REQ, 
+    MATTX_MSG_SYS_GETDENTS64_REPLY,
+    MATTX_MSG_SYS_PIPE2_REQ, 
+    MATTX_MSG_SYS_PIPE2_REPLY,
 };
 
 struct mattx_header {
@@ -175,6 +205,7 @@ struct mattx_load_info {
     u32 cpu_load;    // Now instantaneous runqueue length!
     u32 mem_free_mb;
     u32 affinity;    // Node Speed / Affinity
+    u32 accept_guests; // Explicit Cordon Flag!
 };
 
 struct mattx_vma_info {
@@ -190,29 +221,42 @@ struct mattx_cpu_regs {
 
 };
 
+struct mattx_thread_info {
+    uint32_t tid;
+    struct mattx_cpu_regs regs;
+    uint64_t fsbase;
+    uint64_t gsbase;
+    uint64_t clear_child_tid; // The Futex Wake Pointer!
+    uint64_t set_child_tid;   // The Thread Init Pointer!
+} __attribute__((packed)); // FORCE EXACT LAYOUT
+
 struct mattx_migration_req {
     u32 orig_pid;
     u32 uid; 
     u32 gid; 
-    u32 home_node; // Tell the stub where home is!
-    struct mattx_cpu_regs regs; 
-    uint64_t fsbase; 
-    uint64_t gsbase; 
+    u32 home_node; 
+    
+    u32 thread_count;
+    struct mattx_thread_info threads[MAX_GANG_THREADS]; 
+    
     uint64_t arg_start; 
     uint64_t arg_end;   
+    uint64_t start_brk; // The start of the Heap
+    uint64_t brk;       // The current end of the Heap
+    uint64_t vdso_addr; // The vDSO Transplant Address!
+
     char comm[16]; 
-    char dfsa_dir[256]; // Tell the stub what to bind-mount!
+    char dfsa_dir[256]; 
     u32 fd_count;          
     u32 open_fds[MAX_FDS]; 
     u32 vma_count;
-    u8 mattxfs_enabled; // Tell the stub if it should build the illusion
-    u8 pad[3];          // Alignment padding
+    u8 mattxfs_enabled; 
     struct mattx_vma_info vmas[]; 
-};
+} __attribute__((packed)); // <-- FORCE EXACT LAYOUT
+
 
 struct mattx_page_header {
-    u32 vma_index;
-    u32 offset;
+    uint64_t absolute_addr; // <--: The exact memory address!
     u32 length;
 };
 
@@ -544,6 +588,168 @@ struct mattx_sys_recvmsg_reply {
     char data[]; // Flexible array for the flattened data!
 };
 
+struct mattx_sys_uname_req { 
+    u32 orig_pid; 
+};
+struct mattx_sys_uname_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct new_utsname uts; 
+};
+
+struct mattx_sys_prlimit64_req { 
+    u32 orig_pid; pid_t pid; int resource; 
+    u8 has_new; u8 has_old; struct rlimit new_rlim; 
+};
+struct mattx_sys_prlimit64_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct rlimit old_rlim; 
+};
+
+struct mattx_sys_prctl_req { 
+    u32 orig_pid; 
+    int option; 
+    unsigned long arg2, arg3, arg4, arg5; 
+};
+
+struct mattx_sys_prctl_reply { 
+    u32 orig_pid; 
+    int error; 
+};
+
+
+struct mattx_sys_fcntl_req { 
+    u32 orig_pid; int fd; 
+    int cmd; unsigned long arg; 
+    u8 has_ptr; char data[256]; 
+};
+
+struct mattx_sys_fcntl_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[256]; 
+};
+
+struct mattx_sys_ioctl_req { 
+    u32 orig_pid; 
+    int fd; 
+    unsigned int cmd; 
+    unsigned long arg; 
+    u8 has_ptr; 
+    char data[256]; 
+};
+
+struct mattx_sys_ioctl_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[256]; 
+};
+
+struct mattx_sys_pread64_req { 
+    u32 orig_pid; 
+    int fd; 
+    size_t count; 
+    loff_t pos; 
+};
+// Note: We will reuse mattx_sys_read_reply for pread64's reply!
+
+struct mattx_sys_statfs_req { 
+    u32 orig_pid; 
+    char path[256]; 
+};
+
+struct mattx_sys_statfs_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct statfs buf; 
+};
+
+struct mattx_sys_fstatfs_req { 
+    u32 orig_pid; 
+    int fd; 
+};
+
+struct mattx_sys_fstatfs_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct statfs buf; 
+};
+
+struct mattx_sys_newfstatat_req { 
+    u32 orig_pid; 
+    int dfd; 
+    int flags; 
+    char path[256]; 
+};
+struct mattx_sys_newfstatat_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct stat buf; 
+};
+
+struct mattx_sys_faccessat2_req { 
+    u32 orig_pid; 
+    int dfd; 
+    int mode; 
+    int flags; 
+    char path[256]; 
+};
+struct mattx_sys_faccessat2_reply { 
+    u32 orig_pid; 
+    int error; 
+};
+
+struct mattx_sys_readlink_req { 
+    u32 orig_pid; 
+    size_t bufsiz; 
+    char path[256]; 
+};
+struct mattx_sys_readlink_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[]; 
+};
+
+struct mattx_sys_readlinkat_req { 
+    u32 orig_pid; 
+    int dfd; 
+    size_t bufsiz; 
+    char path[256]; 
+};
+struct mattx_sys_readlinkat_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[]; 
+};
+
+struct mattx_sys_getdents64_req { 
+    u32 orig_pid; 
+    int fd; u32 count; 
+};
+
+struct mattx_sys_getdents64_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[]; 
+};
+
+struct mattx_sys_pipe2_req { 
+    u32 orig_pid; 
+    int flags; 
+};
+
+struct mattx_sys_pipe2_reply { 
+    u32 orig_pid; 
+    int error; 
+    int fd0; 
+    int fd1; 
+};
+
+
+
+
+
 
 
 struct mattx_fake_fd_info {
@@ -662,6 +868,54 @@ struct mattx_rpc_work {
     bool is_recvmsg;
     struct msghdr __user *msg_ptr;
 
+    // For UNAME
+    bool is_uname;
+
+    // For PRLIMIT64
+    bool is_prlimit64;
+    pid_t prlimit_pid;
+    int prlimit_resource;
+    bool prlimit_has_new;
+    bool prlimit_has_old;
+    void __user *prlimit_new_rlim_ptr;
+    void __user *prlimit_old_rlim_ptr;
+
+    // For PRCTL
+    bool is_prctl;
+    int prctl_option;
+    unsigned long prctl_arg2, prctl_arg3, prctl_arg4, prctl_arg5;
+
+    // For FCNTL & IOCTL
+    bool is_fcntl;
+    bool is_ioctl;
+    int fcntl_cmd;
+    unsigned int ioctl_cmd;
+    unsigned long ioctl_arg; // Reused for fcntl_arg
+    bool ioctl_has_ptr;      // Reused for fcntl
+    char ioctl_data[256];    // Reused for fcntl
+
+    // For PREAD64
+    bool is_pread64;
+    loff_t pread64_pos;
+
+    // For META FETCHERS (Microstep 2.2)
+    bool is_statfs, is_fstatfs, is_newfstatat, is_faccessat2, is_readlink, is_readlinkat;
+    int meta_dfd, meta_flags, meta_mode;
+    size_t meta_bufsiz;
+    char meta_path[256];
+    void __user *meta_buf_ptr;
+
+    // For GETDENTS64
+    bool is_getdents64;
+    int getdents64_fd;
+    u32 getdents64_count;
+    void __user *getdents64_dirp;
+
+    // For PIPE2
+    bool is_pipe2;
+    int pipe2_flags;
+    void __user *pipe2_pipefd;
+
 };
 
 struct mattx_link {
@@ -686,6 +940,12 @@ struct mattx_guest_info {
     struct statx *rpc_statx_buf;
     int rpc_fsync_res;
     bool is_migrating; // The Migration Lock!
+
+    // The TID Translation Map ---
+    int thread_count;
+    u32 orig_tids[MAX_GANG_THREADS];
+    pid_t local_tids[MAX_GANG_THREADS];    
+
 };
 
 struct mattx_export_info {
@@ -693,6 +953,7 @@ struct mattx_export_info {
     int target_node;
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
+    bool is_growing_gang; // The Gang Grower Flag!
 };
 
 struct mattx_vfs_getattr_req {
@@ -921,6 +1182,61 @@ extern mattx_sys_dup2_fn real_sys_dup2;
 typedef long (*mattx_sys_close_fn)(const struct pt_regs *regs);
 extern mattx_sys_close_fn real_sys_close;
 
+typedef long (*mattx_sys_prlimit64_fn)(const struct pt_regs *regs);
+extern mattx_sys_prlimit64_fn real_sys_prlimit64;
+
+typedef long (*mattx_sys_prctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_prctl_fn real_sys_prctl;
+
+typedef long (*mattx_sys_fcntl_fn)(const struct pt_regs *regs);
+extern mattx_sys_fcntl_fn real_sys_fcntl;
+
+typedef long (*mattx_sys_ioctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_ioctl_fn real_sys_ioctl;
+
+typedef long (*mattx_sys_statfs_fn)(const struct pt_regs *regs);
+extern mattx_sys_statfs_fn real_sys_statfs;
+
+typedef long (*mattx_sys_fstatfs_fn)(const struct pt_regs *regs);
+extern mattx_sys_fstatfs_fn real_sys_fstatfs;
+
+typedef long (*mattx_sys_newfstatat_fn)(const struct pt_regs *regs);
+extern mattx_sys_newfstatat_fn real_sys_newfstatat;
+
+typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
+extern mattx_sys_faccessat2_fn real_sys_faccessat2;
+
+typedef long (*mattx_sys_readlink_fn)(const struct pt_regs *regs);
+extern mattx_sys_readlink_fn real_sys_readlink;
+
+typedef long (*mattx_sys_readlinkat_fn)(const struct pt_regs *regs);
+extern mattx_sys_readlinkat_fn real_sys_readlinkat;
+
+typedef long (*mattx_sys_getdents64_fn)(const struct pt_regs *regs);
+extern mattx_sys_getdents64_fn real_sys_getdents64;
+
+typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
+extern mattx_sys_pipe2_fn real_sys_pipe2;
+
+// --- THE THREAD GHOST EXORCIST RESOLVER ---
+typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
+extern mattx_sys_exit_fn real_sys_exit;
+
+// --- THE GANG GROWER RESOLVER ---
+typedef long (*mattx_sys_clone_fn)(const struct pt_regs *regs);
+extern mattx_sys_clone_fn real_sys_clone;
+
+// --- THE vDSO TRANSPLANT RESOLVER ---
+typedef long (*mattx_sys_mremap_fn)(const struct pt_regs *regs);
+extern mattx_sys_mremap_fn real_sys_mremap;
+
+// --- THE TLS HARDWARE SYNC RESOLVERS ---
+typedef void (*mattx_x86_fsbase_write_task_fn)(struct task_struct *task, unsigned long fsbase);
+typedef void (*mattx_x86_gsbase_write_task_fn)(struct task_struct *task, unsigned long gsbase);
+extern mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task;
+extern mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task;
+
+
 
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!
@@ -930,6 +1246,17 @@ extern mattx_sys_close_fn real_sys_close;
 // Configuration Toggles
 extern bool config_migrate_file_io;
 extern bool config_migrate_network_io;
+extern bool config_mpi_support;
+extern bool config_accept_guests;
+extern bool config_hpc_local_libs; // The HPC Fast-Path Toggle!
+
+// Expose the balancer thread so we can borrow its host root filesystem!
+extern struct task_struct *balancer_thread;
+
+// The HPC Fast-Path Helper
+bool is_hpc_local_lib(const char *path);
+
+int mattx_expel_guest(pid_t local_pid);
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 int mattx_comm_send_ctrl(struct mattx_link *link, u32 type, void *data, u32 len);
@@ -940,6 +1267,7 @@ int mattx_balancer_loop(void *data);
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node); 
 void mattx_send_vma_data(void); 
+void mattx_freeze_task_safely(struct task_struct *task); // Expose the Freezer!
 
 bool is_guest_process(pid_t pid);
 bool is_rpc_pending(pid_t pid); // Check if a Wormhole is open!

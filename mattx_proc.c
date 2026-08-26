@@ -59,6 +59,9 @@ static int nodes_show(struct seq_file *m, void *v) {
     
     seq_printf(m, "\nBalancer Enabled: %s\n", balancer_enabled ? "YES" : "NO");
     seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
+    seq_printf(m, "MPI Support: %s\n", config_mpi_support ? "YES" : "NO");
+    seq_printf(m, "Accept Guests: %s\n", config_accept_guests ? "YES" : "NO");
+    seq_printf(m, "HPC Local Libs: %s\n", config_hpc_local_libs ? "ON" : "OFF");
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
@@ -125,7 +128,7 @@ static const struct proc_ops guests_proc_ops = {
 };
 
 static int version_show(struct seq_file *m, void *v) {
-    seq_printf(m, "MattX Version: 1.7\n");
+    seq_printf(m, "MattX Version: 1.8\n");
     seq_printf(m, "MattX License: GPLv2\n");
     seq_printf(m, "Copyright (c) 2026 by Matthias Rechenburg\n");
     return 0;
@@ -172,8 +175,15 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             mattx_dbg(" [ADMIN] Node affinity set to %u\n", val);
         }
         return count;
+    } else if (strncmp(buf, "expel ", 6) == 0) {
+        pid_t pid;
+        if (sscanf(buf + 6, "%d", &pid) == 1) {
+            mattx_dbg(" [ADMIN] Expel requested for local Surrogate PID %d\n", pid);
+            mattx_expel_guest(pid); // This will block until finished!
+        }
+        return count;
     }
-
+    
     // --- Legacy integer-based commands ---
     if (sscanf(buf, "%31s %d %31s", cmd, &arg1, arg2_str) >= 2) {
         
@@ -189,6 +199,18 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_mattxfs_enabled = (arg1 != 0);
             mattx_dbg(" [ADMIN] MattXFS Mode set to: %s\n", config_mattxfs_enabled ? "ON" : "OFF");
         }        
+        else if (strcmp(cmd, "mpi") == 0 && arg1 != -1) {
+            config_mpi_support = (arg1 != 0);
+            mattx_dbg(" [ADMIN] MPI Support set to: %s\n", config_mpi_support ? "ON" : "OFF");
+        }
+        else if (strcmp(cmd, "accept") == 0 && arg1 != -1) {
+            config_accept_guests = (arg1 != 0);
+            mattx_dbg(" [ADMIN] Accept Guests set to: %s\n", config_accept_guests ? "YES" : "NO");
+        }
+        else if (strcmp(cmd, "locallibs") == 0 && arg1 != -1) { // <-- NEW
+            config_hpc_local_libs = (arg1 != 0);
+            mattx_dbg(" [ADMIN] HPC Local Libs Fast-Path set to: %s\n", config_hpc_local_libs ? "ON" : "OFF");
+        }
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {
@@ -209,6 +231,7 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
                     rcu_read_lock();
                     task = pid_task(find_vpid(arg1), PIDTYPE_PID);
                     if (task) get_task_struct(task);
+                    task = task->group_leader; // Grab the Mother!
                     rcu_read_unlock();
 
                     if (task) {

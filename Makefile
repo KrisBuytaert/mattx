@@ -27,13 +27,14 @@ obj-m += mattx.o
 mattx-objs := mattx_main.o mattx_comm.o mattx_sched.o mattx_migr.o mattx_proc.o mattx_hooks.o mattx_import.o mattx_guest.o mattx_fileio.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
+KVER := $(shell uname -r)
 PWD := $(shell pwd)
 
 # --- User-Space Build Config ---
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 servertestpoll servertestselect dfsatest epolltest
+all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -52,6 +53,12 @@ migtest: bin/migtest.c
 migtest2: bin/migtest2.c
 	gcc -o bin/migtest2 bin/migtest2.c
 
+migtest3: bin/migtest3.c
+	gcc -o bin/migtest3 bin/migtest3.c
+
+migtest4: bin/migtest4.c
+	gcc -o bin/migtest4 bin/migtest4.c
+
 servertestpoll: bin/servertestpoll.c
 	gcc -o bin/servertestpoll bin/servertestpoll.c
 
@@ -64,17 +71,33 @@ dfsatest: bin/dfsatest.c
 epolltest: bin/epolltest.c
 	gcc -o bin/epolltest bin/epolltest.c
 
+threadtest: bin/threadtest.c
+	gcc -o bin/threadtest bin/threadtest.c -lpthread -lgcc_s
+
+threadtest2: bin/threadtest2.c
+	gcc -o bin/threadtest2 bin/threadtest2.c -lpthread -lgcc_s
+
+threadtest_nofork: bin/threadtest_nofork.c
+	gcc -o bin/threadtest_nofork bin/threadtest_nofork.c -lpthread -lgcc_s
+
+
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork
 	rm -f mattxfs/Module.symvers
 
 install:
 	sudo rm -f /usr/local/bin/migtest
 	sudo rm -f /usr/local/bin/migtest2
+	sudo rm -f /usr/local/bin/migtest3
+	sudo rm -f /usr/local/bin/migtest4
 	sudo rm -f /usr/local/bin/servertestpoll
 	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/mattx-stub
+	sudo rm -f /usr/local/bin/threadtest
+	sudo rm -f /usr/local/bin/threadtest2
+	sudo rm -f /usr/local/bin/threadtest_nofork
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
 	sudo rm -f /usr/local/bin/dfsatest
@@ -82,35 +105,58 @@ install:
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
 	sudo cp -f bin/migtest2 /usr/local/bin/migtest2
+	sudo cp -f bin/migtest3 /usr/local/bin/migtest3
 	sudo cp -f bin/servertestpoll /usr/local/bin/servertestpoll
 	sudo cp -f bin/servertestselect /usr/local/bin/servertestselect
 	sudo cp -f bin/dfsatest /usr/local/bin/dfsatest
 	sudo cp -f bin/epolltest /usr/local/bin/epolltest
+	sudo cp -f bin/threadtest /usr/local/bin/threadtest
+	sudo cp -f bin/threadtest2 /usr/local/bin/threadtest2
+	sudo cp -f bin/threadtest_nofork /usr/local/bin/threadtest_nofork
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
 	sudo cp -f bin/mattx-admin /usr/local/bin/mattx-admin
+	sudo chmod +x scripts/*
 	sudo chmod +x /usr/local/bin/mattx-admin
 	sudo cp -f etc/mattx.conf /etc/mattx.conf
 	sudo chmod 644 /etc/mattx.conf
-	sudo cp -f init/mattx-discd.service /etc/systemd/system/mattx-discd.service
+	sudo cp -f init/mattx.service /etc/systemd/system/mattx.service
+	sudo mkdir -p /usr/local/etc/init.d
+	sudo cp -f init/mattx /usr/local/etc/init.d/mattx
+	sudo chmod +x /usr/local/etc/init.d/mattx
 
+	# install the kernel modules
+	sudo mkdir -p /usr/local/lib/modules/$(KVER)
+	sudo cp -f mattx.ko /usr/local/lib/modules/$(KVER)/mattx.ko
+	sudo cp -f mattxfs/mattxfs.ko /usr/local/lib/modules/$(KVER)/mattxfs.ko
 
-	# install the kernel module
+	sudo systemctl enable mattx
 
 	echo "NOTICE: MattX installation complete."
-	echo "Please configure /etc/mattx.conf before running the daemon."
+	echo "Please configure /etc/mattx.conf before starting MattX."
 
 
 
 
 uninstall:
+	sudo systemctl disable mattx
 	sudo rm -f /usr/local/bin/migtest
 	sudo rm -f /usr/local/bin/migtest2
+	sudo rm -f /usr/local/bin/migtest3
+	sudo rm -f /usr/local/bin/migtest4
 	sudo rm -f /usr/local/bin/servertestpoll
 	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/dfsatest
 	sudo rm -f /usr/local/bin/epolltest
+	sudo rm -f /usr/local/bin/threadtest
+	sudo rm -f /usr/local/bin/threadtest2
+	sudo rm -f /usr/local/bin/threadtest_nofork
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
 	sudo rm -f /etc/mattx.conf
+	sudo rm -f /etc/systemd/system/mattx.service
+	sudo rm -f /usr/local/etc/init.d/mattx
+	sudo rm -f /usr/local/lib/modules/$(KVER)/mattx.ko
+	sudo rm -f /usr/local/lib/modules/$(KVER)/mattxfs.ko
+	

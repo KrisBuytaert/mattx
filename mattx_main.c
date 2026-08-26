@@ -37,7 +37,7 @@ struct mattx_migration_req *pending_migration = NULL;
 int pending_source_node = -1;
 struct task_struct *hijacked_stub_task = NULL;
 
-static struct task_struct *balancer_thread;
+struct task_struct *balancer_thread; // expose the balancer_thread so we can borrow its root filesystem pointer later
 static struct task_struct *listener_thread;
 
 bool balancer_enabled = true;
@@ -52,8 +52,13 @@ char config_dfsa_dir[256] = {0}; // Default empty
 EXPORT_SYMBOL(config_dfsa_dir);
 bool config_debug_mode = true; // Default to ON so we see everything!
 EXPORT_SYMBOL(config_debug_mode);
+bool config_mpi_support = false; // Default to false
+EXPORT_SYMBOL(config_mpi_support);
+bool config_hpc_local_libs = true; // Default to ON for maximum performance!
+EXPORT_SYMBOL(config_hpc_local_libs);
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, __MATTX_ATTR_MAX };
+
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -68,6 +73,9 @@ static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_A
     [MATTX_ATTR_CONFIG_NET_IO] = { .type = NLA_U8 },
     [MATTX_ATTR_MATTXFS_ENABLED] = { .type = NLA_U8 },
     [MATTX_ATTR_DFSA_DIR] = { .type = NLA_STRING, .len = 255 },
+    [MATTX_ATTR_MPI_SUPPORT] = { .type = NLA_U8 },
+    [MATTX_ATTR_ACCEPT_GUESTS] = { .type = NLA_U8 },
+    [MATTX_ATTR_CONFIG_LOCAL_LIBS] = { .type = NLA_U8 },
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -128,6 +136,29 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
     return genlmsg_reply(reply_skb, info);
 }
 
+
+// THE HIJACK KWORKER ---
+struct mattx_hijack_work {
+    struct work_struct work;
+    u32 stub_pid;
+};
+
+static void mattx_hijack_kworker(struct work_struct *work) {
+    struct mattx_hijack_work *hw = container_of(work, struct mattx_hijack_work, work);
+    
+    if (hijacked_stub_task) {
+        mattx_dbg(" [HIJACK] Freezing Stub PID %u safely...\n", hw->stub_pid);
+        mattx_freeze_task_safely(hijacked_stub_task);
+        mattx_dbg(" [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", hw->stub_pid);
+    }
+
+    if (pending_source_node != -1 && cluster_map[pending_source_node]) {
+        mattx_dbg(" [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+        mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
+    }
+    kfree(hw);
+}
+
 static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     u32 stub_pid = nla_get_u32(info->attrs[MATTX_ATTR_STUB_PID]);
     struct task_struct *stub_task = NULL;
@@ -144,15 +175,18 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
     hijacked_stub_task = stub_task;
 
-    mattx_dbg(" [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
-
-    if (pending_source_node != -1 && cluster_map[pending_source_node]) {
-        mattx_dbg(" [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
-        mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
+    // --- THE SYMMETRICAL FREEZE ---
+    // Spawn a Kworker to freeze the stub safely, allowing the Netlink handler to return instantly!
+    struct mattx_hijack_work *hw = kmalloc(sizeof(*hw), GFP_KERNEL);
+    if (hw) {
+        hw->stub_pid = stub_pid;
+        INIT_WORK(&hw->work, mattx_hijack_kworker);
+        schedule_work(&hw->work);
     }
 
     return 0;
 }
+
 
 static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info) {
     if (info->attrs[MATTX_ATTR_LOCAL_IP]) {
@@ -184,11 +218,26 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         nla_strscpy(config_dfsa_dir, info->attrs[MATTX_ATTR_DFSA_DIR], sizeof(config_dfsa_dir));
         mattx_dbg("[NL] DFSA Directory set to: '%s'\n", config_dfsa_dir);
     }
-    
-    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s\n",
+    if (info->attrs[MATTX_ATTR_MPI_SUPPORT]) {
+        config_mpi_support = nla_get_u8(info->attrs[MATTX_ATTR_MPI_SUPPORT]) ? true : false;
+        mattx_dbg("[NL] MPI Support Enabled: %s\n", config_mpi_support ? "TRUE" : "FALSE");
+    }
+    if (info->attrs[MATTX_ATTR_ACCEPT_GUESTS]) {
+        config_accept_guests = nla_get_u8(info->attrs[MATTX_ATTR_ACCEPT_GUESTS]) ? true : false;
+        mattx_dbg("[NL] Accept Guests Enabled: %s\n", config_accept_guests ? "TRUE" : "FALSE");
+    }
+    if (info->attrs[MATTX_ATTR_CONFIG_LOCAL_LIBS]) {
+        config_hpc_local_libs = nla_get_u8(info->attrs[MATTX_ATTR_CONFIG_LOCAL_LIBS]) ? true : false;
+        mattx_dbg("[NL] HPC Local Libs Fast-Path: %s\n", config_hpc_local_libs ? "ON" : "OFF");
+    }
+
+    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, MPI: %s, Accept: %s, HPC Local Libs: %s\n",    
            config_migrate_file_io ? "TRUE" : "FALSE",
            config_migrate_network_io ? "TRUE" : "FALSE",
-           config_mattxfs_enabled ? "TRUE" : "FALSE");
+           config_mattxfs_enabled ? "TRUE" : "FALSE",
+           config_mpi_support ? "TRUE" : "FALSE",
+           config_accept_guests ? "TRUE" : "FALSE",
+           config_hpc_local_libs ? "TRUE" : "FALSE");           
     return 0;
 }
 

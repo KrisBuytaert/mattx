@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # MattX - The Modern Single System Image (SSI) Cluster
 # 
@@ -22,6 +21,18 @@
 # Commercial licensing options are available upon request.
 #
 
-export MPICH_NO_LOCAL=1
+CC = mpicc
+CFLAGS = -O2 -Wall
 
-mpirun -np 1 ./mpitest
+all: mpichess mpichess-client
+
+mpichess: mpichess.c mpichess.h
+	$(CC) $(CFLAGS) -o mpichess mpichess.c
+
+mpichess-client: mpichess-client.c mpichess.h
+	$(CC) $(CFLAGS) -o mpichess-client mpichess-client.c
+
+clean:
+	rm -f mpichess mpichess-client *.log *.btr
+
+

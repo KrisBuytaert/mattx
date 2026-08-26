@@ -1,3 +1,4 @@
+#!/bin/bash
 #
 # MattX - The Modern Single System Image (SSI) Cluster
 # 
@@ -21,16 +22,9 @@
 # Commercial licensing options are available upon request.
 #
 
-[Unit]
-Description=MattX Cluster Discovery Daemon
-After=network.target mattx.ko
+RDMAV_FORK_SAFE=1
+export RDMAV_FORK_SAFE
 
-[Service]
-ExecStart=/usr/local/sbin/mattx-discd
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
+./chessbot | mpirun -host mobile ./mpichess
 
 

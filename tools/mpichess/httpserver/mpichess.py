@@ -1,4 +1,3 @@
-#!/bin/bash
 #
 # MattX - The Modern Single System Image (SSI) Cluster
 # 
@@ -22,6 +21,43 @@
 # Commercial licensing options are available upon request.
 #
 
-export MPICH_NO_LOCAL=1
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session
+import cv2
+import base64
 
-mpirun -np 1 ./mpitest
+app = Flask(__name__)
+
+move = ""
+
+@app.route('/postmove', methods=['POST', 'GET'])
+def handle_post():
+    global move
+    move = request.args.get('move')
+    # Print the parameters to the terminal/console
+    print(f"Received move: {move}")
+
+    # Return a JSON response to the client
+    return jsonify({
+        "status": "success",
+        "message": "Move submitted."
+    }), 200
+
+
+
+@app.route('/move', methods=['GET'])
+def retrunmove():
+    global move
+    print("returning " + move)
+    return move
+
+
+@app.route('/', methods=['GET'])
+def chess():
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    # Run the app in debug mode on port 5003
+    app.run(debug=True, host='0.0.0.0', port=5003)
+
+

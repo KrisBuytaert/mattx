@@ -52,6 +52,23 @@ mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
 mattx_sys_dup_fn real_sys_dup = NULL;
 mattx_sys_dup2_fn real_sys_dup2 = NULL;
 mattx_sys_close_fn real_sys_close = NULL;
+mattx_sys_prlimit64_fn real_sys_prlimit64 = NULL;
+mattx_sys_prctl_fn real_sys_prctl = NULL;
+mattx_sys_fcntl_fn real_sys_fcntl = NULL;
+mattx_sys_ioctl_fn real_sys_ioctl = NULL;
+mattx_sys_statfs_fn real_sys_statfs = NULL;
+mattx_sys_fstatfs_fn real_sys_fstatfs = NULL;
+mattx_sys_newfstatat_fn real_sys_newfstatat = NULL;
+mattx_sys_faccessat2_fn real_sys_faccessat2 = NULL;
+mattx_sys_readlink_fn real_sys_readlink = NULL;
+mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
+mattx_sys_getdents64_fn real_sys_getdents64 = NULL;
+mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
+mattx_sys_exit_fn real_sys_exit = NULL;
+mattx_sys_clone_fn real_sys_clone = NULL;
+mattx_sys_mremap_fn real_sys_mremap = NULL;
+mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task = NULL;
+mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task = NULL;
 
 
 
@@ -175,7 +192,10 @@ static void mattx_resolve_hidden_symbols(void) {
 
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_sendmsg";
-    if (register_kprobe(&kp) == 0) { real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; unregister_kprobe(&kp); }
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_recvmsg";
@@ -204,6 +224,129 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_prlimit64";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_prlimit64 = (mattx_sys_prlimit64_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_prctl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_prctl = (mattx_sys_prctl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_fcntl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_fcntl = (mattx_sys_fcntl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_ioctl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_ioctl = (mattx_sys_ioctl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_statfs";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_statfs = (mattx_sys_statfs_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_fstatfs";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_fstatfs = (mattx_sys_fstatfs_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_newfstatat";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_newfstatat = (mattx_sys_newfstatat_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_faccessat2";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_faccessat2 = (mattx_sys_faccessat2_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_readlink";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_readlink = (mattx_sys_readlink_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_readlinkat";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_readlinkat = (mattx_sys_readlinkat_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+   
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_getdents64";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_getdents64 = (mattx_sys_getdents64_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_pipe2";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_pipe2 = (mattx_sys_pipe2_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+    
+    // --- THE THREAD GHOST EXORCIST ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_exit";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_exit = (mattx_sys_exit_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // --- THE GANG GROWER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_clone";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_clone = (mattx_sys_clone_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // --- THE vDSO TRANSPLANT ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_mremap";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_mremap = (mattx_sys_mremap_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // --- THE TLS HARDWARE SYNC ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "x86_fsbase_write_task";
+    if (register_kprobe(&kp) == 0) { 
+        real_x86_fsbase_write_task = (mattx_x86_fsbase_write_task_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "x86_gsbase_write_task";
+    if (register_kprobe(&kp) == 0) { 
+        real_x86_gsbase_write_task = (mattx_x86_gsbase_write_task_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+    
 
 }
 
@@ -222,51 +365,57 @@ struct mattx_drain_ctx {
     struct completion done;
 };
 
+
 // This function runs INSIDE the target process, right at the user-space boundary!
 static void mattx_drain_callback(struct callback_head *cb) {
     struct mattx_drain_ctx *ctx = container_of(cb, struct mattx_drain_ctx, cb);
-    
-    // 1. Tell the migrator thread that we have safely reached the boundary
     complete(&ctx->done);
-    
-    // 2. Put ourselves into a deep, stable freeze
-    set_current_state(TASK_STOPPED);
-    schedule();
+    // Return normally! Do NOT sleep here, to avoid the SIGCONT ricochet.
 }
 
-static void mattx_freeze_task_safely(struct task_struct *task) {
+void mattx_freeze_task_safely(struct task_struct *task) {
     struct mattx_drain_ctx ctx;
     int ret;
 
-    // --- NEW: Wait for any open RPC Wormholes to close! ---
     while (is_rpc_pending(task->pid)) {
         printk_once(KERN_INFO "MattX:[DRAIN] Waiting for RPC Wormhole to close for PID %d...\n", task->pid);
         msleep(50);
     }
 
-    // We REMOVED the old TASK_STOPPED check here, because if it was stopped by an RPC, 
-    // it wasn't at the user-space boundary! We must force it through the Task Work.
-
     init_completion(&ctx.done);
     init_task_work(&ctx.cb, mattx_drain_callback);
 
-    // Call the dynamically resolved pointer! ---
     if (real_task_work_add) {
         ret = real_task_work_add(task, &ctx.cb, TWA_SIGNAL);
     } else {
-        ret = -ENOSYS; // Force the fallback if the resolver failed
+        ret = -ENOSYS; 
     }
+    
     if (ret == 0) {
         mattx_dbg("[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
         
-        // If the task was stopped by something else (like job control), we must nudge it 
-        // so it wakes up and executes our Task Work!
         if (READ_ONCE(task->__state) & __TASK_STOPPED) {
             send_sig(SIGCONT, task, 0);
         }
         
         wait_for_completion(&ctx.done);
-        mattx_dbg("[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
+        
+        // --- THE TRUE FREEZE ---
+        // Explicitly freeze the task from the outside to override any lingering SIGCONT!
+        send_sig(SIGSTOP, task, 0);
+        
+        // Ironclad Verification: Wait until the CPU confirms the task is unconscious!
+        int retries = 500; // 5 seconds max
+        while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
+            msleep(10);
+            retries--;
+        }
+        
+        if (retries == 0) {
+            printk(KERN_WARNING "MattX:[DRAIN] WARNING: PID %d took too long to freeze!\n", task->pid);
+        } else {
+            mattx_dbg("[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
+        }
     } else {
         printk(KERN_WARNING "MattX:[DRAIN] task_work_add failed for PID %d. Falling back to SIGSTOP.\n", task->pid);
         send_sig(SIGSTOP, task, 0);
@@ -278,10 +427,10 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
         }
     }
 }
+EXPORT_SYMBOL(mattx_freeze_task_safely);
 
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
-    struct pt_regs *regs;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
@@ -338,21 +487,50 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         mattx_dbg("[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
     }
 
-    regs = task_pt_regs(task);
-    if (regs) {
-        memcpy(&req->regs, regs, sizeof(struct pt_regs));
-        req->fsbase = task->thread.fsbase;
-        req->gsbase = task->thread.gsbase;
-        
-        if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
-            mattx_dbg("[DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
+    // --- GANG EXTRACTION ---
+    struct task_struct *threads[MAX_GANG_THREADS];
+    int t_count = 0;
+    struct task_struct *t;
+    
+    rcu_read_lock();
+    for_each_thread(task, t) {
+        if (t_count < MAX_GANG_THREADS) {
+            get_task_struct(t);
+            threads[t_count++] = t;
         }
     }
+    rcu_read_unlock();
+
+    req->thread_count = t_count;
+    for (int i = 0; i < t_count; i++) {
+        if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
+        
+        req->threads[i].tid = threads[i]->pid;
+        struct pt_regs *t_regs = task_pt_regs(threads[i]);
+        if (t_regs) {
+            memcpy(&req->threads[i].regs, t_regs, sizeof(struct pt_regs));
+            req->threads[i].fsbase = threads[i]->thread.fsbase;
+            req->threads[i].gsbase = threads[i]->thread.gsbase;
+            
+            // Capture the Futex Pointers! ---
+            req->threads[i].clear_child_tid = (uint64_t)threads[i]->clear_child_tid;
+            req->threads[i].set_child_tid   = (uint64_t)threads[i]->set_child_tid;
+
+            if (threads[i] == task && access_process_vm(task, t_regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
+                mattx_dbg("[DEBUG] Mother Source RIP (0x%lx) contains: %8ph\n", (unsigned long)t_regs->ip, rip_buf);
+            }
+        }
+        put_task_struct(threads[i]);
+    }
+    mattx_dbg("[EXTRACT] Packed %d threads into the Gang Blueprint!\n", t_count);
 
     mm = task->mm;
     if (mm) {
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
+        req->start_brk = mm->start_brk; // Capture Heap Start
+        req->brk = mm->brk;             // Capture Heap End
+        req->vdso_addr = (uint64_t)mm->context.vdso; // Capture the vDSO!
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
@@ -390,7 +568,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 }
 
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
-    struct pt_regs *regs;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
@@ -428,16 +605,54 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
     // Pack the DFSA path into the Blueprint! ---
     strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
+
+    // --- The "Lazy Oracle" Nametag Capture! ---
+    get_task_comm(req->comm, task);
+    mattx_dbg("[EXTRACT] Captured RETURN process name: '%s'\n", req->comm);
+
+    // --- GANG RETURN EXTRACTION ---
+    struct task_struct *threads[MAX_GANG_THREADS];
+    int t_count = 0;
+    struct task_struct *t;
     
-    regs = task_pt_regs(task);
-    if (regs) {
-        memcpy(&req->regs, regs, sizeof(struct pt_regs));
+    rcu_read_lock();
+    for_each_thread(task, t) {
+        if (t_count < MAX_GANG_THREADS) {
+            get_task_struct(t);
+            threads[t_count++] = t;
+        }
     }
+    rcu_read_unlock();
+
+    req->thread_count = t_count;
+    for (int i = 0; i < t_count; i++) {
+        if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
+        
+        req->threads[i].tid = threads[i]->pid;
+        struct pt_regs *t_regs = task_pt_regs(threads[i]);
+        if (t_regs) {
+            memcpy(&req->threads[i].regs, t_regs, sizeof(struct pt_regs));
+
+            // --- The "Lazy Oracle" TLS Capture! ---
+            req->threads[i].fsbase = threads[i]->thread.fsbase;
+            req->threads[i].gsbase = threads[i]->thread.gsbase;
+
+            // Capture the Futex Pointers on Return! ---
+            req->threads[i].clear_child_tid = (uint64_t)threads[i]->clear_child_tid;
+            req->threads[i].set_child_tid   = (uint64_t)threads[i]->set_child_tid;            
+        }
+        put_task_struct(threads[i]);
+    }
+    mattx_dbg("[EXTRACT] Packed %d threads into the Return Blueprint!\n", t_count);
+
 
     mm = task->mm;
     if (mm) {
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
+        req->start_brk = mm->start_brk; // Capture Heap Start
+        req->brk = mm->brk;             // Capture Heap End
+        req->vdso_addr = (uint64_t)mm->context.vdso; // Capture the vDSO!
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
@@ -468,11 +683,14 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
-        mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
-        mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
-    }
-    kvfree(req); // FIX: Use kvfree!
+            mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n", 
+                    vma_count, actual_payload_size);
+            mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
+            mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
+        }
+        kvfree(req); // FIX: Use kvfree!
 }
+
 
 void mattx_send_vma_data(void) {
     int total_pages = 0;
@@ -483,21 +701,32 @@ void mattx_send_vma_data(void) {
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
 
-    mattx_dbg(" [MIGRATE] Starting data pipeline to Node %d...\n", migrating_target_node);
+    mattx_dbg("[MIGRATE] =====================================================\n");
+    mattx_dbg("[MIGRATE] Starting data pipeline to Node %d...\n", migrating_target_node);
+    mattx_dbg("[MIGRATE] Blueprint Size: %zu bytes, VMA Count: %u, Is Returning: %d\n",
+              sizeof(struct mattx_migration_req) + (local_migration_req->vma_count * sizeof(struct mattx_vma_info)),
+              local_migration_req->vma_count, is_returning);
 
     for (int i = 0; i < local_migration_req->vma_count; i++) {
         unsigned long start = local_migration_req->vmas[i].vm_start;
         unsigned long end = local_migration_req->vmas[i].vm_end;
-        unsigned long vma_flags = local_migration_req->vmas[i].vm_flags; // Declared here!
+        unsigned long vma_flags = local_migration_req->vmas[i].vm_flags;
         unsigned long curr = start;
-        
+        unsigned long vma_size = end - start;
+        int vma_pages = (vma_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        int pages_sent_this_vma = 0;
+
+        mattx_dbg("[MIGRATE] Processing VMA %d/%d: 0x%lx - 0x%lx (Size: %lu bytes, ~%d pages, Flags: 0x%lx)\n",
+                  i + 1, local_migration_req->vma_count, start, end, vma_size, vma_pages, vma_flags);
+
         // --- The Smart Return Optimization ---
-        // If we are returning to the Home Node, the Deputy already has the Read-Only code!
-        // We only need to send back the memory that could have changed (VM_WRITE).
         if (is_returning && !(vma_flags & VM_WRITE)) {
-            continue; // Skip this VMA entirely!
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
+            continue;
         }
-        
+
+        mattx_dbg("[MIGRATE] -> VMA %d: Entering page extraction loop...\n", i);
+
         while (curr < end) {
             u32 chunk_size = PAGE_SIZE;
             if (curr + chunk_size > end) chunk_size = end - curr;
@@ -513,32 +742,55 @@ void mattx_send_vma_data(void) {
                     if (payload_buf) {
                         struct mattx_page_header *p_page_hdr = (struct mattx_page_header *)payload_buf;
                         
-                        p_page_hdr->vma_index = i;
-                        p_page_hdr->offset = curr - start;
+                        p_page_hdr->absolute_addr = curr;
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
                         
+                        if (pages_sent_this_vma % 256 == 0) {
+                            mattx_dbg("[MIGRATE] -> VMA %d: Sending page %d/%d (Offset: 0x%lx, Payload: %zu bytes)...\n",
+                                      i, pages_sent_this_vma, vma_pages, curr - start, payload_size);
+                        }
+
                         int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        
                         if (send_res < payload_size) {
+                            mattx_dbg("[MIGRATE] -> ERROR: Network send blocked/failed at VMA %d, Offset 0x%lx (Sent %d/%zu bytes)\n", 
+                                      i, curr - start, send_res, payload_size);
                             network_errors++;
                         } else {
                             sent_pages++;
+                            pages_sent_this_vma++;
                         }
                         
                         kfree(payload_buf);
+                    } else {
+                        mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate payload_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
                     }
                 } else {
                     skipped_pages++;
                 }
                 kfree(page_buf);
+            } else {
+                mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate page_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
             }
             curr += chunk_size;
+
+            // --- NEW: THE BREATHING PUMP ---
+            // Give the CPU a chance to process network ACKs and let VM1 catch up!
+            // We also add a tiny 1ms sleep every 1024 pages (4MB) to guarantee the TCP window stays open.
+            cond_resched();
+            if (pages_sent_this_vma % 1024 == 0) {
+                msleep(1);
+            }
         }
+
+        mattx_dbg("[MIGRATE] -> VMA %d finished. Sent %d pages.\n", i, pages_sent_this_vma);
     }
     
     mattx_dbg("[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
            total_pages, sent_pages, skipped_pages, network_errors);
+    mattx_dbg("[MIGRATE] =====================================================\n");
 
     if (is_returning) {
         mattx_dbg("[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
@@ -546,11 +798,6 @@ void mattx_send_vma_data(void) {
         
         mattx_dbg("[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
         send_sig(SIGKILL, migrating_task, 0);
-        
-        // --- FIXED: The Patient Shield ---
-        // DO NOT remove the guest from the registry here! 
-        // If we remove it now, mattx_fake_release will think it's a normal death and assassinate the Deputy's FDs!
-        // We leave it in the registry, and let the Balancer's Guest Watcher clean it up naturally later.
 
     } else {
         mattx_dbg("[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
@@ -564,6 +811,77 @@ void mattx_send_vma_data(void) {
     migrating_task = NULL;
     kvfree(local_migration_req);
     local_migration_req = NULL;
+}
+
+// --- THE NODE DRAINER (Expel) ---
+int mattx_expel_guest(pid_t local_pid) {
+    u32 orig_pid = 0;
+    int home_node = -1;
+    struct task_struct *surrogate = NULL;
+    bool found = false;
+
+    // 1. Find the guest in the registry
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == local_pid) {
+            orig_pid = guest_registry[i].orig_pid;
+            home_node = guest_registry[i].home_node;
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!found) {
+        printk(KERN_WARNING "MattX: [EXPEL] PID %d is not a MattX guest!\n", local_pid);
+        return -ENOENT;
+    }
+
+    if (!cluster_map[home_node]) {
+        printk(KERN_ERR "MattX: [EXPEL] Home Node %d is disconnected! Cannot expel PID %d.\n", home_node, local_pid);
+        return -ENOTCONN;
+    }
+
+
+    // 2. Grab the task struct
+    rcu_read_lock();
+    surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID);
+    if (surrogate) {
+        surrogate = surrogate->group_leader; // Grab the Mother!
+        get_task_struct(surrogate);
+    }
+    rcu_read_unlock();
+
+    if (surrogate) {
+        mattx_dbg("[EXPEL] Initiating forced return for Surrogate PID %d to Node %d...\n", local_pid, home_node);
+        
+        // 3. Trigger the exact same return pipeline as a Recall!
+        mattx_capture_and_return_state(surrogate, orig_pid, home_node);
+        put_task_struct(surrogate);
+
+        // 4. BLOCKING WAIT: Wait until the guest is fully removed from the registry
+        mattx_dbg("[EXPEL] Waiting for migration of PID %d to complete...\n", local_pid);
+        while (1) {
+            found = false;
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == local_pid) {
+                    found = true;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (!found) break; // It's gone! Migration complete!
+            
+            // Sleep for 100ms and check again. This safely blocks the /proc write!
+            msleep(100);
+        }
+        mattx_dbg("[EXPEL] Successfully expelled PID %d!\n", local_pid);
+        return 0;
+    }
+
+    return -ESRCH;
 }
 
 

@@ -35,6 +35,13 @@
 #include <sys/mman.h> 
 #include <signal.h>
 #include <sched.h>      // For unshare()
+#include <sys/syscall.h>
+
+// Safe fallback just in case the glibc headers are weird
+#ifndef SYS_clone
+#define SYS_clone 56
+#endif
+
 #include <sys/mount.h>  // For mount()
 #include <sys/stat.h>   // For mkdir()
 #include <netlink/netlink.h>
@@ -43,6 +50,7 @@
 
 // Match the kernel's new MAX_FDS ---
 #define MAX_FDS 256
+#define MAX_GANG_THREADS 16
 
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
@@ -62,25 +70,42 @@ struct mattx_cpu_regs {
     uint64_t rip, cs, eflags, rsp, ss;
 };
 
+struct mattx_thread_info {
+    uint32_t tid;
+    struct mattx_cpu_regs regs;
+    uint64_t fsbase;
+    uint64_t gsbase;
+    uint64_t clear_child_tid; // The Futex Wake Pointer!
+    uint64_t set_child_tid;   // The Thread Init Pointer!
+} __attribute__((packed)); // FORCE EXACT LAYOUT
+
+
+
+// --- IN mattx_stub.c ---
+
 struct mattx_migration_req {
     uint32_t orig_pid;
     uint32_t uid; 
     uint32_t gid; 
     uint32_t home_node;
-    struct mattx_cpu_regs regs;
-    uint64_t fsbase; 
-    uint64_t gsbase; 
+    
+    uint32_t thread_count;
+    struct mattx_thread_info threads[MAX_GANG_THREADS];
+    
     uint64_t arg_start; 
     uint64_t arg_end;   
+    uint64_t start_brk;
+    uint64_t brk;
+    uint64_t vdso_addr; // The vDSO Transplant Address!
     char comm[16];
     char dfsa_dir[256];    
     uint32_t fd_count;          
     uint32_t open_fds[MAX_FDS]; 
     uint32_t vma_count;
     uint8_t mattxfs_enabled;
-    uint8_t pad[3];
     struct mattx_vma_info vmas[]; 
-};
+} __attribute__((packed)); // <-- FORCE EXACT LAYOUT
+
 
 static struct mattx_migration_req *received_req = NULL;
 
@@ -108,6 +133,13 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
         if (received_req) memcpy(received_req, req, len);
     }
     return NL_OK;
+}
+
+
+static int dummy_thread_fn(void *arg) {
+    // Child thread: Just sleep until the kernel hijacks my brain!
+    while(1) sleep(1); 
+    return 0;
 }
 
 int main() {
@@ -168,37 +200,37 @@ int main() {
     printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', UID: %u, GID: %u, VMAs: %u, FDs: %u\n", 
            received_req->orig_pid, received_req->comm, received_req->uid, received_req->gid, received_req->vma_count, received_req->fd_count);
 
-    // Get the approximate memory address of our own code to prevent suicide!
-    uint64_t my_brain_addr = (uint64_t)&main & ~(0xFFFULL); 
-
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
-        struct mattx_vma_info *v = &received_req->vmas[i];
-        size_t size = v->vm_end - v->vm_start;
-
-        // --- THE ALMA ANOMALY SHIELD ---
-        if (my_brain_addr >= v->vm_start && my_brain_addr < v->vm_end) {
-            fprintf(stderr, "\n=======================================================\n");
-            fprintf(stderr, "MattX-Stub: FATAL ALMA ANOMALY DETECTED! 🚨\n");
-            fprintf(stderr, "VMA 0x%lx - 0x%lx overlaps with my own brain (0x%lx)!\n", v->vm_start, v->vm_end, my_brain_addr);
-            fprintf(stderr, "I refuse to overwrite my own memory. Please compile mattx-stub with '-fPIE -pie'!\n");
-            fprintf(stderr, "=======================================================\n\n");
-            exit(1);
-        }
+        // --- FIXED: Copy by value to avoid unaligned pointer warnings! ---
+        struct mattx_vma_info v = received_req->vmas[i]; 
+        size_t size = v.vm_end - v.vm_start;
 
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
 
         // The Stack Growth Protector ---
-        if (v->vm_flags & 0x0100) {
+        if (v.vm_flags & 0x0100) {
             flags |= MAP_GROWSDOWN;
         }
 
-        void *addr = mmap((void *)v->vm_start, size, prot, flags, -1, 0);        
+        void *addr = mmap((void *)v.vm_start, size, prot, flags, -1, 0);        
         if (addr == MAP_FAILED) {
             perror("MattX-Stub: mmap MAP_FIXED failed");
         } else {
             printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX%s)\n", 
-                   i, v->vm_start, v->vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
+                   i, (unsigned long)v.vm_start, (unsigned long)v.vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
+        }
+    }
+
+    printf("MattX-Stub: Spawning %u dummy threads for Gang Migration...\n", received_req->thread_count);
+    int clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    
+    for (uint32_t i = 1; i < received_req->thread_count; i++) {
+        void *dummy_stack = malloc(4096);
+        
+        // Use the glibc clone() wrapper! It safely handles the stack return address.
+        if (clone(dummy_thread_fn, (char *)dummy_stack + 4096, clone_flags, NULL) == -1) {
+            perror("MattX-Stub: clone failed");
         }
     }
 
@@ -271,10 +303,9 @@ int main() {
     nl_socket_free(sock);
     free(received_req);
 
-    raise(SIGSTOP); 
-    
-    printf("MattX-Stub: ERROR - I woke up but I am still the stub!\n");
+    // --- THE SYMMETRICAL FREEZE ---
+    // Just loop peacefully. The kernel will inject a Task Work and freeze us natively!
     while (1) sleep(1); 
+    
     return 0;
 }
-
