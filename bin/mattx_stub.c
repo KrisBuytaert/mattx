@@ -51,6 +51,9 @@
 // Match the kernel's new MAX_FDS ---
 #define MAX_FDS 256
 #define MAX_GANG_THREADS 16
+// MUST match mattx.h -- see the comment there for why this can't just be
+// bumped to PAGE_SIZE (netlink attribute length is a 16-bit field).
+#define MATTX_FPU_STATE_MAX 1024
 
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
@@ -77,6 +80,11 @@ struct mattx_thread_info {
     uint64_t gsbase;
     uint64_t clear_child_tid; // The Futex Wake Pointer!
     uint64_t set_child_tid;   // The Thread Init Pointer!
+    // MUST STAY IN SYNC with struct mattx_thread_info in mattx.h -- this
+    // is a hand-mirrored copy since this file is a separate userspace
+    // program and can't #include the kernel module's header.
+    uint32_t fpu_size;
+    uint8_t fpu_state[MATTX_FPU_STATE_MAX];
 } __attribute__((packed)); // FORCE EXACT LAYOUT
 
 
@@ -162,6 +170,18 @@ int main() {
     printf("MattX-Stub: Waking up! PID %u. Requesting blueprint...\n", my_pid);
 
     sock = nl_socket_alloc();
+    // The blueprint (now including per-thread FPU/XSAVE state) can be
+    // ~70KB+, comfortably over netlink's defaults. Two SEPARATE size
+    // limits both need raising: the kernel socket's SO_RCVBUF (queue
+    // capacity) and libnl's own internal per-message read buffer, which
+    // is what actually errors here -- nl_recvmsgs_default() logs "-5"
+    // (NLE_NOMEM) when its fixed-size read buffer is too small, and we
+    // end up parsing a garbage/zeroed blueprint (VMAs: 0, FDs: 0, empty
+    // comm) instead of failing loudly -- every subsequent mmap/page-
+    // injection step then fails because the VMAs were never actually
+    // there to carve.
+    nl_socket_set_buffer_size(sock, 1024 * 1024, 0);
+    nl_socket_set_msg_buf_size(sock, 1024 * 1024);
     genl_connect(sock);
     family_id = genl_ctrl_resolve(sock, "MATTX");
     

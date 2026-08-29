@@ -239,11 +239,25 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
 
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
+
+                    // Restore FPU/SSE/AVX state! See the matching capture
+                    // side in mattx_migr.c for why this is needed. t is
+                    // guaranteed frozen here (stopped, about to be
+                    // SIGCONT'd below), so its FPU context is safely
+                    // resident in memory, not live in hardware registers.
+                    if (t->thread.fpu.fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
+                        u32 fsize = pending_migration->threads[t_idx].fpu_size;
+                        if (fsize > t->thread.fpu.fpstate->size)
+                            fsize = t->thread.fpu.fpstate->size;
+                        if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
+                            fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
+                        memcpy(&t->thread.fpu.fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+                    }
                 }
-                
+
                 // Child Comm Fix! ---
                 strscpy(t->comm, pending_migration->comm, sizeof(t->comm));
-                
+
                 t_idx++;
             }
         }
@@ -697,8 +711,19 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
 
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
+
+                    // Restore FPU/SSE/AVX state on return! See the matching
+                    // capture side in mattx_migr.c for why this is needed.
+                    if (t->thread.fpu.fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
+                        u32 fsize = pending_migration->threads[t_idx].fpu_size;
+                        if (fsize > t->thread.fpu.fpstate->size)
+                            fsize = t->thread.fpu.fpstate->size;
+                        if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
+                            fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
+                        memcpy(&t->thread.fpu.fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+                    }
                 }
-                
+
                 // Child Comm Fix on Return! ---
                 strscpy(t->comm, pending_migration->comm, sizeof(t->comm));
             } else {
