@@ -49,7 +49,7 @@ bool check_rpc_done(pid_t pid) {
     bool done = false;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == pid) {
+        if (mattx_pid_shares_tgid_with_guest(pid, guest_registry[i].local_pid)) {
             done = guest_registry[i].rpc_done;
             break;
         }
@@ -222,7 +222,7 @@ static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct pa
     // 1. Attach our wait queue to the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             guest_registry[i].rpc_wq = &rpc_wq;
             guest_registry[i].rpc_done = false;
             guest_registry[i].rpc_statx_buf = NULL; 
@@ -242,7 +242,7 @@ static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct pa
     // 4. We woke up! Collect the data from the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             if (guest_registry[i].rpc_statx_buf) {
                 struct statx *s = guest_registry[i].rpc_statx_buf;
                 
@@ -308,7 +308,7 @@ static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
     // 1. Attach our wait queue to the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             guest_registry[i].rpc_wq = &rpc_wq;
             guest_registry[i].rpc_done = false;
             guest_registry[i].rpc_lseek_res = -1;
@@ -328,7 +328,7 @@ static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
     // 4. We woke up! Collect the data from the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             ret_offset = guest_registry[i].rpc_lseek_res;
             guest_registry[i].rpc_wq = NULL;
             break;
@@ -365,7 +365,7 @@ static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int dat
     // 1. Attach our wait queue to the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             guest_registry[i].rpc_wq = &rpc_wq;
             guest_registry[i].rpc_done = false;
             guest_registry[i].rpc_fsync_res = -1;
@@ -385,7 +385,7 @@ static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int dat
     // 4. We woke up! Collect the data from the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             ret_error = guest_registry[i].rpc_fsync_res;
             guest_registry[i].rpc_wq = NULL;
             break;
@@ -419,7 +419,7 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
     // 1. Attach our wait queue to the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             guest_registry[i].rpc_wq = &rpc_wq;
             guest_registry[i].rpc_done = false;
             guest_registry[i].rpc_read_buf = NULL;
@@ -440,7 +440,7 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
     // 4. We woke up! Collect the data from the registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
+        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
             read_buf = guest_registry[i].rpc_read_buf;
             ret_bytes = guest_registry[i].rpc_read_bytes;
             

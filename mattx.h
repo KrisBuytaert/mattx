@@ -1130,6 +1130,31 @@ extern struct mattx_guest_info guest_registry[MAX_GUESTS];
 extern int guest_count;
 extern spinlock_t guest_lock;
 
+// guest_registry is keyed by the GUEST's thread-group leader PID (see
+// add_guest_process()), but a wormhole-hooked syscall (open/read/write/
+// lseek/fsync/poll/...) can be issued by ANY thread in a multi-threaded
+// Gang, not just the leader -- current->pid for a non-leader thread is
+// its own unique TID, not the shared TGID. Comparing that raw per-thread
+// pid directly against guest_registry[i].local_pid never matches for a
+// non-leader thread, so its RPC-wait loop immediately concludes "Surrogate
+// disappeared" and gives up -- without ever sending the SIGCONT to un-stop
+// the very thread the hook itself had just SIGSTOP'd, permanently wedging
+// the whole Gang (see docs/BUGS.md BUG-007). Use this everywhere a
+// thread-specific pid needs to be checked against a (leader-keyed)
+// guest_registry entry.
+static inline bool mattx_pid_shares_tgid_with_guest(pid_t local_pid, pid_t guest_local_pid) {
+    struct task_struct *t;
+    bool match;
+
+    if (local_pid == guest_local_pid) return true; // fast path: it IS the leader
+
+    rcu_read_lock();
+    t = pid_task(find_vpid(local_pid), PIDTYPE_PID);
+    match = t && (t->tgid == guest_local_pid);
+    rcu_read_unlock();
+    return match;
+}
+
 extern struct mattx_export_info export_registry[MAX_GUESTS];
 extern int export_count;
 extern spinlock_t export_lock;
