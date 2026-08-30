@@ -487,24 +487,61 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         mattx_dbg("[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
     }
 
-    // --- GANG EXTRACTION ---
+    // --- GANG EXTRACTION (race-safe against lazily-created threads) ---
     struct task_struct *threads[MAX_GANG_THREADS];
     int t_count = 0;
+    int frozen_count = 0;
     struct task_struct *t;
-    
-    rcu_read_lock();
-    for_each_thread(task, t) {
-        if (t_count < MAX_GANG_THREADS) {
-            get_task_struct(t);
-            threads[t_count++] = t;
+
+    // Runtimes like GROMACS/OpenMP can lazily create additional thread
+    // teams at MULTIPLE points throughout a run (e.g. separate teams for
+    // PME vs. neighbor-search/pairlist construction, each formed only on
+    // first use of that code path, not just once at startup) -- if such a
+    // thread appears after we've already snapshotted the thread list but
+    // before the VMA walk below, whatever memory it allocates would
+    // silently be missing from the blueprint (see docs/BUGS.md BUG-008:
+    // real crashes were traced to exactly this -- a live thread executing
+    // real code against a heap address that simply didn't exist in any
+    // captured VMA, or a freshly-started gomp worker thread jumping through
+    // an uninitialized dispatch pointer). Keep re-scanning for_each_thread
+    // and freezing anything new, and require several CONSECUTIVE quiet
+    // scans (with a short sleep between each) before concluding the thread
+    // group has genuinely settled -- a single quiet scan isn't enough
+    // evidence, since a thread's clone() can still be in flight and not
+    // yet visible for a few scans in a row.
+    int stabilize_retries = 200;
+    int stable_scans = 0;
+    #define MATTX_REQUIRED_STABLE_SCANS 5
+    do {
+        int before_count = t_count;
+        rcu_read_lock();
+        for_each_thread(task, t) {
+            bool already_have = false;
+            for (int j = 0; j < t_count; j++) {
+                if (threads[j] == t) { already_have = true; break; }
+            }
+            if (!already_have && t_count < MAX_GANG_THREADS) {
+                get_task_struct(t);
+                threads[t_count++] = t;
+            }
         }
-    }
-    rcu_read_unlock();
+        rcu_read_unlock();
+
+        for (int i = frozen_count; i < t_count; i++) {
+            if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
+        }
+        frozen_count = t_count;
+
+        if (t_count == before_count) {
+            stable_scans++;
+            msleep(20);
+        } else {
+            stable_scans = 0;
+        }
+    } while (stable_scans < MATTX_REQUIRED_STABLE_SCANS && --stabilize_retries > 0);
 
     req->thread_count = t_count;
     for (int i = 0; i < t_count; i++) {
-        if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
-        
         req->threads[i].tid = threads[i]->pid;
         struct pt_regs *t_regs = task_pt_regs(threads[i]);
         if (t_regs) {
@@ -625,24 +662,48 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     get_task_comm(req->comm, task);
     mattx_dbg("[EXTRACT] Captured RETURN process name: '%s'\n", req->comm);
 
-    // --- GANG RETURN EXTRACTION ---
+    // --- GANG RETURN EXTRACTION (race-safe against lazily-created threads) ---
     struct task_struct *threads[MAX_GANG_THREADS];
     int t_count = 0;
+    int frozen_count = 0;
     struct task_struct *t;
-    
-    rcu_read_lock();
-    for_each_thread(task, t) {
-        if (t_count < MAX_GANG_THREADS) {
-            get_task_struct(t);
-            threads[t_count++] = t;
+
+    // See the matching comment in mattx_capture_and_send_state() above --
+    // keep re-scanning for_each_thread and freezing anything new, and
+    // require several CONSECUTIVE quiet scans (with a short sleep between
+    // each) before concluding the thread group has genuinely settled.
+    int stabilize_retries = 200;
+    int stable_scans = 0;
+    do {
+        int before_count = t_count;
+        rcu_read_lock();
+        for_each_thread(task, t) {
+            bool already_have = false;
+            for (int j = 0; j < t_count; j++) {
+                if (threads[j] == t) { already_have = true; break; }
+            }
+            if (!already_have && t_count < MAX_GANG_THREADS) {
+                get_task_struct(t);
+                threads[t_count++] = t;
+            }
         }
-    }
-    rcu_read_unlock();
+        rcu_read_unlock();
+
+        for (int i = frozen_count; i < t_count; i++) {
+            if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
+        }
+        frozen_count = t_count;
+
+        if (t_count == before_count) {
+            stable_scans++;
+            msleep(20);
+        } else {
+            stable_scans = 0;
+        }
+    } while (stable_scans < MATTX_REQUIRED_STABLE_SCANS && --stabilize_retries > 0);
 
     req->thread_count = t_count;
     for (int i = 0; i < t_count; i++) {
-        if (threads[i] != task) mattx_freeze_task_safely(threads[i]); // Mother is already frozen
-        
         req->threads[i].tid = threads[i]->pid;
         struct pt_regs *t_regs = task_pt_regs(threads[i]);
         if (t_regs) {
