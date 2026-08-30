@@ -145,8 +145,22 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
 
 
 static int dummy_thread_fn(void *arg) {
-    // Child thread: Just sleep until the kernel hijacks my brain!
-    while(1) sleep(1); 
+    // Child thread: just spin until the kernel hijacks my brain!
+    //
+    // This thread is created with a raw clone() below, WITHOUT
+    // CLONE_SETTLS -- it has no thread-local-storage area of its own and
+    // is unknowingly sharing the parent stub thread's TLS block (errno,
+    // and any other libc per-thread state). Any libc call that can touch
+    // TLS -- even sleep(), which sets errno to EINTR on the signal that's
+    // specifically used to freeze/drain this thread for the brain
+    // transplant -- races with the real stub thread and any other dummy
+    // Gang threads over that single shared TLS block. Use a bare spin
+    // loop with no function calls at all so this thread touches nothing
+    // beyond its own registers until the kernel overwrites its pt_regs
+    // (rip/rsp/fsbase/gsbase) with the real captured thread's state.
+    for (;;) {
+        __asm__ __volatile__("pause");
+    }
     return 0;
 }
 
@@ -245,11 +259,16 @@ int main() {
     printf("MattX-Stub: Spawning %u dummy threads for Gang Migration...\n", received_req->thread_count);
     int clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
     
+    // Generous stack even though dummy_thread_fn makes no calls and needs
+    // almost none of it -- cheap insurance against any signal-delivery
+    // frame the kernel pushes onto this thread's stack before it reaches
+    // the brain transplant.
+    #define MATTX_DUMMY_STACK_SIZE (64 * 1024)
     for (uint32_t i = 1; i < received_req->thread_count; i++) {
-        void *dummy_stack = malloc(4096);
-        
+        void *dummy_stack = malloc(MATTX_DUMMY_STACK_SIZE);
+
         // Use the glibc clone() wrapper! It safely handles the stack return address.
-        if (clone(dummy_thread_fn, (char *)dummy_stack + 4096, clone_flags, NULL) == -1) {
+        if (clone(dummy_thread_fn, (char *)dummy_stack + MATTX_DUMMY_STACK_SIZE, clone_flags, NULL) == -1) {
             perror("MattX-Stub: clone failed");
         }
     }

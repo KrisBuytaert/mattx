@@ -746,8 +746,20 @@ void mattx_send_vma_data(void) {
                   i + 1, local_migration_req->vma_count, start, end, vma_size, vma_pages, vma_flags);
 
         // --- The Smart Return Optimization ---
-        if (is_returning && !(vma_flags & VM_WRITE)) {
-            mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
+        // Only skip a VMA that is neither writable NOR executable. A VMA
+        // can gain new content after being made non-writable again -- most
+        // notably runtime JIT code generation (e.g. FFTW's FFT codelets,
+        // which GROMACS's PME path uses): mmap RW, write the generated
+        // machine code, then mprotect back to RX (a standard W^X-safe JIT
+        // pattern). If that codegen happens on the Surrogate sometime after
+        // the forward migration but before a recall, this VMA now reports
+        // VM_WRITE unset even though its content differs from whatever the
+        // frozen Deputy has from the original capture -- skipping it would
+        // silently leave the Deputy with stale/missing code and crash on
+        // first use. Only truly-inert regions (no write, no exec -- e.g.
+        // relocated .rodata/GOT/PLT) are safe to assume unchanged.
+        if (is_returning && !(vma_flags & (VM_WRITE | VM_EXEC))) {
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only, non-exec during Return)\n", i);
             continue;
         }
 
