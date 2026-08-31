@@ -84,6 +84,20 @@
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
 
+// Max size of a captured thread's raw FPU/SSE/AVX register image
+// (XSAVE/FXSAVE area). Covers up through AVX2 (~832-960 bytes on typical
+// hardware) with headroom. NOTE: this whole struct gets shipped to
+// mattx-stub as a single Generic Netlink attribute, whose length field is
+// only 16 bits wide (65535-byte hard cap) -- MAX_GANG_THREADS (16) copies
+// of this buffer are embedded directly in mattx_migration_req, so keep
+// this modest. A full PAGE_SIZE (4096) buffer here blows straight through
+// that limit (16 * 4096 = 65536 alone) and silently corrupts the
+// blueprint on the wire (nla_len wraps, mattx-stub parses a garbage/zeroed
+// struct: "VMAs: 0, FDs: 0" and every page injection then fails). If this
+// ever needs to grow (e.g. AVX-512 support, ~2696 bytes), the attribute
+// would need to be split/chunked instead of raised further.
+#define MATTX_FPU_STATE_MAX 1024
+
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
 
@@ -221,6 +235,12 @@ struct mattx_cpu_regs {
 
 };
 
+// NOTE: bin/mattx_stub.c hand-mirrors this struct (and mattx_migration_req
+// below) byte-for-byte, since it's a separate userspace program that can't
+// #include this kernel header. Keep both in sync -- a layout mismatch here
+// silently corrupts the vmas[] flexible array offset the stub parses,
+// which fails every page injection ("Failed to inject... res: 0") without
+// any obvious error pointing back at the struct mismatch itself.
 struct mattx_thread_info {
     uint32_t tid;
     struct mattx_cpu_regs regs;
@@ -228,6 +248,16 @@ struct mattx_thread_info {
     uint64_t gsbase;
     uint64_t clear_child_tid; // The Futex Wake Pointer!
     uint64_t set_child_tid;   // The Thread Init Pointer!
+    // struct mattx_cpu_regs above is general-purpose registers only (it
+    // mirrors struct pt_regs). It does NOT cover the FPU/SSE/AVX register
+    // file (XMM/YMM/x87/MXCSR), which lives in a completely separate
+    // per-task structure. Virtually every compiler-generated x86_64 binary
+    // uses those registers routinely (glibc's memcpy/memset/strlen are
+    // SSE2-vectorized by default on this ABI), so without capturing and
+    // restoring this too, the resumed thread runs with the freshly-spawned
+    // stub's own leftover FPU garbage instead of the real captured state.
+    uint32_t fpu_size; // actual bytes valid in fpu_state below
+    u8 fpu_state[MATTX_FPU_STATE_MAX]; // raw XSAVE/FXSAVE register image
 } __attribute__((packed)); // FORCE EXACT LAYOUT
 
 struct mattx_migration_req {

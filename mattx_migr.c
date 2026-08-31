@@ -516,6 +516,21 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             req->threads[i].clear_child_tid = (uint64_t)threads[i]->clear_child_tid;
             req->threads[i].set_child_tid   = (uint64_t)threads[i]->set_child_tid;
 
+            // Capture FPU/SSE/AVX state! pt_regs alone is only the
+            // general-purpose registers -- XMM/YMM/x87 live in the task's
+            // separate fpu.fpstate buffer. threads[i] is guaranteed frozen
+            // by this point (either just above, or already via the Mother
+            // freeze earlier in this function), so its FPU context is
+            // safely resident in memory, not live in hardware registers.
+            req->threads[i].fpu_size = 0;
+            if (threads[i]->thread.fpu.fpstate) {
+                u32 fsize = threads[i]->thread.fpu.fpstate->size;
+                if (fsize > sizeof(req->threads[i].fpu_state))
+                    fsize = sizeof(req->threads[i].fpu_state);
+                memcpy(req->threads[i].fpu_state, &threads[i]->thread.fpu.fpstate->regs, fsize);
+                req->threads[i].fpu_size = fsize;
+            }
+
             if (threads[i] == task && access_process_vm(task, t_regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                 mattx_dbg("[DEBUG] Mother Source RIP (0x%lx) contains: %8ph\n", (unsigned long)t_regs->ip, rip_buf);
             }
@@ -639,7 +654,18 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 
             // Capture the Futex Pointers on Return! ---
             req->threads[i].clear_child_tid = (uint64_t)threads[i]->clear_child_tid;
-            req->threads[i].set_child_tid   = (uint64_t)threads[i]->set_child_tid;            
+            req->threads[i].set_child_tid   = (uint64_t)threads[i]->set_child_tid;
+
+            // Capture FPU/SSE/AVX state on return! See the forward-path
+            // capture above for why this is needed.
+            req->threads[i].fpu_size = 0;
+            if (threads[i]->thread.fpu.fpstate) {
+                u32 fsize = threads[i]->thread.fpu.fpstate->size;
+                if (fsize > sizeof(req->threads[i].fpu_state))
+                    fsize = sizeof(req->threads[i].fpu_state);
+                memcpy(req->threads[i].fpu_state, &threads[i]->thread.fpu.fpstate->regs, fsize);
+                req->threads[i].fpu_size = fsize;
+            }
         }
         put_task_struct(threads[i]);
     }
