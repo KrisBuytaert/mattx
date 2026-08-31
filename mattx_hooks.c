@@ -283,7 +283,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == rpc->local_pid) {
+            if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                 guest_registry[i].rpc_fsync_res = to_send; 
                 guest_registry[i].rpc_done = true;
                 break;
@@ -597,7 +597,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         bool found = false;
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == rpc->local_pid) {
+            if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                 found = true;
                 done = guest_registry[i].rpc_done;
                 if (done) remote_fd = guest_registry[i].rpc_remote_fd;
@@ -673,7 +673,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 loff_t res = -EINTR;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) res = guest_registry[i].rpc_lseek_res; 
                         break;
                     }
@@ -687,7 +687,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
                         break;
                     }
@@ -703,7 +703,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             error = guest_registry[i].rpc_fsync_res; 
                             read_buf = guest_registry[i].rpc_statx_buf; 
@@ -730,7 +730,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         // We reused rpc_fsync_res to store the generic integer reply from VM1
                         error = guest_registry[i].rpc_fsync_res; 
                         success = true;
@@ -755,7 +755,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         ret_bytes = guest_registry[i].rpc_read_bytes;
                         read_buf = guest_registry[i].rpc_read_buf;
                         guest_registry[i].rpc_read_buf = NULL;
@@ -785,7 +785,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         bytes_written = guest_registry[i].rpc_fsync_res;
                         break;
                     }
@@ -805,7 +805,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         ret_bytes = guest_registry[i].rpc_read_bytes;
                         read_buf = guest_registry[i].rpc_read_buf;
                         guest_registry[i].rpc_read_buf = NULL;
@@ -868,7 +868,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                                     spin_lock(&guest_lock);
                                     for (g_idx = 0; g_idx < guest_count; g_idx++) {
-                                        if (guest_registry[g_idx].local_pid == rpc->local_pid) {
+                                        if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[g_idx].local_pid)) {
                                             addr_len = guest_registry[g_idx].rpc_fsync_res;
                                             addr_buf = guest_registry[g_idx].rpc_read_buf;
                                             guest_registry[g_idx].rpc_read_buf = NULL; 
@@ -913,7 +913,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         retval = guest_registry[i].rpc_fsync_res; 
                         reply_data = guest_registry[i].rpc_read_buf; 
                         guest_registry[i].rpc_read_buf = NULL;
@@ -945,7 +945,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         retval = guest_registry[i].rpc_fsync_res; 
                         reply_data = guest_registry[i].rpc_read_buf; 
                         guest_registry[i].rpc_read_buf = NULL;
@@ -1053,7 +1053,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             error = guest_registry[i].rpc_fsync_res; 
                         }
@@ -1073,7 +1073,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             retval = guest_registry[i].rpc_fsync_res; 
                             read_buf = guest_registry[i].rpc_read_buf; 
@@ -1105,7 +1105,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             error = guest_registry[i].rpc_fsync_res; 
                             read_buf = guest_registry[i].rpc_read_buf; 
@@ -1132,7 +1132,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
                         break;
                     }
@@ -1149,7 +1149,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             error = guest_registry[i].rpc_fsync_res; 
                             optlen = guest_registry[i].rpc_lseek_res; // We stored the length here!
@@ -1176,7 +1176,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
                         break;
                     }
@@ -1194,7 +1194,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             retval = guest_registry[i].rpc_fsync_res; 
                             read_buf = guest_registry[i].rpc_read_buf; 
@@ -1244,7 +1244,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR; void *read_buf = NULL;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
                         guest_registry[i].rpc_read_buf = NULL; break;
                     }
@@ -1260,7 +1260,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR; void *read_buf = NULL;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
                         guest_registry[i].rpc_read_buf = NULL; break;
                     }
@@ -1276,7 +1276,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
                             error = guest_registry[i].rpc_fsync_res;
                         }
@@ -1293,7 +1293,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR; void *read_buf = NULL;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
                         guest_registry[i].rpc_read_buf = NULL; break;
                     }
@@ -1312,7 +1312,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 ssize_t ret_bytes = -1; void *read_buf = NULL;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { ret_bytes = guest_registry[i].rpc_read_bytes; read_buf = guest_registry[i].rpc_read_buf; }
                         guest_registry[i].rpc_read_buf = NULL; break;
                     }
@@ -1330,7 +1330,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 int error = -EINTR; void *read_buf = NULL; size_t datalen = 0;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { 
                             error = guest_registry[i].rpc_fsync_res; 
                             datalen = guest_registry[i].rpc_lseek_res; // Reused for datalen
@@ -1353,7 +1353,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 struct pt_regs *regs = task_pt_regs(surrogate); int error = -EINTR; void *read_buf = NULL; size_t datalen = 0;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; datalen = guest_registry[i].rpc_lseek_res; read_buf = guest_registry[i].rpc_read_buf; }
                         guest_registry[i].rpc_read_buf = NULL; break;
                     }
@@ -1374,7 +1374,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 struct pt_regs *regs = task_pt_regs(surrogate); int error = -EINTR; void *read_buf = NULL;
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
                         guest_registry[i].rpc_read_buf = NULL; break;
                     }
@@ -1498,7 +1498,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             bool safe_to_wake = true;
             spin_lock(&guest_lock);
             for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
+                if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                     if (guest_registry[i].is_migrating) {
                         safe_to_wake = false;
                     }
