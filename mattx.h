@@ -89,8 +89,17 @@
 #endif
 
 #define MATTX_PORT 7226
-#define MAX_NODES 1024 
-#define BALANCER_INTERVAL_MS 2000 
+#define MAX_NODES 1024
+#define BALANCER_INTERVAL_MS 2000
+
+// How long mattx_expel_guest() will wait (in ms) for a guest to drain out of
+// guest_registry before giving up. Normal drain completes within one or two
+// Guest Watcher cycles (BALANCER_INTERVAL_MS = 2000ms) after the Surrogate's
+// SIGKILL lands, so a few seconds is the expected case; 30s gives generous
+// headroom for scheduler/lock contention on a busy node while still bounding
+// the wait so a genuinely stuck guest (e.g. #20-style clock skew wedge)
+// cannot hang systemctl stop / module unload forever.
+#define MATTX_EXPEL_DRAIN_TIMEOUT_MS 30000
 
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
