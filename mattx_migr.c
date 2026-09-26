@@ -1058,28 +1058,61 @@ int mattx_expel_guest(pid_t local_pid) {
 
     if (surrogate) {
         mattx_dbg("[EXPEL] Initiating forced return for Surrogate PID %d to Node %d...\n", local_pid, home_node);
-        
+
         // 3. Trigger the exact same return pipeline as a Recall!
         mattx_capture_and_return_state(surrogate, orig_pid, home_node);
         put_task_struct(surrogate);
 
         // 4. BLOCKING WAIT: Wait until the guest is fully removed from the registry
+        //
+        // Bounded by MATTX_EXPEL_DRAIN_TIMEOUT_MS: this used to be `while (1)`,
+        // which meant a guest that never dies (e.g. the #20 clock-skew wedge)
+        // would spin here forever. Since this runs synchronously under a
+        // /proc/mattx/admin write() issued from `systemctl stop` / the init
+        // script's drain loop, a wedged guest here wedged the whole stop path
+        // until systemd force-SIGKILLed it (mattx#23).
         mattx_dbg("[EXPEL] Waiting for migration of PID %d to complete...\n", local_pid);
-        while (1) {
-            found = false;
-            spin_lock(&guest_lock);
-            for (int i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == local_pid) {
-                    found = true;
-                    break;
+        {
+            unsigned long expire = jiffies + msecs_to_jiffies(MATTX_EXPEL_DRAIN_TIMEOUT_MS);
+            while (1) {
+                found = false;
+                spin_lock(&guest_lock);
+                for (int i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == local_pid) {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            spin_unlock(&guest_lock);
+                spin_unlock(&guest_lock);
 
-            if (!found) break; // It's gone! Migration complete!
-            
-            // Sleep for 100ms and check again. This safely blocks the /proc write!
-            msleep(100);
+                if (!found) break; // It's gone! Migration complete!
+
+                if (time_after(jiffies, expire)) {
+                    // Give up rather than hang the caller forever. Deliberately
+                    // DON'T force-remove the guest_registry entry or SIGKILL
+                    // anything further here: the Guest Watcher (mattx_sched.c)
+                    // keeps polling guest_registry on its own independent
+                    // BALANCER_INTERVAL_MS cadence regardless of what we do,
+                    // and it - not us - owns freeing guest_registry's DSM
+                    // page pointers/rpc buffers. Ripping the entry out from
+                    // under it here (or re-signalling a task we no longer hold
+                    // a reference to) risks a use-after-free/double-free race
+                    // against whatever the stuck Surrogate/Watcher is still
+                    // doing. Leaving the registry untouched lets the Watcher
+                    // finish the drain later if/when the stuck condition
+                    // clears, and lets the caller (the init script's cordon
+                    // loop, which ignores our return value) move on to the
+                    // next guest / continue shutdown instead of hanging.
+                    printk(KERN_WARNING "MattX: [EXPEL] Timed out after %dms waiting for "
+                           "PID %d (orig PID %u, home Node %d) to drain from the guest "
+                           "registry - giving up, guest state left as-is.\n",
+                           MATTX_EXPEL_DRAIN_TIMEOUT_MS, local_pid, orig_pid, home_node);
+                    return -ETIMEDOUT;
+                }
+
+                // Sleep for 100ms and check again. This safely blocks the /proc write!
+                msleep(100);
+            }
         }
         mattx_dbg("[EXPEL] Successfully expelled PID %d!\n", local_pid);
         return 0;
