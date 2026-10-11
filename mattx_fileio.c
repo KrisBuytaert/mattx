@@ -4597,7 +4597,7 @@ int mattx_dsm_sweeper_loop(void *data) {
                                 if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                                     if (vma->vm_file->f_inode->i_ino == to_shoot[s].shmid) {
                                         real_unmap_mapping_range(vma->vm_file->f_mapping, to_shoot[s].offset, PAGE_SIZE, 1);
-                                        // mattx_dbg("[MESI_VM1] Native Sweeper: Shot down PTE for SHMID %u Offset %lu to catch writes.\n", to_shoot[s].shmid, to_shoot[s].offset);
+                                        mattx_dbg("[MESI_VM1] Native Sweeper: Shot down PTE for SHMID %u Offset %lu to catch writes.\n", to_shoot[s].shmid, to_shoot[s].offset);
                                         break;
                                     }
                                 }
