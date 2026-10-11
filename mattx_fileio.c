@@ -4482,86 +4482,139 @@ static void handle_dsm_page_update(struct mattx_link *link, struct mattx_header 
 
 
 // ============================================================================
-// THE DIRTY SWEEPER THREAD (VM2)
+// THE DIRTY SWEEPER THREAD (VM2 & VM1)
 // ============================================================================
 int mattx_dsm_sweeper_loop(void *data) {
     mattx_dbg(" [DSM] Dirty Sweeper thread started\n");
 
     while (!kthread_should_stop()) {
+        
         if (config_dsm_mode == 1) {
-            
+            // --- PHASE 1: THE GUEST SWEEPER (VM2 - MODE 1 ONLY) ---
             struct mattx_dsm_mapping *local_dsm = kmalloc_array(16, sizeof(struct mattx_dsm_mapping), GFP_KERNEL);
-            if (!local_dsm) { msleep(50); continue; }
+            if (local_dsm) {
+                for (int i = 0; i < MAX_GUESTS; i++) {
+                    pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1; int dsm_count = 0;
 
-            for (int i = 0; i < MAX_GUESTS; i++) {
-                pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1; int dsm_count = 0;
-
-                spin_lock(&guest_lock);
-                if (i < guest_count && guest_registry[i].dsm_count > 0) {
-                    local_pid = guest_registry[i].local_pid; orig_pid = guest_registry[i].orig_pid;
-                    home_node = guest_registry[i].home_node; dsm_count = guest_registry[i].dsm_count;
-                    memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
-                    
-                    for (int d = 0; d < dsm_count; d++) {
-                        memset(guest_registry[i].dsm_map[d].present_pages, 0, sizeof(guest_registry[i].dsm_map[d].present_pages));
-                    }
-                }
-                spin_unlock(&guest_lock);
-
-                if (local_pid != -1) {
-                    struct task_struct *surrogate = NULL;
-                    rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
-
-                    if (surrogate && surrogate->mm) {
+                    spin_lock(&guest_lock);
+                    if (i < guest_count && guest_registry[i].dsm_count > 0) {
+                        local_pid = guest_registry[i].local_pid; orig_pid = guest_registry[i].orig_pid;
+                        home_node = guest_registry[i].home_node; dsm_count = guest_registry[i].dsm_count;
+                        memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
+                        
                         for (int d = 0; d < dsm_count; d++) {
-                            unsigned long base = local_dsm[d].base_addr;
-                            unsigned long size = local_dsm[d].size;
-                            u32 shmid = local_dsm[d].shmid;
+                            memset(guest_registry[i].dsm_map[d].present_pages, 0, sizeof(guest_registry[i].dsm_map[d].present_pages));
+                        }
+                    }
+                    spin_unlock(&guest_lock);
 
-                            // 1. Sync present pages (The Data Bomb)
-                            for (int bit = 0; bit < MAX_DSM_PAGES; bit++) {
-                                if (test_bit(bit, local_dsm[d].present_pages)) {
-                                    unsigned long offset = bit * PAGE_SIZE;
-                                    if (offset >= size) continue;
+                    if (local_pid != -1) {
+                        struct task_struct *surrogate = NULL;
+                        rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
 
-                                    void *kaddr = local_dsm[d].pages[bit];
-                                    if (kaddr) {
-                                        size_t req_size = sizeof(struct mattx_dsm_page_update_req);
-                                        struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
-                                        if (req) {
-                                            req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
-                                            // FAST PATH: Read directly from our physical page! No access_process_vm needed!
-                                            memcpy(req->data, kaddr, PAGE_SIZE); 
-                                            
-                                            if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
-                                            kfree(req);
+                        if (surrogate && surrogate->mm) {
+                            for (int d = 0; d < dsm_count; d++) {
+                                unsigned long base = local_dsm[d].base_addr;
+                                unsigned long size = local_dsm[d].size;
+                                u32 shmid = local_dsm[d].shmid;
+
+                                // 1. Sync present pages (The Data Bomb)
+                                for (int bit = 0; bit < MAX_DSM_PAGES; bit++) {
+                                    if (test_bit(bit, local_dsm[d].present_pages)) {
+                                        unsigned long offset = bit * PAGE_SIZE;
+                                        if (offset >= size) continue;
+
+                                        void *kaddr = local_dsm[d].pages[bit];
+                                        if (kaddr) {
+                                            size_t req_size = sizeof(struct mattx_dsm_page_update_req);
+                                            struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
+                                            if (req) {
+                                                req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
+                                                memcpy(req->data, kaddr, PAGE_SIZE); 
+                                                if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
+                                                kfree(req);
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            // 2. The Zap! (Burn it all down SAFELY)
-                            if (real_zap_vma_ptes) {
-                                mmap_read_lock(surrogate->mm);
-                                struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                                if (vma && vma->vm_start == base) {
-                                    real_zap_vma_ptes(vma, base, size);
-                                    mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
+                                // 2. The Zap! (Burn it all down SAFELY)
+                                if (real_zap_vma_ptes) {
+                                    mmap_read_lock(surrogate->mm);
+                                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                                    if (vma && vma->vm_start <= base) {
+                                        real_zap_vma_ptes(vma, base, size);
+                                        mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
+                                    }
+                                    mmap_read_unlock(surrogate->mm);
                                 }
-                                mmap_read_unlock(surrogate->mm);
+                            }
+                            put_task_struct(surrogate);
+                        }
+                    }
+                }
+                kfree(local_dsm); 
+            }
+            
+        } else if (config_dsm_mode == 2) {
+            // --- PHASE 2: THE NATIVE SWEEPER (VM1 - MODE 2 ONLY) ---
+            struct { u32 shmid; u32 home_pid; unsigned long offset; } to_shoot[16];
+            int shoot_count = 0;
+
+            spin_lock(&mattx_dsm_lock);
+            for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                if (mattx_global_dsm_dir[d].in_use) {
+                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                        // If it's SHARED, remote nodes have copies. We must shoot down native PTEs
+                        // to force a fault and catch potential silent native writes!
+                        if (mattx_global_dsm_dir[d].page_state[p] == MATTX_PAGE_SHARED) {
+                            if (shoot_count < 16) {
+                                to_shoot[shoot_count].shmid = mattx_global_dsm_dir[d].shmid;
+                                to_shoot[shoot_count].home_pid = mattx_global_dsm_dir[d].home_pid;
+                                to_shoot[shoot_count].offset = p * PAGE_SIZE;
+                                shoot_count++;
                             }
                         }
-                        put_task_struct(surrogate);
                     }
                 }
             }
-            kfree(local_dsm); 
+            spin_unlock(&mattx_dsm_lock);
+
+            for (int s = 0; s < shoot_count; s++) {
+                if (real_unmap_mapping_range) {
+                    struct task_struct *deputy = NULL;
+                    rcu_read_lock();
+                    deputy = pid_task(find_vpid(to_shoot[s].home_pid), PIDTYPE_PID);
+                    if (deputy) get_task_struct(deputy);
+                    rcu_read_unlock();
+
+                    if (deputy && deputy->mm) {
+                        mmap_read_lock(deputy->mm);
+                        struct vm_area_struct *vma;
+                        VMA_ITERATOR(vmi, deputy->mm, 0);
+                        for_each_vma(vmi, vma) {
+                            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                                    if (vma->vm_file->f_inode->i_ino == to_shoot[s].shmid) {
+                                        real_unmap_mapping_range(vma->vm_file->f_mapping, to_shoot[s].offset, PAGE_SIZE, 1);
+                                        // mattx_dbg("[MESI_VM1] Native Sweeper: Shot down PTE for SHMID %u Offset %lu to catch writes.\n", to_shoot[s].shmid, to_shoot[s].offset);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        mmap_read_unlock(deputy->mm);
+                        put_task_struct(deputy);
+                    }
+                }
+            }
         }
+        
+        // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
         msleep(50); 
     }
     return 0;
 }
-
 
 
 
