@@ -4588,26 +4588,32 @@ int mattx_dsm_sweeper_loop(void *data) {
                     if (deputy) get_task_struct(deputy);
                     rcu_read_unlock();
 
-                    if (deputy && deputy->mm) {
-                        mmap_read_lock(deputy->mm);
-                        struct vm_area_struct *vma;
-                        VMA_ITERATOR(vmi, deputy->mm, 0);
-                        for_each_vma(vmi, vma) {
-                            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
-                                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
-                                    if (vma->vm_file->f_inode->i_ino == to_shoot[s].shmid) {
-                                        real_unmap_mapping_range(vma->vm_file->f_mapping, to_shoot[s].offset, PAGE_SIZE, 1);
-                                        mattx_dbg("[MESI_VM1] Native Sweeper: Shot down PTE for SHMID %u Offset %lu to catch writes.\n", to_shoot[s].shmid, to_shoot[s].offset);
-                                        break;
+                    if (deputy) {
+                        // --- THE ZOMBIE SHIELD ---
+                        // Never touch a dying process! It is already tearing down its mm_struct
+                        // and holding the mmap_write_lock. If we try to read_lock it, we deadlock!
+                        if (deputy->mm && !(deputy->flags & PF_EXITING)) {
+                            mmap_read_lock(deputy->mm);
+                            struct vm_area_struct *vma;
+                            VMA_ITERATOR(vmi, deputy->mm, 0);
+                            for_each_vma(vmi, vma) {
+                                if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                                    if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                                        if (vma->vm_file->f_inode->i_ino == to_shoot[s].shmid) {
+                                            real_unmap_mapping_range(vma->vm_file->f_mapping, to_shoot[s].offset, PAGE_SIZE, 1);
+                                            mattx_dbg("[MESI_VM1] Native Sweeper: Shot down PTE for SHMID %u Offset %lu to catch writes.\n", to_shoot[s].shmid, to_shoot[s].offset);
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            mmap_read_unlock(deputy->mm);
                         }
-                        mmap_read_unlock(deputy->mm);
                         put_task_struct(deputy);
                     }
                 }
             }
+
         }
         
         // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
