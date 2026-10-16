@@ -4446,18 +4446,28 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
 
         // 2. HEAVY LIFTING: Write directly to physical RAM lock-free!
         if (shm_file) {
-            // THE BOMB: Overwrite the physical RAM on the Home Node directly!
-            struct page *page = read_mapping_page(shm_file->f_mapping, ctx->req.offset / PAGE_SIZE, NULL);
-            if (!IS_ERR(page)) {
+            // --- THE SAFE BOMB TRICK ---
+            // Use filemap_get_folio instead of read_mapping_page!
+            // read_mapping_page blocks if the page is locked (e.g., during IPC_RMID destruction).
+            // filemap_get_folio is a non-blocking lookup. If the memory is being destroyed,
+            // it just returns an error and we safely drop the bomb!
+            struct folio *folio = filemap_get_folio(shm_file->f_mapping, ctx->req.offset / PAGE_SIZE);
+            
+            if (!IS_ERR(folio)) {
+                struct page *page = folio_page(folio, 0);
                 void *kaddr = kmap_local_page(page);
                 memcpy(kaddr, ctx->req.data, PAGE_SIZE);
                 kunmap_local(kaddr);
-                set_page_dirty(page); // Tell the kernel we modified it!
-                put_page(page);
+                
+                folio_mark_dirty(folio); // Tell the kernel we modified it!
+                folio_put(folio);        // Release our reference
+                
                 mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
             } else {
-                mattx_dbg("[DSM_SYNC] ERROR: Failed to read shmem physical page for Data Bomb!\n");
+                mattx_dbg("[DSM_SYNC] SHM segment is gone or locked. Dropping Data Bomb safely.\n");
             }
+            // ---------------------------------------
+            
             fput(shm_file); // Release the file
 
             // --- THE FUNERAL DIRECTORY CLEANUP ---
@@ -4482,6 +4492,7 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
             }
             // ------------------------------------------
         }
+
         put_task_struct(deputy);
     }
     kfree(ctx);
