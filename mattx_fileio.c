@@ -4411,11 +4411,15 @@ static void handle_dsm_page_fault_reply(struct mattx_link *link, struct mattx_he
 // ============================================================================
 // THE 1-WAY DATA BOMB (VM1 RECEIVER)
 // ============================================================================
+// ============================================================================
+// THE 1-WAY DATA BOMB (VM1 RECEIVER)
+// ============================================================================
 struct mattx_dsm_update_kworker_ctx { struct work_struct work; struct mattx_dsm_page_update_req req; };
 
 static void mattx_dsm_update_kworker(struct work_struct *work) {
     struct mattx_dsm_update_kworker_ctx *ctx = container_of(work, struct mattx_dsm_update_kworker_ctx, work);
     struct task_struct *deputy = NULL;
+    struct file *shm_file = NULL;
 
     rcu_read_lock();
     deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
@@ -4423,6 +4427,7 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
     rcu_read_unlock();
 
     if (deputy && deputy->mm) {
+        // 1. QUICK GRAB: Find the SYSV file and pin it!
         mmap_read_lock(deputy->mm);
         struct vm_area_struct *vma;
         VMA_ITERATOR(vmi, deputy->mm, 0);
@@ -4431,44 +4436,60 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
                 if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                     if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
                         unsigned long target_addr = vma->vm_start + ctx->req.offset;
-
                         if (target_addr < vma->vm_end) {
-                            // THE BOMB: Overwrite the physical RAM on the Home Node!
-                            access_process_vm(deputy, target_addr, ctx->req.data, 4096, FOLL_WRITE | FOLL_FORCE);
-                            mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
-                            
-                            // --- THE FUNERAL DIRECTORY CLEANUP ---
-                            if (config_dsm_mode == 2) {
-                                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
-                                spin_lock(&mattx_dsm_lock);
-                                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                                        // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
-                                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
-                                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] == ctx->req.orig_pid) {
-                                            
-                                            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = 0;
-                                            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-                                            mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
-                                        }
-                                        break;
-                                    }
-                                }
-                                spin_unlock(&mattx_dsm_lock);
-                            }
-                            // ------------------------------------------
+                            shm_file = vma->vm_file;
+                            get_file(shm_file); // Safely pin the file so it doesn't vanish!
                         }
                         break;
                     }
                 }
             }
         }
-        mmap_read_unlock(deputy->mm);
+        mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
+
+        // 2. HEAVY LIFTING: Write directly to physical RAM lock-free!
+        if (shm_file) {
+            // THE BOMB: Overwrite the physical RAM on the Home Node directly!
+            struct page *page = read_mapping_page(shm_file->f_mapping, ctx->req.offset / PAGE_SIZE, NULL);
+            if (!IS_ERR(page)) {
+                void *kaddr = kmap_local_page(page);
+                memcpy(kaddr, ctx->req.data, PAGE_SIZE);
+                kunmap_local(kaddr);
+                set_page_dirty(page); // Tell the kernel we modified it!
+                put_page(page);
+                mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
+            } else {
+                mattx_dbg("[DSM_SYNC] ERROR: Failed to read shmem physical page for Data Bomb!\n");
+            }
+            fput(shm_file); // Release the file
+
+            // --- THE FUNERAL DIRECTORY CLEANUP ---
+            if (config_dsm_mode == 2) {
+                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                spin_lock(&mattx_dsm_lock);
+                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                        // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
+                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
+                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] == ctx->req.orig_pid) {
+                            
+                            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_SHARED;
+                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = 0;
+                            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                            mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&mattx_dsm_lock);
+            }
+            // ------------------------------------------
+        }
         put_task_struct(deputy);
     }
     kfree(ctx);
 }
+
 
 static void handle_dsm_page_update(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_dsm_page_update_req *req = payload;
