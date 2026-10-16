@@ -4411,9 +4411,6 @@ static void handle_dsm_page_fault_reply(struct mattx_link *link, struct mattx_he
 // ============================================================================
 // THE 1-WAY DATA BOMB (VM1 RECEIVER)
 // ============================================================================
-// ============================================================================
-// THE 1-WAY DATA BOMB (VM1 RECEIVER)
-// ============================================================================
 struct mattx_dsm_update_kworker_ctx { struct work_struct work; struct mattx_dsm_page_update_req req; };
 
 static void mattx_dsm_update_kworker(struct work_struct *work) {
