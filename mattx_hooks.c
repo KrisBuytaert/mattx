@@ -4794,7 +4794,15 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
             data->vmf->page = NULL;
         }
 
-        // Force the kernel to drop its mmap locks and retry the fault later!
+        // --- NEW: THE LEAKED LOCK FIX ---
+        // If we return VM_FAULT_RETRY, the Linux kernel strictly requires us to drop the mmap_read_lock!
+        // Since we hijacked the return value, we must do it manually on behalf of the native handler.
+        if (current->mm) {
+            mmap_read_unlock(current->mm);
+        }
+        // --------------------------------
+
+        // Force the kernel to retry the fault later!
         regs->ax = VM_FAULT_RETRY;
         
         mattx_dbg("[MESI_VM1] Native Fault intercepted! Freezing PID %d to sync network...\n", current->pid);
@@ -4805,6 +4813,7 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
     }
     return 0;
 }
+
 
 
 
