@@ -4593,18 +4593,41 @@ struct shmctl_kretprobe_data { int shmid; int cmd; void __user *buf; };
 static struct kretprobe shmctl_kprobe;
 
 static int entry_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    
+    // ALWAYS save the arguments so we can check them in the return handler!
+    data->shmid = (int)sys_regs->di;
+    data->cmd = (int)sys_regs->si;
+    data->buf = (void __user *)sys_regs->dx;
+
+    // Only sabotage the syscall if it's a guest process!
     if (is_guest_process(current->tgid)) {
-        struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
-        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
-        data->shmid = (int)sys_regs->di;
-        data->cmd = (int)sys_regs->si;
-        data->buf = (void __user *)sys_regs->dx;
         sys_regs->di = -1; // Sabotage!
     }
     return 0;
 }
 
+
 static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+
+    // --- NEW: THE GARBAGE COLLECTOR (VM1) ---
+    // If ANY process (native, Kworker, or guest) successfully destroys a shared memory segment,
+    // we must remove it from the Global Directory to keep the Matrix Monitor clean!
+    if (regs->ax == 0 && regs->si == IPC_RMID) {
+        spin_lock(&mattx_dsm_lock);
+        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+            if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == regs->di) {
+                mattx_global_dsm_dir[d].in_use = false;
+                mattx_dbg("[MESI_VM1] Garbage Collector: SHMID %lu destroyed. Directory slot %d freed.\n", regs->di, d);
+                break;
+            }
+        }
+        spin_unlock(&mattx_dsm_lock);
+    }
+    // ----------------------------------------
+
+
     if (!is_guest_process(current->tgid)) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
