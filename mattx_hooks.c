@@ -4610,16 +4610,17 @@ static int entry_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *r
 
 
 static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
 
     // --- NEW: THE GARBAGE COLLECTOR (VM1) ---
     // If ANY process (native, Kworker, or guest) successfully destroys a shared memory segment,
     // we must remove it from the Global Directory to keep the Matrix Monitor clean!
-    if (regs->ax == 0 && regs->si == IPC_RMID) {
+    if (regs->ax == 0 && data->cmd == IPC_RMID) {
         spin_lock(&mattx_dsm_lock);
         for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-            if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == regs->di) {
+            if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == data->shmid) {
                 mattx_global_dsm_dir[d].in_use = false;
-                mattx_dbg("[MESI_VM1] Garbage Collector: SHMID %lu destroyed. Directory slot %d freed.\n", regs->di, d);
+                mattx_dbg("[MESI_VM1] Garbage Collector: SHMID %d destroyed. Directory slot %d freed.\n", data->shmid, d);
                 break;
             }
         }
@@ -4627,11 +4628,9 @@ static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *reg
     }
     // ----------------------------------------
 
-
     if (!is_guest_process(current->tgid)) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
-    struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
     int home_node = -1; u32 orig_pid = 0;
 
     spin_lock(&guest_lock);
@@ -4654,6 +4653,7 @@ static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *reg
     }
     return 0;
 }
+
 
 // --- SHMDT ---
 struct shmdt_kretprobe_data { unsigned long shmaddr; };
