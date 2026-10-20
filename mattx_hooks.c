@@ -3618,6 +3618,80 @@ static int ret_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+/*
+ * gettid() of a Surrogate's thread.
+ *
+ * getpid() is spoofed to the original (home node) PID, which is right for the one number
+ * every thread shares. gettid() used to reuse that handler, so EVERY thread reported the
+ * original PID as its TID: threads created after the migration (all of them, in the
+ * mattx#9 case) were indistinguishable from the main thread and from each other.
+ * pthread_cancel()/pthread_kill() then did tgkill(pid, tid) with the main thread's TID and
+ * signalled the main thread instead of the target, so pthread_cancel() never reached its
+ * thread and pthread_join() waited on its futex forever.
+ *
+ * Threads that were part of the migrated Gang have a home-node TID in the translation map,
+ * and that is what they get back. Threads created afterwards have no home TID, so they keep
+ * their real local TID, which is unique; entry_handler_tgkill() passes it through.
+ */
+static int ret_handler_gettid(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int j = 0; j < guest_registry[i].thread_count; j++) {
+                    if (guest_registry[i].local_tids[j] == current->pid) {
+                        regs->ax = guest_registry[i].orig_tids[j];
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+    return 0;
+}
+
+/*
+ * Signals a Surrogate sends to its own thread group (pthread_cancel/pthread_kill -> tgkill,
+ * kill(getpid(), ...)) carry the REAL local PID in si_pid, but the Surrogate sees the
+ * spoofed home-node PID from getpid(). glibc's SIGCANCEL handler (sigcancel_handler) only
+ * acts when si_pid == getpid(): with the mismatch it silently ignores the cancellation, the
+ * target thread keeps running, and pthread_join() on it waits on its futex forever
+ * (mattx#9 -- seen with threadtest, which cancel()s and join()s its worker threads).
+ * Rewrite si_pid to the spoofed PID right before the signal is queued, so the Surrogate
+ * observes the same PID everywhere.
+ *
+ * __send_signal_locked() runs under sighand->siglock with interrupts off, so guest_lock is
+ * only trylock'ed (it is also taken in paths that go on to send signals); on contention the
+ * signal is left untouched.
+ */
+static struct kprobe send_signal_kprobe;
+
+static int pre_handler_send_signal(struct kprobe *p, struct pt_regs *regs) {
+    struct kernel_siginfo *info = (struct kernel_siginfo *)regs->si;
+    struct task_struct *t = (struct task_struct *)regs->dx;
+    int i;
+
+    if ((unsigned long)info <= 2 || !t)            /* SEND_SIG_NOINFO / SEND_SIG_PRIV */
+        return 0;
+    if (info->si_code != SI_TKILL && info->si_code != SI_USER)
+        return 0;
+    if (t->tgid != current->tgid)                  /* only a thread signalling its own group */
+        return 0;
+    if (!spin_trylock(&guest_lock))
+        return 0;
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            if (info->si_pid == task_tgid_nr(current))
+                info->si_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return 0;
+}
+
 // --- BATCH 1: WORMHOLE TUNNELERS ---
 struct uname_kretprobe_data { void __user *buf; };
 static struct kretprobe uname_kprobe;
@@ -4509,7 +4583,8 @@ static int entry_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *r
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     
     if (is_guest_process(current->tgid)) {
-        u32 target_tid = (u32)sys_regs->si; // The spoofed VM1 TID
+        u32 target_tid = (u32)sys_regs->si; // A home-node TID, or the real local TID of a thread created after the migration
+        u32 target_tgid = (u32)sys_regs->di; // getpid() is spoofed, so this is the home-node PID
         
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
@@ -4518,12 +4593,16 @@ static int entry_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *r
                 for (int j = 0; j < guest_registry[i].thread_count; j++) {
                     if (guest_registry[i].orig_tids[j] == target_tid) {
                         sys_regs->si = guest_registry[i].local_tids[j]; // Inject real VM2 TID!
-                        sys_regs->di = current->tgid; // Translate TGID too, just in case!
                         mattx_dbg("[HOOK] tgkill translated VM1 TID %u -> VM2 TID %u\n", 
                                   target_tid, (u32)sys_regs->si);
                         break;
                     }
                 }
+                // The tgid must be the local one either way (the kernel checks that the TID
+                // belongs to it). Threads created after the migration have no home TID and
+                // keep their real one, so this is also needed when no TID was translated.
+                if (target_tgid == guest_registry[i].orig_pid)
+                    sys_regs->di = current->tgid;
                 break;
             }
         }
@@ -5327,8 +5406,8 @@ int mattx_hooks_init(void) {
 
     memset(&gettid_kprobe, 0, sizeof(gettid_kprobe));
     gettid_kprobe.kp.symbol_name = "__x64_sys_gettid";
-    gettid_kprobe.entry_handler = entry_handler_getpid; // Reusing getpid handler to spoof main thread!
-    gettid_kprobe.handler = ret_handler_getpid;
+    gettid_kprobe.entry_handler = entry_handler_getpid;
+    gettid_kprobe.handler = ret_handler_gettid; // per-thread, NOT the getpid handler (see above)
     gettid_kprobe.maxactive = 64;
     ret = mattx_register_kretprobe(&gettid_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for gettid, returned %d\n", ret);
@@ -5557,6 +5636,12 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&tgkill_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for tgkill, returned %d\n", ret);
 
+    memset(&send_signal_kprobe, 0, sizeof(send_signal_kprobe));
+    send_signal_kprobe.symbol_name = "__send_signal_locked";
+    send_signal_kprobe.pre_handler = pre_handler_send_signal;
+    ret = register_kprobe(&send_signal_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kprobe failed for __send_signal_locked, returned %d (pthread_cancel() in a migrated process will not work)\n", ret);
+
     // DSM - shared memory syscalls
     memset(&shmget_kprobe, 0, sizeof(shmget_kprobe)); shmget_kprobe.kp.symbol_name = "__x64_sys_shmget";
     shmget_kprobe.entry_handler = entry_handler_shmget; shmget_kprobe.handler = ret_handler_shmget;
@@ -5637,6 +5722,7 @@ void mattx_hooks_exit(void) {
     while (mattx_nregistered_krp > 0)
         unregister_kretprobe(mattx_registered_krp[--mattx_nregistered_krp]);
     unregister_kprobe(&wake_up_new_task_kprobe);
+    unregister_kprobe(&send_signal_kprobe);
 
     unregister_die_notifier(&mattx_die_notifier);
 
