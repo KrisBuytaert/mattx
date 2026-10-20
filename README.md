@@ -153,10 +153,13 @@ https://github.com/KrisBuytaert/mattx-testsuite
 
 ---
 
-## ✨ Key Features (MattX v1.8)
+## ✨ Key Features (MattX v1.9)
 
 ### 🧠 Live Process Teleportation & The Syscall Drainer
 MattX migrates running processes safely using a custom **Syscall Drainer**. Instead of violently freezing processes with `SIGSTOP` while they hold kernel locks, MattX uses modern `task_work_add(TWA_SIGNAL)` to gently guide the process to the user-space boundary. Once in a 100% stable state, its memory map (VMAs), CPU registers (`pt_regs`), and credentials (`struct cred`) are extracted and streamed over a custom TCP data pump to the target node.
+
+### Distributed Shared Memory (DSM)
+We have officially conquered the final boss of Single System Image (SSI) clustering: **Distributed Shared Memory (DSM)**. MattX 1.9 features a hardware-accurate, software-defined DSM using the **MESI Cache Coherence Protocol**. What does this mean? It means you can take a complex, multi-process application and MattX will seamlessly migrate the worker processes across your network nodes. 
 
 ### 👯‍♂️ Thread Migration
 Historically, multi-threaded applications have been the "boogeyman" of Single System Image (SSI) clustering. Because threads share memory, file descriptors, and signal handlers, splitting them across a network introduces catastrophic latency and split-brain deadlocks. MattX solves this natively using a strict **Gang Migration** architecture.
@@ -183,17 +186,31 @@ MattX is designed to be "Zero-Config" via UDP Multicast auto-discovery, but it o
 
 ```ini
 # Network interface and UDP Multicast group for Zero-Config Auto-Discovery
-INTERFACE=eth0
+INTERFACE=enp1s0
 MULTICAST_GROUP=239.0.0.1
 PORT=7225
+# AUTODISCOVERY can be 'multicast' (default) or 'sweep' (for cloud VPCs)
+AUTODISCOVERY=multicast
+# Set to 0 to auto-generate Node ID from MAC address
+NODE_ID=0
+# configure the behavior of the cluster
+MIGRATE_NETWORK_IO=true     # Set to true to enable network I/O migration, false to disable
+MIGRATE_FILE_IO=true        # Set to true to enable file I/O migration, false to disable
+MATTXFS_ENABLED=true        # Set to true to enable MattXFS, false to disable
+DFSA_DIR=/mnt/shared        # Directory for Direct File System Access (DFSA) 
+MPI_SUPPORT=false           # Set to true to enable MPI support, false to disable
+ACCEPT_GUESTS=true          # Set to true to allow migrating processes to this node, false to disallow
+LOCAL_LIBS=true             # Set to true to use local libraries for migrated processes, false to use remote libraries
 
-# Feature Toggles (A/B Testing & Fallbacks)
-MIGRATE_NETWORK_IO=true     # Set to false to disable socket routing
-MIGRATE_FILE_IO=true        # Set to false to fallback to Kprobe File I/O
-MATTXFS_ENABLED=true        # Set to true to enable the MattXFS Namespace Illusion
+# Distributed Shared Memory (DSM) Cache Coherence Algorithm
+# 0 = Lazy Mode (Uncoherent, fast local caching, good for Read-Only)
+# 1 = Dirty Sweeper (Eventual Consistency, syncs every 50ms)
+# 2 = MESI Protocol (Hardware-grade strict consistency) [DEFAULT]
+# 3 = Emulation Route (Zero caching, strict consistency)
+DSM_MODE=2
 
-# Direct File System Access (DFSA)
-DFSA_DIR=/mnt/shared        # Directory to bypass network routing (e.g., shared NFS/SAN)
+# configure your default included processes to migrate for the cluster
+MATTX_INCLUDE="pvmchess-client,mpichess-client,migtest,migtest2,migtest3,dfsatest,epolltest"
 ```
 
 ---
