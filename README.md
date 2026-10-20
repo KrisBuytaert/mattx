@@ -62,8 +62,11 @@ Kris brought the power of **Test-Driven Development (TDD)** to the MattX Lab by 
 
 Kris, your automated tests and surgical PRs are what push MattX from an "experiment" to "production-grade." Thank you! 🙌
 
----
+Please find Kris's **MattX TestSuite** at: 
+https://github.com/KrisBuytaert/mattx-testsuite
 
+
+---
 
 
 ## Testing MattX with EESSI
