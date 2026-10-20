@@ -16,6 +16,56 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ## 📰 Latest News
 
+*October 2026*
+
+## 🚀 MattX 1.9: The Distributed Shared Memory (DSM) Evolution 🧠🕳️
+
+<div style="display: inline-flex; align-items: center;">
+    <img src="./web/media/Mattx-1.9-MESI-DSM-bright.jpeg" style="width: 100%; display: block;">
+</div>
+
+<br>
+
+Welcome to **MattX 1.9**, the release that officially transforms MattX from an advanced process migrator into a true, hardware-accurate **Single System Image (SSI) Hypervisor**. 
+
+With this release, we have successfully bent the Linux Virtual Memory subsystem to our will. MattX now allows complex, multi-process HPC applications and AI training workloads to seamlessly migrate across the cluster while maintaining perfect synchronization over **Distributed Shared Memory (DSM)**.
+
+### 🌌 The Crown Jewel: Pluggable Cache Coherence (DSM)
+Migrating processes that share memory (System V IPC) across a network is notoriously difficult. MattX 1.9 solves this by introducing "Ghost VMAs"—hollow memory mappings on remote nodes rigged with custom kernel tripwires. When a migrated process touches this memory, MattX catches the Page Fault and teleports the physical RAM across the TCP Wormhole.
+
+Because there is no "one size fits all" for distributed memory, MattX 1.9 introduces **four pluggable DSM algorithms**, configurable on-the-fly via `/proc/mattx/admin` or `mattx.conf`:
+
+*   **Mode 0 (Lazy Mode):** Uncoherent, fast local caching. Best for Read-Only datasets.
+*   **Mode 1 (The Dirty Sweeper):** Eventual consistency. A background Kthread batches dirty pages and syncs them to the Home Node every 50ms.
+*   **Mode 2 (The MESI Protocol) [DEFAULT]:** The Industry Standard. A mathematically perfect, strict cache coherence engine. 
+    *   **The Master Directory:** The Home Node (VM1) maintains a Node-Local Global Directory tracking the exact state (`SHARED`, `EXCLUSIVE`, `INVALID`) of every 4KB page.
+    *   **The Read-Only Trapdoor:** Remote nodes map pages as strictly Read-Only. Reads execute at native hardware speed with zero network traffic.
+    *   **The Write-Acquire Pipeline:** Writes trigger a Write-Protect Fault. The node asks VM1 for an `EXCLUSIVE` lock. VM1 broadcasts `INVALIDATE` requests to all other nodes, shooting down their caches, before granting the lock and allowing the writer to upgrade to Read-Write.
+    *   **The PTE Shootdown:** Native processes running on the Home Node are fully integrated into the Matrix. MattX uses `unmap_mapping_range` to shoot down native Page Table Entries, forcing local processes to fault and flush dirty data from remote nodes!
+    *   **The Funeral Flush:** When a process exits, MattX proactively fires a 1-Way Data Bomb to sync any dirty `EXCLUSIVE` pages back to the Home Node before destroying the memory.
+*   **Mode 3 (The Single-Step Route):** God Mode. MattX puts a leash on the CPU using the hardware Trap Flag (`X86_EFLAGS_TF`), executing exactly one assembly instruction natively before catching the `#DB` exception to sync the data. 
+
+### 🖥️ The True Supercomputer Experience
+MattX 1.9 consolidates our massive architectural milestones, turning a bunch of standard networked Linux boxes into a single, unified supercomputer:
+*   **Identity Theft (The Silent Ninja):** Syscalls are intercepted and executed natively on the Home Node by Kworkers that temporarily steal the `mm`, `cred`, `nsproxy`, and `files` structs of the original process. Zero split-brain deadlocks.
+*   **Global Cluster Filesystem:** **MattXFS** provides a seamless, cluster-wide VFS using Mount Namespaces.
+*   **Gang Migration:** Multi-threaded monsters are migrated together. Registers, FPU/AVX states, and TLS are packed into a Blueprint and injected into dummy clones on the target node.
+*   **Syscall-Level Load Balancing:** The cluster breathes naturally, balancing CPU load across nodes at the syscall level, completely transparent to the user.
+
+### 🏆 Massive Community Kudos: Kris Buytaert
+A hypervisor is only as strong as its QA, and MattX 1.9 owes a massive debt of gratitude to our legendary contributor, **Kris Buytaert**. 
+
+Kris brought the power of **Test-Driven Development (TDD)** to the MattX Lab by building the automated **MattX TestSuite**. Through his relentless testing and bug hunting, Kris uncovered and submitted surgical Pull Requests for incredibly complex edge cases, including:
+*   Fixing `kzalloc` dispatch flag corruption in the RPC workers.
+*   Solving PhD-level `CLOCK_MONOTONIC` time skew deadlocks for migrated absolute timers.
+*   Implementing production-grade timeouts for the `expel` cordon-and-drain loops.
+
+Kris, your automated tests and surgical PRs are what push MattX from an "experiment" to "production-grade." Thank you! 🙌
+
+---
+
+
+
 ## Testing MattX with EESSI
 
 *September 2026*
