@@ -251,6 +251,7 @@ enum mattx_msg_type {
     MATTX_MSG_DSM_INVALIDATE_REPLY,
     MATTX_MSG_DSM_FLUSH_REQ,
     MATTX_MSG_DSM_FLUSH_REPLY,
+    MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, // appended last so the numbering of the older messages is unchanged
 };
 
 struct mattx_header {
@@ -592,13 +593,36 @@ struct mattx_sys_epoll_wait_req {
     int epfd;
     int maxevents;
     int timeout;
+    u32 req_id; // matches the reply to the one thread that is waiting for it
 };
 
 struct mattx_sys_epoll_wait_reply {
     u32 orig_pid;
     int retval; // Number of events, or error
+    u32 req_id;
     struct epoll_event events[]; // Flexible array for the returned events!
 };
+
+/*
+ * A Surrogate thread blocked in a proxied epoll_wait(). Only that thread sleeps (see
+ * mattx_epoll_wait_tw_fn() in mattx_hooks.c); the other threads of the process keep running,
+ * which they must, since one of them is usually what makes the epoll ready.
+ */
+struct mattx_epoll_pending {
+    struct list_head node;
+    u32 orig_pid;
+    u32 req_id;
+    int home_node;
+    struct completion done;
+    int retval;
+    struct epoll_event *events; // kmalloc'ed by the reply handler, owned by the waiter afterwards
+};
+struct mattx_sys_epoll_wait_cancel {
+    u32 orig_pid;
+    u32 req_id;
+};
+struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);
+void mattx_epoll_pending_del(struct mattx_epoll_pending *p);
 
 struct mattx_sys_getsockname_req { 
     u32 orig_pid; int fd; 
@@ -949,6 +973,7 @@ struct mattx_rpc_work {
     bool is_epoll_wait;
     int epoll_maxevents;
     void __user *epoll_events_ptr;
+    u32 epoll_req_id; // home-node side: echoed back in the reply
 
     // For SOCKOPTS & NAMES ---
     bool is_getsockname;

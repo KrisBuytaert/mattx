@@ -309,7 +309,12 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     fd_info->home_node = pending_source_node;
                     fd_info->orig_pid = pending_migration->orig_pid;
                     fd_info->remote_fd = fd_num;
-                    fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+                    // O_RDWR, not O_WRONLY: the blueprint does not say how the fd was opened at home, and a
+                    // write-only proxy makes the VFS reject every read() on an inherited fd with EBADF
+                    // before mattx_fops->read ever runs ("Error reading from eventfd: Bad file descriptor",
+                    // mattx#14). The home node does the real access and returns its own error if the fd
+                    // cannot be read.
+                    fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
                 }
             }
 
