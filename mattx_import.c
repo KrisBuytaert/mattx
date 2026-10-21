@@ -697,6 +697,12 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         int i;
         pid_t fixup_tids[MAX_GANG_THREADS]; // local tids, for the clock-offset fixup registered below
         int fixup_count = 0;
+        // Per thread: where its TID word lives in user memory (clear_child_tid == &pthread->tid),
+        // the TID it holds from the remote node, and the TID the thread has here.
+        unsigned long tidword_addr[MAX_GANG_THREADS] = {0};
+        pid_t tidword_remote[MAX_GANG_THREADS] = {0};
+        pid_t tidword_local[MAX_GANG_THREADS] = {0};
+        int tidword_count = 0;
 
         // --- THE vDSO TRANSPLANT ---
         // disabled vDSO transplant for testing
@@ -760,6 +766,12 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
 
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
+                    if (pending_migration->threads[t_idx].clear_child_tid && tidword_count < MAX_GANG_THREADS) {
+                        tidword_addr[tidword_count]   = pending_migration->threads[t_idx].clear_child_tid;
+                        tidword_remote[tidword_count] = pending_migration->threads[t_idx].tid;
+                        tidword_local[tidword_count]  = t->pid;
+                        tidword_count++;
+                    }
 
                     // Restore FPU/SSE/AVX state on return! See the matching
                     // capture side in mattx_migr.c for why this is needed.
@@ -790,6 +802,25 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             t_idx++;
         }
         rcu_read_unlock();
+
+        // Threads that were created on the remote node come back as fresh "dummy" threads
+        // (Gang Grower) with new local TIDs, but the memory image still holds the TID the
+        // clone() gave them on the remote node (glibc keeps it in pthread->tid, at
+        // clear_child_tid). pthread_cancel()/pthread_kill() then tgkill() a TID that does not
+        // exist here and the thread is never signalled (mattx#9). Overwrite the stale TID with
+        // the real local one -- only where the word still holds exactly the remote TID, so a
+        // runtime that keeps something else at clear_child_tid is left alone.
+        for (int k = 0; k < tidword_count; k++) {
+            int cur = 0;
+            if (tidword_remote[k] == tidword_local[k])
+                continue;
+            if (access_process_vm(hijacked_stub_task, tidword_addr[k], &cur, sizeof(cur), FOLL_FORCE) != sizeof(cur))
+                continue;
+            if (cur != tidword_remote[k])
+                continue;
+            if (access_process_vm(hijacked_stub_task, tidword_addr[k], &tidword_local[k], sizeof(int), FOLL_FORCE | FOLL_WRITE) == sizeof(int))
+                mattx_dbg("[RECALL] TID word 0x%lx: remote TID %d -> local TID %d\n", tidword_addr[k], tidword_remote[k], tidword_local[k]);
+        }
 
         // --- Use the Mother's registers from the Blueprint! ---
         if (pending_migration->thread_count > 0) {
