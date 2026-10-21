@@ -65,6 +65,8 @@ struct mattx_vma_info {
     uint64_t vm_start;
     uint64_t vm_end;
     uint64_t vm_flags;
+    uint32_t shmid;
+    uint8_t is_shm;    
 };
 
 struct mattx_cpu_regs {
@@ -105,6 +107,18 @@ struct mattx_migration_req {
     uint64_t start_brk;
     uint64_t brk;
     uint64_t vdso_addr; // The vDSO Transplant Address!
+
+    // MUST STAY IN SYNC with struct mattx_migration_req in mattx.h -- see
+    // the comment on monotonic_at_freeze there. The stub never reads this
+    // field itself (only the kernel does, at Awakening), but it MUST be
+    // present here in the same position so every field after it (comm,
+    // dfsa_dir, fd_count, open_fds, vma_count, mattxfs_enabled, vmas[])
+    // lands at the same offset the kernel used when it serialized this
+    // struct -- otherwise the whole blueprint parses as garbage (observed:
+    // vma_count decoding to garbage and EVERY subsequent mmap(MAP_FIXED)/
+    // page-injection step failing).
+    uint64_t monotonic_at_freeze;
+
     char comm[16];
     char dfsa_dir[256];    
     uint32_t fd_count;          
@@ -240,7 +254,14 @@ int main() {
         size_t size = v.vm_end - v.vm_start;
 
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+
+        // --- THE MAP_SHARED FIX ---
+        int flags = MAP_ANONYMOUS | MAP_FIXED;
+        if (v.is_shm) {
+            flags |= MAP_SHARED; // Shared Memory gets MAP_SHARED!
+        } else {
+            flags |= MAP_PRIVATE; // Normal memory stays MAP_PRIVATE!
+        }
 
         // The Stack Growth Protector ---
         if (v.vm_flags & 0x0100) {

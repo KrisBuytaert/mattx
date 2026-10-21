@@ -20,11 +20,13 @@
  *
  * Commercial licensing options are available upon request.
  */
- 
+
 #include "mattx.h"
 #include <linux/wait.h> 
 #include <linux/poll.h>
 #include <linux/eventpoll.h>
+#include <linux/kdebug.h>
+#include <linux/pagemap.h> // Required for unlock_page and put_page
 
 // Helper for modern x86_64 syscall wrappers (__x64_sys_*)
 // The first argument (regs->di) is a pointer to the real pt_regs!
@@ -567,6 +569,23 @@ static void mattx_rpc_worker(struct work_struct *work) {
     } else if (rpc->is_pipe2) {
         struct mattx_sys_pipe2_req req = { .orig_pid = rpc->orig_pid, .flags = rpc->pipe2_flags };
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PIPE2_REQ, &req, sizeof(req));
+
+    // --- DSM WORKERS ---
+    } else if (rpc->is_shmget) {
+        struct mattx_sys_shmget_req req = { .orig_pid = rpc->orig_pid, .key = rpc->shm_key, .size = rpc->shm_size, .shmflg = rpc->shm_flg };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMGET_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_shmctl) {
+        struct mattx_sys_shmctl_req req = { .orig_pid = rpc->orig_pid, .shmid = rpc->shm_id, .cmd = rpc->shm_cmd };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMCTL_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_shmdt) {
+        struct mattx_sys_shmdt_req req = { .orig_pid = rpc->orig_pid, .shmaddr = rpc->shm_addr };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMDT_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_shmat) {
+        struct mattx_sys_shmat_req req = { .orig_pid = rpc->orig_pid, .shmid = rpc->shm_id, .shmaddr = rpc->shm_addr, .shmflg = rpc->shm_flg };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMAT_REQ, &req, sizeof(req));
 
 
 
@@ -1423,7 +1442,202 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     regs->ax = error;
                 }
 
+            // --- DSM AWAKENING ---
+            } else if (rpc->is_shmget) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (regs) regs->ax = error;
 
+
+            } else if (rpc->is_shmctl) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR; void *read_buf = NULL;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                
+                if (error == 0 && read_buf && rpc->buff) {
+                    access_process_vm(surrogate, (unsigned long)rpc->buff, read_buf, 128, FOLL_WRITE | FOLL_FORCE);
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+
+            // --- SHMDT AWAKENING / DSM MESI PROTOCOL ---
+            } else if (rpc->is_shmdt) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                unsigned long size_to_unmap = 0;
+
+                // --- THE FUNERAL FLUSH (MODE 2) ---
+                struct mattx_dsm_page_update_req *flush_reqs = NULL;
+                int flush_count = 0;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res; 
+                            // Find the Hollow VMA size and remove it from the map!
+                            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                                if (guest_registry[i].dsm_map[d].base_addr == rpc->shm_addr) {
+                                    size_to_unmap = guest_registry[i].dsm_map[d].size;
+                                    
+                                    // 1. Pack the dirty pages!
+                                    if (config_dsm_mode == 2) {
+                                        for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                            if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) flush_count++;
+                                        }
+                                        if (flush_count > 0) {
+                                            flush_reqs = kmalloc_array(flush_count, sizeof(*flush_reqs), GFP_ATOMIC);
+                                            if (flush_reqs) {
+                                                int idx = 0;
+                                                for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                                    if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) {
+                                                        flush_reqs[idx].orig_pid = rpc->orig_pid;
+                                                        flush_reqs[idx].shmid = guest_registry[i].dsm_map[d].shmid;
+                                                        flush_reqs[idx].offset = p * PAGE_SIZE;
+                                                        memcpy(flush_reqs[idx].data, guest_registry[i].dsm_map[d].pages[p], PAGE_SIZE);
+                                                        idx++;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // 2. Free the physical pages for this segment!
+                                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                        if (guest_registry[i].dsm_map[d].pages[p]) {
+                                            free_page((unsigned long)guest_registry[i].dsm_map[d].pages[p]);
+                                            guest_registry[i].dsm_map[d].pages[p] = NULL;
+                                        }
+                                    }
+
+                                    guest_registry[i].dsm_map[d] = guest_registry[i].dsm_map[--guest_registry[i].dsm_count];
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                // 3. Fire the Data Bombs safely outside the spinlock!
+                if (flush_reqs) {
+                    for (int f = 0; f < flush_count; f++) {
+                        if (cluster_map[rpc->home_node]) {
+                            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_DSM_PAGE_UPDATE, &flush_reqs[f], sizeof(struct mattx_dsm_page_update_req));
+                            mattx_dbg("[MESI_VM2] Funeral Flush (shmdt): Sent dirty page (SHMID %u, Offset %lu) to VM1\n", flush_reqs[f].shmid, flush_reqs[f].offset);
+                        }
+                    }
+                    kfree(flush_reqs);
+                }
+
+                // The Magic Trick: Destroy the Hollow VMA on VM2!
+                if (error == 0 && size_to_unmap > 0) {
+                    if (surrogate->mm) {
+                        kthread_use_mm(surrogate->mm);
+                        vm_munmap(rpc->shm_addr, size_to_unmap);
+                        kthread_unuse_mm(surrogate->mm);
+                        mattx_dbg("[DSM] Hollow VMA at 0x%lx (Size: %lu) destroyed on VM2.\n", rpc->shm_addr, size_to_unmap);
+                    } else {
+                        mattx_dbg("[DSM] Warning: Surrogate has no mm, cannot unmap Hollow VMA.\n");
+                    }
+                }
+
+                if (regs) regs->ax = error;
+
+
+            // --- SHMAT AWAKENING (THE HOLLOW CARVING) ---
+            } else if (rpc->is_shmat) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int rpc_err = -EINTR;
+                long final_ret = -EINTR; // 64-bit return value!
+                size_t shm_size = 0;
+                unsigned long ret_addr = 0;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) {
+                            rpc_err = guest_registry[i].rpc_fsync_res;
+                            shm_size = guest_registry[i].rpc_lseek_res; // We stored the size here!
+                            read_buf = guest_registry[i].rpc_read_buf;
+                        }
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                final_ret = rpc_err; // Default to the RPC error code
+
+                if (rpc_err == 0 && read_buf && shm_size > 0) {
+                    memcpy(&ret_addr, read_buf, sizeof(unsigned long));
+                    
+                    // --- THE HOLLOW CARVING ---
+                    kthread_use_mm(surrogate->mm);
+                    
+                    unsigned long prot = PROT_READ | PROT_WRITE;
+                    if (rpc->shm_flg & SHM_RDONLY) prot = PROT_READ;
+                    
+                    unsigned long map_flags = MAP_SHARED | MAP_ANONYMOUS;
+                    if (rpc->shm_addr) map_flags |= MAP_FIXED; // If user requested specific address
+
+                    // 1. Carve the blank VMA
+                    unsigned long hollow_addr = vm_mmap(NULL, ret_addr, shm_size, prot, map_flags, 0);
+                    
+                    if (!IS_ERR_VALUE(hollow_addr)) {
+                        // 2. The Tripwire Injection!
+                        mmap_write_lock(surrogate->mm);
+                        struct vm_area_struct *vma = find_vma(surrogate->mm, hollow_addr);
+                        if (vma && vma->vm_start == hollow_addr) {
+                            
+                            vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
+                            vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
+                            
+                            // 3. Register it in the DSM Map
+                            spin_lock(&guest_lock);
+                            for (i = 0; i < guest_count; i++) {
+                                if (guest_registry[i].local_pid == surrogate->tgid) {
+                                    if (guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
+                                        int d_idx = guest_registry[i].dsm_count++;
+                                        guest_registry[i].dsm_map[d_idx].base_addr = hollow_addr;
+                                        guest_registry[i].dsm_map[d_idx].size = shm_size;
+                                        guest_registry[i].dsm_map[d_idx].shmid = rpc->shm_id;
+                                        mattx_dbg("[DSM] Hollow VMA carved at 0x%lx (Size: %zu, SHMID: %d). Tripwire armed!\n", hollow_addr, shm_size, rpc->shm_id);
+                                    }
+                                    break;
+                                }
+                            }
+                            spin_unlock(&guest_lock);
+                        }
+                        mmap_write_unlock(surrogate->mm);
+                        final_ret = (long)hollow_addr; // Safe 64-bit assignment!
+                    } else {
+                        final_ret = (long)hollow_addr; // Return the mmap error
+                    }
+                    
+                    kthread_unuse_mm(surrogate->mm);
+                }
+                
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = final_ret; // Inject the clean 64-bit pointer!
 
 
                 
@@ -1636,7 +1850,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 return 0;
             }
 
-            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+            struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
                 rpc->local_pid = my_pid;
@@ -1738,7 +1952,7 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -1822,7 +2036,7 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
                 return 0;
             }
 
-            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+            struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
                 rpc->local_pid = my_pid;
@@ -1894,7 +2108,7 @@ static int ret_handler_socket(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -1981,7 +2195,7 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2057,7 +2271,7 @@ static int ret_handler_bind(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2133,7 +2347,7 @@ static int ret_handler_listen(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2212,7 +2426,7 @@ static int ret_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2293,7 +2507,7 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2374,7 +2588,7 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2468,7 +2682,7 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2549,7 +2763,7 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2661,7 +2875,7 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2775,7 +2989,7 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2858,7 +3072,7 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2942,7 +3156,7 @@ static int ret_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->fd;
@@ -3018,7 +3232,7 @@ static int ret_handler_epoll_create(struct kretprobe_instance *ri, struct pt_reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid;
@@ -3094,7 +3308,7 @@ static int ret_handler_epoll_ctl(struct kretprobe_instance *ri, struct pt_regs *
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid;
@@ -3174,7 +3388,7 @@ static int ret_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid;
@@ -3239,7 +3453,7 @@ static int ret_handler_sockname(struct kretprobe_instance *ri, struct pt_regs *r
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3294,7 +3508,7 @@ static int ret_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *re
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3359,7 +3573,7 @@ static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3404,6 +3618,80 @@ static int ret_handler_getpid(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+/*
+ * gettid() of a Surrogate's thread.
+ *
+ * getpid() is spoofed to the original (home node) PID, which is right for the one number
+ * every thread shares. gettid() used to reuse that handler, so EVERY thread reported the
+ * original PID as its TID: threads created after the migration (all of them, in the
+ * mattx#9 case) were indistinguishable from the main thread and from each other.
+ * pthread_cancel()/pthread_kill() then did tgkill(pid, tid) with the main thread's TID and
+ * signalled the main thread instead of the target, so pthread_cancel() never reached its
+ * thread and pthread_join() waited on its futex forever.
+ *
+ * Threads that were part of the migrated Gang have a home-node TID in the translation map,
+ * and that is what they get back. Threads created afterwards have no home TID, so they keep
+ * their real local TID, which is unique; entry_handler_tgkill() passes it through.
+ */
+static int ret_handler_gettid(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int j = 0; j < guest_registry[i].thread_count; j++) {
+                    if (guest_registry[i].local_tids[j] == current->pid) {
+                        regs->ax = guest_registry[i].orig_tids[j];
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+    return 0;
+}
+
+/*
+ * Signals a Surrogate sends to its own thread group (pthread_cancel/pthread_kill -> tgkill,
+ * kill(getpid(), ...)) carry the REAL local PID in si_pid, but the Surrogate sees the
+ * spoofed home-node PID from getpid(). glibc's SIGCANCEL handler (sigcancel_handler) only
+ * acts when si_pid == getpid(): with the mismatch it silently ignores the cancellation, the
+ * target thread keeps running, and pthread_join() on it waits on its futex forever
+ * (mattx#9 -- seen with threadtest, which cancel()s and join()s its worker threads).
+ * Rewrite si_pid to the spoofed PID right before the signal is queued, so the Surrogate
+ * observes the same PID everywhere.
+ *
+ * __send_signal_locked() runs under sighand->siglock with interrupts off, so guest_lock is
+ * only trylock'ed (it is also taken in paths that go on to send signals); on contention the
+ * signal is left untouched.
+ */
+static struct kprobe send_signal_kprobe;
+
+static int pre_handler_send_signal(struct kprobe *p, struct pt_regs *regs) {
+    struct kernel_siginfo *info = (struct kernel_siginfo *)regs->si;
+    struct task_struct *t = (struct task_struct *)regs->dx;
+    int i;
+
+    if ((unsigned long)info <= 2 || !t)            /* SEND_SIG_NOINFO / SEND_SIG_PRIV */
+        return 0;
+    if (info->si_code != SI_TKILL && info->si_code != SI_USER)
+        return 0;
+    if (t->tgid != current->tgid)                  /* only a thread signalling its own group */
+        return 0;
+    if (!spin_trylock(&guest_lock))
+        return 0;
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            if (info->si_pid == task_tgid_nr(current))
+                info->si_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return 0;
+}
+
 // --- BATCH 1: WORMHOLE TUNNELERS ---
 struct uname_kretprobe_data { void __user *buf; };
 static struct kretprobe uname_kprobe;
@@ -3434,7 +3722,7 @@ static int ret_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3480,7 +3768,7 @@ static int ret_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3527,7 +3815,7 @@ static int ret_handler_prctl(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3573,7 +3861,7 @@ static int ret_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->remote_fd;
@@ -3627,7 +3915,7 @@ static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *re
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->remote_fd;
@@ -3677,7 +3965,7 @@ static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *reg
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3732,7 +4020,7 @@ static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *re
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3790,7 +4078,7 @@ static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs 
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3857,7 +4145,7 @@ static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs 
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3913,7 +4201,7 @@ static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *r
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3978,7 +4266,7 @@ static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs 
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4028,7 +4316,7 @@ static int ret_handler_getdents64(struct kretprobe_instance *ri, struct pt_regs 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4067,7 +4355,7 @@ static int ret_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4295,7 +4583,8 @@ static int entry_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *r
     struct pt_regs *sys_regs = SYSCALL_REGS(regs);
     
     if (is_guest_process(current->tgid)) {
-        u32 target_tid = (u32)sys_regs->si; // The spoofed VM1 TID
+        u32 target_tid = (u32)sys_regs->si; // A home-node TID, or the real local TID of a thread created after the migration
+        u32 target_tgid = (u32)sys_regs->di; // getpid() is spoofed, so this is the home-node PID
         
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
@@ -4304,12 +4593,16 @@ static int entry_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *r
                 for (int j = 0; j < guest_registry[i].thread_count; j++) {
                     if (guest_registry[i].orig_tids[j] == target_tid) {
                         sys_regs->si = guest_registry[i].local_tids[j]; // Inject real VM2 TID!
-                        sys_regs->di = current->tgid; // Translate TGID too, just in case!
                         mattx_dbg("[HOOK] tgkill translated VM1 TID %u -> VM2 TID %u\n", 
                                   target_tid, (u32)sys_regs->si);
                         break;
                     }
                 }
+                // The tgid must be the local one either way (the kernel checks that the TID
+                // belongs to it). Threads created after the migration have no home TID and
+                // keep their real one, so this is also needed when no TID was translated.
+                if (target_tgid == guest_registry[i].orig_pid)
+                    sys_regs->di = current->tgid;
                 break;
             }
         }
@@ -4326,9 +4619,488 @@ static int ret_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *reg
 
 
 
+// ============================================================================
+// DSM CONTROL PLANE KPROBES
+// ============================================================================
+
+// --- SHMGET ---
+struct shmget_kretprobe_data { int key; size_t size; int shmflg; };
+static struct kretprobe shmget_kprobe;
+
+static int entry_handler_shmget(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmget_kretprobe_data *data = (struct shmget_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->key = (int)sys_regs->di;
+        data->size = (size_t)sys_regs->si;
+        data->shmflg = (int)sys_regs->dx;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmget(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmget_kretprobe_data *data = (struct shmget_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmget = true; rpc->shm_key = data->key; rpc->shm_size = data->size; rpc->shm_flg = data->shmflg;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+// --- SHMCTL ---
+struct shmctl_kretprobe_data { int shmid; int cmd; void __user *buf; };
+static struct kretprobe shmctl_kprobe;
+
+static int entry_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    
+    // ALWAYS save the arguments so we can check them in the return handler!
+    data->shmid = (int)sys_regs->di;
+    data->cmd = (int)sys_regs->si;
+    data->buf = (void __user *)sys_regs->dx;
+
+    // Only sabotage the syscall if it's a guest process!
+    if (is_guest_process(current->tgid)) {
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+
+static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
+
+    // --- NEW: THE GARBAGE COLLECTOR (VM1) ---
+    // If ANY process (native, Kworker, or guest) successfully destroys a shared memory segment,
+    // we must remove it from the Global Directory to keep the Matrix Monitor clean!
+    if (regs->ax == 0 && data->cmd == IPC_RMID) {
+        spin_lock(&mattx_dsm_lock);
+        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+            if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == data->shmid) {
+                mattx_global_dsm_dir[d].in_use = false;
+                mattx_dbg("[MESI_VM1] Garbage Collector: SHMID %d destroyed. Directory slot %d freed.\n", data->shmid, d);
+                break;
+            }
+        }
+        spin_unlock(&mattx_dsm_lock);
+    }
+    // ----------------------------------------
+
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmctl = true; rpc->shm_id = data->shmid; rpc->shm_cmd = data->cmd; rpc->buff = data->buf;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+// --- SHMDT ---
+struct shmdt_kretprobe_data { unsigned long shmaddr; };
+static struct kretprobe shmdt_kprobe;
+
+static int entry_handler_shmdt(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmdt_kretprobe_data *data = (struct shmdt_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->shmaddr = (unsigned long)sys_regs->di;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmdt(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmdt_kretprobe_data *data = (struct shmdt_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmdt = true; rpc->shm_addr = data->shmaddr;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+// --- SHMAT ---
+struct shmat_kretprobe_data { int shmid; unsigned long shmaddr; int shmflg; };
+static struct kretprobe shmat_kprobe;
+
+static int entry_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmat_kretprobe_data *data = (struct shmat_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->shmid = (int)sys_regs->di;
+        data->shmaddr = (unsigned long)sys_regs->si;
+        data->shmflg = (int)sys_regs->dx;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmat_kretprobe_data *data = (struct shmat_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmat = true; rpc->shm_id = data->shmid; rpc->shm_addr = data->shmaddr; rpc->shm_flg = data->shmflg;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+// ============================================================================
+// THE NATIVE HOME NODE INTERCEPTOR (VM1)
+// ============================================================================
+struct shmem_fault_kretprobe_data { bool needs_sync; u32 shmid; unsigned long offset; bool is_write; struct vm_fault *vmf; };
+static struct kretprobe shmem_fault_kprobe;
+static struct kretprobe shmem_page_mkwrite_kprobe; // <-- NEW: Catch native writes to SHARED pages!
+
+static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
+    data->needs_sync = false;
+    data->vmf = NULL;
+
+    // --- THE VIP PASS ---
+    if (current->flags & PF_KTHREAD) return 0;
+
+    if (config_dsm_mode == 2) {
+        struct vm_fault *vmf = (struct vm_fault *)regs->di;
+        data->vmf = vmf; // Save the VMF pointer so we can unlock the page later!
+        
+        if (vmf && vmf->vma && vmf->vma->vm_file && vmf->vma->vm_file->f_path.dentry->d_name.name) {
+            if (strncmp(vmf->vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                u32 shmid = vmf->vma->vm_file->f_inode->i_ino;
+                unsigned long offset = (vmf->address & PAGE_MASK) - vmf->vma->vm_start;
+                bool is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
+
+                spin_lock(&mattx_dsm_lock);
+                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+                        unsigned long page_idx = offset / PAGE_SIZE;
+                        u8 state = mattx_global_dsm_dir[d].page_state[page_idx];
+                        u32 owner = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
+                        
+                        if (state == MATTX_PAGE_EXCLUSIVE && owner != 0) {
+                            data->needs_sync = true; // We must flush the remote owner!
+                        } else if (is_write && state == MATTX_PAGE_SHARED) {
+                            // We must invalidate remote sharers!
+                            for (int n = 0; n < MAX_NODES; n++) {
+                                int n_idx = n / 64; int n_bit = n % 64;
+                                if (mattx_global_dsm_dir[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
+                                    data->needs_sync = true; break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&mattx_dsm_lock);
+
+                if (data->needs_sync) {
+                    data->shmid = shmid;
+                    data->offset = offset;
+                    data->is_write = is_write;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+
+static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
+    
+    if (data->needs_sync) {
+        // --- THE LOCK PICK ---
+        // shmem_fault locked the physical page. Because we are aborting the fault,
+        // we MUST unlock and release the page, otherwise our Kworker will deadlock trying to read it!
+        if ((regs->ax & VM_FAULT_LOCKED) && data->vmf && data->vmf->page) {
+            unlock_page(data->vmf->page);
+            put_page(data->vmf->page);
+            data->vmf->page = NULL;
+        }
+
+        // --- NEW: THE LEAKED LOCK FIX ---
+        // If we return VM_FAULT_RETRY, the Linux kernel strictly requires us to drop the mmap_read_lock!
+        // Since we hijacked the return value, we must do it manually on behalf of the native handler.
+        if (current->mm) {
+            mmap_read_unlock(current->mm);
+        }
+        // --------------------------------
+
+        // Force the kernel to retry the fault later!
+        regs->ax = VM_FAULT_RETRY;
+        
+        mattx_dbg("[MESI_VM1] Native Fault intercepted! Freezing PID %d to sync network...\n", current->pid);
+        send_sig(SIGSTOP, current, 0);
+        
+        // Call the dedicated VM1 sync scheduler! (Clean cross-file API!)
+        mattx_schedule_vm1_sync(current->pid, data->shmid, data->offset, data->is_write);
+    }
+    return 0;
+}
+
+
+
+
+// ============================================================================
+// MODE 3: THE HARDWARE EXCEPTION CATCHER (DIE NOTIFIER)
+// ============================================================================
+
+static int mattx_die_cb(struct notifier_block *nb, unsigned long val, void *data) {
+    struct die_args *args = data;
+    struct pt_regs *regs = args->regs;
+
+    // We only care about Debug Exceptions (#DB) caused by our Single-Step Trap Flag!
+    if (val == DIE_DEBUG && config_dsm_mode == 3 && current->mm && is_guest_process(current->tgid)) {
+        bool pending = false;
+        bool is_write = false;
+        unsigned long fault_addr = 0;
+        u32 shmid = 0;
+        int home_node = -1;
+        u32 orig_pid = 0;
+
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                if (guest_registry[i].dsm_step_pending) {
+                    pending = true;
+                    is_write = guest_registry[i].dsm_step_is_write;
+                    fault_addr = guest_registry[i].dsm_step_addr;
+                    shmid = guest_registry[i].dsm_step_shmid;
+                    home_node = guest_registry[i].home_node;
+                    orig_pid = guest_registry[i].orig_pid;
+                    guest_registry[i].dsm_step_pending = false; // Clear it!
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (pending) {
+            // 1. Clear the Trap Flag so the CPU resumes normal speed
+            if (regs) regs->flags &= ~X86_EFLAGS_TF;
+
+            mattx_dbg("[DSM_MODE3] Caught #DB Trap via Die Notifier! Injecting Cleanup Callback...\n");
+
+            // 2. Inject the Cleanup Callback
+            mattx_inject_dsm_cleanup(orig_pid, home_node, shmid, fault_addr, is_write);
+
+            // 3. THE SABOTAGE: Tell the kernel "I am a debugger, I handled this!"
+            // This instantly aborts the kernel's signal delivery pipeline!
+            return NOTIFY_STOP;
+        }
+    }
+    
+    // If it wasn't us, let the kernel handle it normally
+    return NOTIFY_DONE; 
+}
+
+static struct notifier_block mattx_die_notifier = {
+    .notifier_call = mattx_die_cb,
+    .priority = 0x7fffffff, // Highest priority! We catch it before anyone else!
+};
+
+// ============================================================================
+// BATCH 4: THE STALE-DEADLINE CLOCK FIX (mattx#20)
+// ============================================================================
+// clock_nanosleep(CLOCKID, TIMER_ABSTIME, ...) encodes its deadline as a raw
+// CLOCK_MONOTONIC/CLOCK_BOOTTIME value, and CLOCK_MONOTONIC is relative to
+// each kernel's own boot instant -- NOT wall-clock time. A process that was
+// frozen mid-sleep (or whose libc/runtime retry loop re-issues the syscall
+// against a stack-resident, pre-migration deadline -- confirmed via
+// /proc/<pid>/stack showing a migrated dd_migtest.py Surrogate genuinely
+// blocked in hrtimer_nanosleep()/clock_nanosleep() moments after arriving on
+// the target node) carries a deadline that's only meaningful in the SOURCE
+// node's own clock frame. Reused verbatim on the TARGET node it can be wildly
+// wrong -- e.g. forward migration FROM a node with a LARGER CLOCK_MONOTONIC
+// TO one with a SMALLER one leaves the process waiting for the target's own
+// clock to climb up to a huge stale number it hasn't caught up to yet,
+// stalling for a very long time (effectively forever for practical purposes).
+//
+// This does NOT fix the fully general case of arbitrary userspace code
+// computing elapsed time via two separate clock_gettime(CLOCK_MONOTONIC)
+// vDSO reads straddling a migration -- that needs real time namespaces
+// (CLONE_NEWTIME), which is out of scope here. It fixes exactly the
+// clock_nanosleep(CLOCK_MONOTONIC/BOOTTIME, TIMER_ABSTIME) case, which is
+// what's actually blocking, since that path is always a real syscall (never
+// vDSO-fast-pathed, since it can block).
+//
+// Plain nanosleep() is NOT hooked: it has no TIMER_ABSTIME concept at all
+// (it only ever takes a relative duration), so it cannot carry a stale
+// absolute deadline across a migration in the first place.
+//
+// We hook common_nsleep_timens() -- the internal helper CLOCK_MONOTONIC and
+// CLOCK_BOOTTIME route through via clock_nanosleep()'s k_clock ops table on
+// this kernel (confirmed by the actual crash's /proc/<pid>/stack showing
+// common_nsleep_timens as the direct caller of hrtimer_nanosleep), NOT the
+// raw __x64_sys_clock_nanosleep() syscall wrapper. By this point in the call
+// chain the timespec has already been copied in from userspace into a
+// kernel-local struct timespec64 on the caller's stack, so we can read/
+// correct it with a direct pointer dereference -- no access_process_vm()
+// round-trip needed, and no risk of racing the syscall's own copy_from_user.
+// We also register on common_nsleep() (the non-timens sibling used by other
+// clockids on some kernel configurations) as a defensive fallback in case a
+// different kernel routes CLOCK_MONOTONIC/BOOTTIME through it instead; it's
+// a harmless extra registration if unused.
+//
+// The offset itself is supplied by mattx_clock_fixup_register()/
+// mattx_clock_fixup_consume() (mattx_guest.c), populated once per thread at
+// Awakening (both the forward Surrogate wake-up and the Deputy return
+// wake-up in mattx_import.c) and consumed AT MOST ONCE per thread here. This
+// one-shot consumption is deliberate: only the deadline that was already
+// resident in memory at freeze time is stale. Any clock_nanosleep() call a
+// thread makes AFTER that first (corrected) one computes its own deadline
+// fresh, against the vDSO's live view of whichever node it's now actually
+// running on, so it's already correct -- adding the offset again would
+// corrupt it. Gating on is_guest_process() alone (which stays true for the
+// Surrogate's entire remaining lifetime) would NOT be safe here for exactly
+// that reason.
+static struct kretprobe clock_nanosleep_timens_kprobe;
+static struct kretprobe clock_nanosleep_kprobe;
+
+static int entry_handler_clock_nanosleep(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    clockid_t which_clock = (clockid_t)regs->di;
+    int flags = (int)regs->si;
+    struct timespec64 *rqtp = (struct timespec64 *)regs->dx;
+    pid_t my_tgid = current->tgid;
+    pid_t my_tid = current->pid;
+    s64 offset_ns;
+    s64 old_ns, new_ns;
+
+    if (!(flags & TIMER_ABSTIME)) return 0; // Relative sleep -- can't be stale, leave it alone.
+    if (which_clock != CLOCK_MONOTONIC && which_clock != CLOCK_BOOTTIME) return 0;
+    if (!rqtp) return 0;
+
+    if (!mattx_clock_fixup_consume(my_tgid, my_tid, &offset_ns)) return 0; // nothing pending for this thread
+    if (offset_ns == 0) return 0; // Same-clock migration (or no drift) -- nothing to correct.
+
+    old_ns = (s64)rqtp->tv_sec * NSEC_PER_SEC + (s64)rqtp->tv_nsec;
+    new_ns = old_ns + offset_ns;
+    if (new_ns < 0) new_ns = 0; // Never hand the kernel a negative/garbage deadline.
+
+    rqtp->tv_sec  = new_ns / NSEC_PER_SEC;
+    rqtp->tv_nsec = new_ns % NSEC_PER_SEC;
+
+    mattx_dbg("[HOOK] Corrected stale post-migration clock_nanosleep deadline for PID %d (tid %d): "
+              "%lld ns -> %lld ns (offset %lld ns)\n", my_tgid, my_tid, old_ns, new_ns, offset_ns);
+
+    return 0;
+}
+static int ret_handler_clock_nanosleep(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+
+
+
+
+
+
 
 
 // --- KPROBE REGISTRATION ---
+
+/*
+ * Kretprobes that registered successfully, in registration order.
+ *
+ * Some hook targets do not exist on every kernel (e.g. shmem_page_mkwrite is
+ * gone on 6.12: register_kretprobe() returns -ENOENT) and a failed
+ * registration is deliberately non-fatal. Calling unregister_kretprobe() on
+ * such a probe is not safe though: it does rethook_free(rp->rh) with rp->rh
+ * still NULL and oopses, which took the node down on every "rmmod mattx"
+ * (mattx#36). So only probes that registered are ever unregistered.
+ */
+static struct kretprobe *mattx_registered_krp[128];
+static int mattx_nregistered_krp;
+
+static int mattx_register_kretprobe(struct kretprobe *rp)
+{
+    int ret;
+
+    if (mattx_nregistered_krp >= ARRAY_SIZE(mattx_registered_krp)) {
+        printk(KERN_ERR "MattX: too many kretprobes, raise mattx_registered_krp[]\n");
+        return -ENOSPC;
+    }
+    ret = register_kretprobe(rp);
+    if (ret == 0)
+        mattx_registered_krp[mattx_nregistered_krp++] = rp;
+    return ret;
+}
 
 int mattx_hooks_init(void) {
     int ret;
@@ -4339,7 +5111,7 @@ int mattx_hooks_init(void) {
     openat_kprobe.data_size = sizeof(struct kretprobe_data); 
     openat_kprobe.maxactive = 64; 
 
-    ret = register_kretprobe(&openat_kprobe);
+    ret = mattx_register_kretprobe(&openat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed, returned %d\n", ret);
         return ret;
@@ -4352,7 +5124,7 @@ int mattx_hooks_init(void) {
     dup_kprobe.data_size = sizeof(struct dup_kretprobe_data);
     dup_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&dup_kprobe);
+    ret = mattx_register_kretprobe(&dup_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for dup, returned %d\n", ret);
     }
@@ -4364,7 +5136,7 @@ int mattx_hooks_init(void) {
     dup2_kprobe.data_size = sizeof(struct dup_kretprobe_data);
     dup2_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&dup2_kprobe);
+    ret = mattx_register_kretprobe(&dup2_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for dup2, returned %d\n", ret);
     }
@@ -4376,7 +5148,7 @@ int mattx_hooks_init(void) {
     unlinkat_kprobe.data_size = sizeof(struct unlinkat_kretprobe_data);
     unlinkat_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&unlinkat_kprobe);
+    ret = mattx_register_kretprobe(&unlinkat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for unlinkat, returned %d\n", ret);
     }
@@ -4388,7 +5160,7 @@ int mattx_hooks_init(void) {
     socket_kprobe.data_size = sizeof(struct socket_kretprobe_data);
     socket_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&socket_kprobe);
+    ret = mattx_register_kretprobe(&socket_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for socket, returned %d\n", ret);
     }
@@ -4400,7 +5172,7 @@ int mattx_hooks_init(void) {
     connect_kprobe.data_size = sizeof(struct connect_kretprobe_data);
     connect_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&connect_kprobe);
+    ret = mattx_register_kretprobe(&connect_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for connect, returned %d\n", ret);
     }
@@ -4412,7 +5184,7 @@ int mattx_hooks_init(void) {
     bind_kprobe.data_size = sizeof(struct connect_kretprobe_data); // we reuse connect data structure
     bind_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&bind_kprobe);
+    ret = mattx_register_kretprobe(&bind_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for bind, returned %d\n", ret);
 
     memset(&listen_kprobe, 0, sizeof(listen_kprobe));
@@ -4422,7 +5194,7 @@ int mattx_hooks_init(void) {
     listen_kprobe.data_size = sizeof(struct listen_kretprobe_data);
     listen_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&listen_kprobe);
+    ret = mattx_register_kretprobe(&listen_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for listen, returned %d\n", ret);
 
     // SENDTO / RECVFROM ---
@@ -4433,7 +5205,7 @@ int mattx_hooks_init(void) {
     sendto_kprobe.data_size = sizeof(struct sendto_kretprobe_data);
     sendto_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&sendto_kprobe);
+    ret = mattx_register_kretprobe(&sendto_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendto, returned %d\n", ret);
 
     memset(&recvfrom_kprobe, 0, sizeof(recvfrom_kprobe));
@@ -4443,7 +5215,7 @@ int mattx_hooks_init(void) {
     recvfrom_kprobe.data_size = sizeof(struct recvfrom_kretprobe_data);
     recvfrom_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&recvfrom_kprobe);
+    ret = mattx_register_kretprobe(&recvfrom_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvfrom, returned %d\n", ret);
 
     memset(&accept_kprobe, 0, sizeof(accept_kprobe));
@@ -4453,7 +5225,7 @@ int mattx_hooks_init(void) {
     accept_kprobe.data_size = sizeof(struct accept_kretprobe_data);
     accept_kprobe.maxactive = 64;
     
-    ret = register_kretprobe(&accept_kprobe);
+    ret = mattx_register_kretprobe(&accept_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for accept, returned %d\n", ret);
 
     memset(&poll_kprobe, 0, sizeof(poll_kprobe));
@@ -4463,7 +5235,7 @@ int mattx_hooks_init(void) {
     poll_kprobe.data_size = sizeof(struct poll_kretprobe_data);
     poll_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&poll_kprobe);
+    ret = mattx_register_kretprobe(&poll_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for poll, returned %d\n", ret);
 
     memset(&select_kprobe, 0, sizeof(select_kprobe));
@@ -4473,7 +5245,7 @@ int mattx_hooks_init(void) {
     select_kprobe.data_size = sizeof(struct select_kretprobe_data);
     select_kprobe.maxactive = 64;
     
-    ret = register_kretprobe(&select_kprobe);
+    ret = mattx_register_kretprobe(&select_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for select, returned %d\n", ret);
 
     memset(&pselect6_kprobe, 0, sizeof(pselect6_kprobe));
@@ -4483,7 +5255,7 @@ int mattx_hooks_init(void) {
     pselect6_kprobe.data_size = sizeof(struct pselect6_kretprobe_data);
     pselect6_kprobe.maxactive = 64;
     
-    ret = register_kretprobe(&pselect6_kprobe);
+    ret = mattx_register_kretprobe(&pselect6_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pselect6, returned %d\n", ret);
     
     memset(&read_kprobe, 0, sizeof(read_kprobe));
@@ -4492,7 +5264,7 @@ int mattx_hooks_init(void) {
     read_kprobe.handler = ret_handler_read;
     read_kprobe.data_size = sizeof(struct rw_kretprobe_data);
     read_kprobe.maxactive = 64;
-    ret = register_kretprobe(&read_kprobe);
+    ret = mattx_register_kretprobe(&read_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for read, returned %d\n", ret);
 
     memset(&write_kprobe, 0, sizeof(write_kprobe));
@@ -4501,7 +5273,7 @@ int mattx_hooks_init(void) {
     write_kprobe.handler = ret_handler_write;
     write_kprobe.data_size = sizeof(struct rw_kretprobe_data);
     write_kprobe.maxactive = 64;
-    ret = register_kretprobe(&write_kprobe);
+    ret = mattx_register_kretprobe(&write_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
 
     memset(&lseek_kprobe, 0, sizeof(lseek_kprobe));
@@ -4510,7 +5282,7 @@ int mattx_hooks_init(void) {
     lseek_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
     lseek_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     lseek_kprobe.maxactive = 64;
-    ret = register_kretprobe(&lseek_kprobe);
+    ret = mattx_register_kretprobe(&lseek_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for lseek, returned %d\n", ret);
 
     memset(&fsync_kprobe, 0, sizeof(fsync_kprobe));
@@ -4519,7 +5291,7 @@ int mattx_hooks_init(void) {
     fsync_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
     fsync_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     fsync_kprobe.maxactive = 64;
-    ret = register_kretprobe(&fsync_kprobe);
+    ret = mattx_register_kretprobe(&fsync_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fsync, returned %d\n", ret);
 
     memset(&statx_kprobe, 0, sizeof(statx_kprobe));
@@ -4528,7 +5300,7 @@ int mattx_hooks_init(void) {
     statx_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
     statx_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     statx_kprobe.maxactive = 64;
-    ret = register_kretprobe(&statx_kprobe);
+    ret = mattx_register_kretprobe(&statx_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statx, returned %d\n", ret);
 
     memset(&epoll_ctl_kprobe, 0, sizeof(epoll_ctl_kprobe));
@@ -4537,7 +5309,7 @@ int mattx_hooks_init(void) {
     epoll_ctl_kprobe.handler = ret_handler_epoll_ctl;
     epoll_ctl_kprobe.data_size = sizeof(struct epoll_ctl_kretprobe_data);
     epoll_ctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_ctl_kprobe);
+    ret = mattx_register_kretprobe(&epoll_ctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_ctl, returned %d\n", ret); 
 
     memset(&epoll_wait_kprobe, 0, sizeof(epoll_wait_kprobe));
@@ -4546,7 +5318,7 @@ int mattx_hooks_init(void) {
     epoll_wait_kprobe.handler = ret_handler_epoll_wait;
     epoll_wait_kprobe.data_size = sizeof(struct epoll_wait_kretprobe_data); // <-- THIS ONE!
     epoll_wait_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_wait_kprobe);
+    ret = mattx_register_kretprobe(&epoll_wait_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_wait, returned %d\n", ret);
 
     memset(&epoll_create_kprobe, 0, sizeof(epoll_create_kprobe));
@@ -4555,7 +5327,7 @@ int mattx_hooks_init(void) {
     epoll_create_kprobe.handler = ret_handler_epoll_create;
     epoll_create_kprobe.data_size = sizeof(struct epoll_create_kretprobe_data);
     epoll_create_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_create_kprobe);
+    ret = mattx_register_kretprobe(&epoll_create_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_create, returned %d\n", ret);
 
     memset(&epoll_create1_kprobe, 0, sizeof(epoll_create1_kprobe));
@@ -4564,7 +5336,7 @@ int mattx_hooks_init(void) {
     epoll_create1_kprobe.handler = ret_handler_epoll_create;
     epoll_create1_kprobe.data_size = sizeof(struct epoll_create_kretprobe_data);
     epoll_create1_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_create1_kprobe);
+    ret = mattx_register_kretprobe(&epoll_create1_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_create1, returned %d\n", ret   );
 
     // --- SOCKNAME & PEERNAME ---
@@ -4574,7 +5346,7 @@ int mattx_hooks_init(void) {
     getsockname_kprobe.handler = ret_handler_sockname;
     getsockname_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
     getsockname_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getsockname_kprobe);
+    ret = mattx_register_kretprobe(&getsockname_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getsockname, returned %d\n", ret);
 
     memset(&getpeername_kprobe, 0, sizeof(getpeername_kprobe));
@@ -4583,7 +5355,7 @@ int mattx_hooks_init(void) {
     getpeername_kprobe.handler = ret_handler_sockname;         // Shared!
     getpeername_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
     getpeername_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getpeername_kprobe);
+    ret = mattx_register_kretprobe(&getpeername_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getpeername, returned %d\n", ret );
 
     // --- SOCKOPTS ---
@@ -4593,7 +5365,7 @@ int mattx_hooks_init(void) {
     setsockopt_kprobe.handler = ret_handler_sockopt;
     setsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
     setsockopt_kprobe.maxactive = 64;
-    ret = register_kretprobe(&setsockopt_kprobe);
+    ret = mattx_register_kretprobe(&setsockopt_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for setsockopt, returned %d\n", ret);
 
     memset(&getsockopt_kprobe, 0, sizeof(getsockopt_kprobe));
@@ -4602,7 +5374,7 @@ int mattx_hooks_init(void) {
     getsockopt_kprobe.handler = ret_handler_sockopt;         // Shared!
     getsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
     getsockopt_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getsockopt_kprobe);
+    ret = mattx_register_kretprobe(&getsockopt_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getsockopt, returned %d\n", ret);
 
     // --- SENDMSG & RECVMSG ---
@@ -4612,7 +5384,7 @@ int mattx_hooks_init(void) {
     sendmsg_kprobe.handler = ret_handler_msg;
     sendmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
     sendmsg_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sendmsg_kprobe);
+    ret = mattx_register_kretprobe(&sendmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendmsg, returned %d\n", ret);
 
     memset(&recvmsg_kprobe, 0, sizeof(recvmsg_kprobe));
@@ -4621,7 +5393,7 @@ int mattx_hooks_init(void) {
     recvmsg_kprobe.handler = ret_handler_msg;         // Shared!
     recvmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
     recvmsg_kprobe.maxactive = 64;
-    ret = register_kretprobe(&recvmsg_kprobe);
+    ret = mattx_register_kretprobe(&recvmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvmsg, returned %d\n", ret);
 
     memset(&getpid_kprobe, 0, sizeof(getpid_kprobe));
@@ -4629,15 +5401,15 @@ int mattx_hooks_init(void) {
     getpid_kprobe.entry_handler = entry_handler_getpid;
     getpid_kprobe.handler = ret_handler_getpid;
     getpid_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getpid_kprobe);
+    ret = mattx_register_kretprobe(&getpid_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getpid, returned %d\n", ret);
 
     memset(&gettid_kprobe, 0, sizeof(gettid_kprobe));
     gettid_kprobe.kp.symbol_name = "__x64_sys_gettid";
-    gettid_kprobe.entry_handler = entry_handler_getpid; // Reusing getpid handler to spoof main thread!
-    gettid_kprobe.handler = ret_handler_getpid;
+    gettid_kprobe.entry_handler = entry_handler_getpid;
+    gettid_kprobe.handler = ret_handler_gettid; // per-thread, NOT the getpid handler (see above)
     gettid_kprobe.maxactive = 64;
-    ret = register_kretprobe(&gettid_kprobe);
+    ret = mattx_register_kretprobe(&gettid_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for gettid, returned %d\n", ret);
 
     memset(&uname_kprobe, 0, sizeof(uname_kprobe));
@@ -4646,7 +5418,7 @@ int mattx_hooks_init(void) {
     uname_kprobe.handler = ret_handler_uname;
     uname_kprobe.data_size = sizeof(struct uname_kretprobe_data);
     uname_kprobe.maxactive = 64;
-    ret = register_kretprobe(&uname_kprobe);
+    ret = mattx_register_kretprobe(&uname_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for uname, returned %d\n", ret   );
 
     memset(&prlimit64_kprobe, 0, sizeof(prlimit64_kprobe));
@@ -4655,7 +5427,7 @@ int mattx_hooks_init(void) {
     prlimit64_kprobe.handler = ret_handler_prlimit64;
     prlimit64_kprobe.data_size = sizeof(struct prlimit_kretprobe_data);
     prlimit64_kprobe.maxactive = 64;
-    ret = register_kretprobe(&prlimit64_kprobe);
+    ret = mattx_register_kretprobe(&prlimit64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for prlimit64, returned %d\n", ret   );
 
     memset(&prctl_kprobe, 0, sizeof(prctl_kprobe));
@@ -4664,7 +5436,7 @@ int mattx_hooks_init(void) {
     prctl_kprobe.handler = ret_handler_prctl;
     prctl_kprobe.data_size = sizeof(struct prctl_kretprobe_data);
     prctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&prctl_kprobe);
+    ret = mattx_register_kretprobe(&prctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for prctl, returned %d\n", ret);
 
     memset(&fcntl_kprobe, 0, sizeof(fcntl_kprobe));
@@ -4673,7 +5445,7 @@ int mattx_hooks_init(void) {
     fcntl_kprobe.handler = ret_handler_fcntl;
     fcntl_kprobe.data_size = sizeof(struct fcntl_kretprobe_data);
     fcntl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&fcntl_kprobe);
+    ret = mattx_register_kretprobe(&fcntl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fcntl, returned %d\n", ret);
 
     memset(&ioctl_kprobe, 0, sizeof(ioctl_kprobe));
@@ -4682,7 +5454,7 @@ int mattx_hooks_init(void) {
     ioctl_kprobe.handler = ret_handler_fcntl;         // Reused!
     ioctl_kprobe.data_size = sizeof(struct fcntl_kretprobe_data);
     ioctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&ioctl_kprobe);
+    ret = mattx_register_kretprobe(&ioctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for ioctl, returned %d\n", ret);
 
     memset(&pread64_kprobe, 0, sizeof(pread64_kprobe));
@@ -4691,7 +5463,7 @@ int mattx_hooks_init(void) {
     pread64_kprobe.handler = ret_handler_pread64;
     pread64_kprobe.data_size = sizeof(struct pread64_kretprobe_data);
     pread64_kprobe.maxactive = 64;
-    ret = register_kretprobe(&pread64_kprobe);
+    ret = mattx_register_kretprobe(&pread64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pread64, returned %d\n", ret);
 
     memset(&statfs_kprobe, 0, sizeof(statfs_kprobe)); 
@@ -4700,7 +5472,7 @@ int mattx_hooks_init(void) {
     statfs_kprobe.handler = ret_handler_statfs; 
     statfs_kprobe.data_size = sizeof(struct statfs_kretprobe_data); 
     statfs_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&statfs_kprobe);
+    ret = mattx_register_kretprobe(&statfs_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statfs, returned %d\n", ret);
 
     memset(&fstatfs_kprobe, 0, sizeof(fstatfs_kprobe)); 
@@ -4709,7 +5481,7 @@ int mattx_hooks_init(void) {
     fstatfs_kprobe.handler = ret_handler_fstatfs; 
     fstatfs_kprobe.data_size = sizeof(struct fstatfs_kretprobe_data); 
     fstatfs_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&fstatfs_kprobe);
+    ret = mattx_register_kretprobe(&fstatfs_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fstatfs, returned %d\n", ret);
 
     memset(&newfstatat_kprobe, 0, sizeof(newfstatat_kprobe)); 
@@ -4718,7 +5490,7 @@ int mattx_hooks_init(void) {
     newfstatat_kprobe.handler = ret_handler_newfstatat; 
     newfstatat_kprobe.data_size = sizeof(struct newfstatat_kretprobe_data); 
     newfstatat_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&newfstatat_kprobe);
+    ret = mattx_register_kretprobe(&newfstatat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for newfstatat, returned %d\n", ret);
 
     memset(&faccessat2_kprobe, 0, sizeof(faccessat2_kprobe)); 
@@ -4727,7 +5499,7 @@ int mattx_hooks_init(void) {
     faccessat2_kprobe.handler = ret_handler_faccessat2; 
     faccessat2_kprobe.data_size = sizeof(struct faccessat2_kretprobe_data); 
     faccessat2_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&faccessat2_kprobe);
+    ret = mattx_register_kretprobe(&faccessat2_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for faccessat2, returned %d\n", ret);
 
     memset(&readlink_kprobe, 0, sizeof(readlink_kprobe)); 
@@ -4736,7 +5508,7 @@ int mattx_hooks_init(void) {
     readlink_kprobe.handler = ret_handler_readlink; 
     readlink_kprobe.data_size = sizeof(struct readlink_kretprobe_data); 
     readlink_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&readlink_kprobe);
+    ret = mattx_register_kretprobe(&readlink_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlink, returned %d\n", ret);
 
     memset(&readlinkat_kprobe, 0, sizeof(readlinkat_kprobe)); 
@@ -4745,7 +5517,7 @@ int mattx_hooks_init(void) {
     readlinkat_kprobe.handler = ret_handler_readlinkat; 
     readlinkat_kprobe.data_size = sizeof(struct readlinkat_kretprobe_data); 
     readlinkat_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&readlinkat_kprobe);
+    ret = mattx_register_kretprobe(&readlinkat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlinkat, returned %d\n", ret);
 
     memset(&getdents64_kprobe, 0, sizeof(getdents64_kprobe)); 
@@ -4754,7 +5526,7 @@ int mattx_hooks_init(void) {
     getdents64_kprobe.handler = ret_handler_getdents64; 
     getdents64_kprobe.data_size = sizeof(struct getdents64_kretprobe_data); 
     getdents64_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&getdents64_kprobe);
+    ret = mattx_register_kretprobe(&getdents64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getdents64, returned %d\n", ret);
 
     memset(&pipe2_kprobe, 0, sizeof(pipe2_kprobe)); 
@@ -4763,7 +5535,7 @@ int mattx_hooks_init(void) {
     pipe2_kprobe.handler = ret_handler_pipe2; 
     pipe2_kprobe.data_size = sizeof(struct pipe2_kretprobe_data); 
     pipe2_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&pipe2_kprobe);
+    ret = mattx_register_kretprobe(&pipe2_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pipe2, returned %d\n", ret);
 
     memset(&brk_kprobe, 0, sizeof(brk_kprobe));
@@ -4771,7 +5543,7 @@ int mattx_hooks_init(void) {
     brk_kprobe.entry_handler = entry_handler_brk;
     brk_kprobe.handler = ret_handler_brk;
     brk_kprobe.maxactive = 64;
-    ret = register_kretprobe(&brk_kprobe);
+    ret = mattx_register_kretprobe(&brk_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for brk, returned %d\n", ret);
 
     memset(&munmap_kprobe, 0, sizeof(munmap_kprobe));
@@ -4779,7 +5551,7 @@ int mattx_hooks_init(void) {
     munmap_kprobe.entry_handler = entry_handler_munmap;
     munmap_kprobe.handler = ret_handler_munmap;
     munmap_kprobe.maxactive = 64;
-    ret = register_kretprobe(&munmap_kprobe);
+    ret = mattx_register_kretprobe(&munmap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for munmap, returned %d\n", ret);
 
     memset(&mremap_kprobe, 0, sizeof(mremap_kprobe));
@@ -4787,7 +5559,7 @@ int mattx_hooks_init(void) {
     mremap_kprobe.entry_handler = entry_handler_mremap;
     mremap_kprobe.handler = ret_handler_mremap;
     mremap_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mremap_kprobe);
+    ret = mattx_register_kretprobe(&mremap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mremap, returned %d\n", ret);
 
     memset(&mmap_kprobe, 0, sizeof(mmap_kprobe));
@@ -4796,7 +5568,7 @@ int mattx_hooks_init(void) {
     mmap_kprobe.handler = ret_handler_mmap;
     mmap_kprobe.data_size = sizeof(struct mmap_kretprobe_data);
     mmap_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mmap_kprobe);
+    ret = mattx_register_kretprobe(&mmap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mmap, returned %d\n", ret);
 
     // --- BATCH 3.2 KPROBES ---
@@ -4805,7 +5577,7 @@ int mattx_hooks_init(void) {
     mprotect_kprobe.entry_handler = entry_handler_mprotect;
     mprotect_kprobe.handler = ret_handler_mprotect;
     mprotect_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mprotect_kprobe);
+    ret = mattx_register_kretprobe(&mprotect_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mprotect, returned %d\n", ret);
 
     memset(&madvise_kprobe, 0, sizeof(madvise_kprobe));
@@ -4813,7 +5585,7 @@ int mattx_hooks_init(void) {
     madvise_kprobe.entry_handler = entry_handler_madvise;
     madvise_kprobe.handler = ret_handler_madvise;
     madvise_kprobe.maxactive = 64;
-    ret = register_kretprobe(&madvise_kprobe);
+    ret = mattx_register_kretprobe(&madvise_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for madvise, returned %d\n", ret);
 
     memset(&mbind_kprobe, 0, sizeof(mbind_kprobe));
@@ -4821,7 +5593,7 @@ int mattx_hooks_init(void) {
     mbind_kprobe.entry_handler = entry_handler_mbind;
     mbind_kprobe.handler = ret_handler_mbind;
     mbind_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mbind_kprobe);
+    ret = mattx_register_kretprobe(&mbind_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mbind, returned %d\n", ret);
 
     memset(&sched_getaffinity_kprobe, 0, sizeof(sched_getaffinity_kprobe));
@@ -4829,7 +5601,7 @@ int mattx_hooks_init(void) {
     sched_getaffinity_kprobe.entry_handler = entry_handler_sched_getaffinity;
     sched_getaffinity_kprobe.handler = ret_handler_sched_getaffinity;
     sched_getaffinity_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sched_getaffinity_kprobe);
+    ret = mattx_register_kretprobe(&sched_getaffinity_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_getaffinity, returned %d\n", ret);
 
     memset(&sched_setaffinity_kprobe, 0, sizeof(sched_setaffinity_kprobe));
@@ -4837,7 +5609,7 @@ int mattx_hooks_init(void) {
     sched_setaffinity_kprobe.entry_handler = entry_handler_sched_setaffinity;
     sched_setaffinity_kprobe.handler = ret_handler_sched_setaffinity;
     sched_setaffinity_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sched_setaffinity_kprobe);
+    ret = mattx_register_kretprobe(&sched_setaffinity_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_setaffinity, returned %d\n", ret);
 
     memset(&sched_yield_kprobe, 0, sizeof(sched_yield_kprobe));
@@ -4845,7 +5617,7 @@ int mattx_hooks_init(void) {
     sched_yield_kprobe.entry_handler = entry_handler_sched_yield;
     sched_yield_kprobe.handler = ret_handler_sched_yield;
     sched_yield_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sched_yield_kprobe);
+    ret = mattx_register_kretprobe(&sched_yield_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_yield, returned %d\n", ret);
 
     // --- THE CRADLE INTERCEPTOR ---
@@ -4861,72 +5633,99 @@ int mattx_hooks_init(void) {
     tgkill_kprobe.entry_handler = entry_handler_tgkill;
     tgkill_kprobe.handler = ret_handler_tgkill;
     tgkill_kprobe.maxactive = 64;
-    ret = register_kretprobe(&tgkill_kprobe);
+    ret = mattx_register_kretprobe(&tgkill_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for tgkill, returned %d\n", ret);
 
+    memset(&send_signal_kprobe, 0, sizeof(send_signal_kprobe));
+    send_signal_kprobe.symbol_name = "__send_signal_locked";
+    send_signal_kprobe.pre_handler = pre_handler_send_signal;
+    ret = register_kprobe(&send_signal_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kprobe failed for __send_signal_locked, returned %d (pthread_cancel() in a migrated process will not work)\n", ret);
+
+    // DSM - shared memory syscalls
+    memset(&shmget_kprobe, 0, sizeof(shmget_kprobe)); shmget_kprobe.kp.symbol_name = "__x64_sys_shmget";
+    shmget_kprobe.entry_handler = entry_handler_shmget; shmget_kprobe.handler = ret_handler_shmget;
+    shmget_kprobe.data_size = sizeof(struct shmget_kretprobe_data); shmget_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&shmget_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmget, returned %d\n", ret);
+
+    memset(&shmctl_kprobe, 0, sizeof(shmctl_kprobe)); shmctl_kprobe.kp.symbol_name = "__x64_sys_shmctl";
+    shmctl_kprobe.entry_handler = entry_handler_shmctl; shmctl_kprobe.handler = ret_handler_shmctl;
+    shmctl_kprobe.data_size = sizeof(struct shmctl_kretprobe_data); shmctl_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&shmctl_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmctl, returned %d\n", ret);
+
+    memset(&shmdt_kprobe, 0, sizeof(shmdt_kprobe)); shmdt_kprobe.kp.symbol_name = "__x64_sys_shmdt";
+    shmdt_kprobe.entry_handler = entry_handler_shmdt; shmdt_kprobe.handler = ret_handler_shmdt;
+    shmdt_kprobe.data_size = sizeof(struct shmdt_kretprobe_data); shmdt_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&shmdt_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmdt, returned %d\n", ret);
+
+    memset(&shmat_kprobe, 0, sizeof(shmat_kprobe)); shmat_kprobe.kp.symbol_name = "__x64_sys_shmat";
+    shmat_kprobe.entry_handler = entry_handler_shmat; shmat_kprobe.handler = ret_handler_shmat;
+    shmat_kprobe.data_size = sizeof(struct shmat_kretprobe_data); shmat_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&shmat_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
+
+    memset(&shmem_fault_kprobe, 0, sizeof(shmem_fault_kprobe));
+    shmem_fault_kprobe.kp.symbol_name = "shmem_fault";
+    shmem_fault_kprobe.entry_handler = entry_handler_shmem_fault;
+    shmem_fault_kprobe.handler = ret_handler_shmem_fault;
+    shmem_fault_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
+    shmem_fault_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&shmem_fault_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_fault, returned %d\n", ret);
+
+    memset(&shmem_page_mkwrite_kprobe, 0, sizeof(shmem_page_mkwrite_kprobe));
+    shmem_page_mkwrite_kprobe.kp.symbol_name = "shmem_page_mkwrite";
+    shmem_page_mkwrite_kprobe.entry_handler = entry_handler_shmem_fault; // Reuse the exact same handler!
+    shmem_page_mkwrite_kprobe.handler = ret_handler_shmem_fault;         // Reuse the exact same handler!
+    shmem_page_mkwrite_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
+    shmem_page_mkwrite_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&shmem_page_mkwrite_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_page_mkwrite, returned %d\n", ret);
+
+
+    // --- Stale-deadline clock_nanosleep() fixup (mattx#20) ---
+    // Non-fatal if either fails to resolve: these are internal, unexported
+    // helper symbols that could legitimately move/vanish/get inlined on a
+    // different kernel version, and this fix is best-effort on top of the
+    // already-working migration path, not a prerequisite for it.
+    memset(&clock_nanosleep_timens_kprobe, 0, sizeof(clock_nanosleep_timens_kprobe));
+    clock_nanosleep_timens_kprobe.kp.symbol_name = "common_nsleep_timens";
+    clock_nanosleep_timens_kprobe.entry_handler = entry_handler_clock_nanosleep;
+    clock_nanosleep_timens_kprobe.handler = ret_handler_clock_nanosleep;
+    clock_nanosleep_timens_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&clock_nanosleep_timens_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for common_nsleep_timens, returned %d (post-migration clock_nanosleep deadlines will NOT be corrected!)\n", ret);
+
+    memset(&clock_nanosleep_kprobe, 0, sizeof(clock_nanosleep_kprobe));
+    clock_nanosleep_kprobe.kp.symbol_name = "common_nsleep";
+    clock_nanosleep_kprobe.entry_handler = entry_handler_clock_nanosleep;
+    clock_nanosleep_kprobe.handler = ret_handler_clock_nanosleep;
+    clock_nanosleep_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&clock_nanosleep_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for common_nsleep, returned %d (defensive fallback only, non-fatal)\n", ret);
+
+
+    // --- THE HARDWARE EXCEPTION CATCHER ---
+    if (register_die_notifier(&mattx_die_notifier) < 0) {
+        printk(KERN_ERR "MattX: Failed to register Die Notifier!\n");
+    }
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
-    unregister_kretprobe(&tgkill_kprobe);
+    // Reverse registration order, registered probes only (see mattx_register_kretprobe).
+    while (mattx_nregistered_krp > 0)
+        unregister_kretprobe(mattx_registered_krp[--mattx_nregistered_krp]);
     unregister_kprobe(&wake_up_new_task_kprobe);
-    unregister_kretprobe(&sched_getaffinity_kprobe);
-    unregister_kretprobe(&sched_setaffinity_kprobe);
-    unregister_kretprobe(&sched_yield_kprobe);
-    unregister_kretprobe(&mprotect_kprobe);
-    unregister_kretprobe(&madvise_kprobe);
-    unregister_kretprobe(&mbind_kprobe);
-    unregister_kretprobe(&brk_kprobe);
-    unregister_kretprobe(&munmap_kprobe);
-    unregister_kretprobe(&mremap_kprobe);
-    unregister_kretprobe(&mmap_kprobe);
-    unregister_kretprobe(&getdents64_kprobe);
-    unregister_kretprobe(&pipe2_kprobe);
-    unregister_kretprobe(&statfs_kprobe);
-    unregister_kretprobe(&fstatfs_kprobe);
-    unregister_kretprobe(&newfstatat_kprobe);
-    unregister_kretprobe(&faccessat2_kprobe);
-    unregister_kretprobe(&readlink_kprobe);
-    unregister_kretprobe(&readlinkat_kprobe);
-    unregister_kretprobe(&fcntl_kprobe);
-    unregister_kretprobe(&ioctl_kprobe);
-    unregister_kretprobe(&pread64_kprobe);
-    unregister_kretprobe(&getpid_kprobe);
-    unregister_kretprobe(&gettid_kprobe);
-    unregister_kretprobe(&uname_kprobe);
-    unregister_kretprobe(&prlimit64_kprobe);
-    unregister_kretprobe(&prctl_kprobe);
-    unregister_kretprobe(&sendmsg_kprobe);
-    unregister_kretprobe(&recvmsg_kprobe);
-    unregister_kretprobe(&getsockname_kprobe);
-    unregister_kretprobe(&getpeername_kprobe);
-    unregister_kretprobe(&getsockopt_kprobe);
-    unregister_kretprobe(&setsockopt_kprobe);
-    unregister_kretprobe(&epoll_create_kprobe);
-    unregister_kretprobe(&epoll_create1_kprobe);
-    unregister_kretprobe(&epoll_wait_kprobe);
-    unregister_kretprobe(&epoll_ctl_kprobe);
-    unregister_kretprobe(&pselect6_kprobe);    
-    unregister_kretprobe(&write_kprobe);
-    unregister_kretprobe(&read_kprobe);    
-    unregister_kretprobe(&lseek_kprobe);    
-    unregister_kretprobe(&fsync_kprobe);    
-    unregister_kretprobe(&statx_kprobe);    
-    unregister_kretprobe(&select_kprobe);
-    unregister_kretprobe(&poll_kprobe);
-    unregister_kretprobe(&accept_kprobe);
-    unregister_kretprobe(&recvfrom_kprobe);
-    unregister_kretprobe(&sendto_kprobe);
-    unregister_kretprobe(&listen_kprobe);
-    unregister_kretprobe(&bind_kprobe);
-    unregister_kretprobe(&connect_kprobe);
-    unregister_kretprobe(&socket_kprobe);
-    unregister_kretprobe(&unlinkat_kprobe);
-    unregister_kretprobe(&dup2_kprobe);
-    unregister_kretprobe(&dup_kprobe);
-    unregister_kretprobe(&openat_kprobe);
+    unregister_kprobe(&send_signal_kprobe);
+
+    unregister_die_notifier(&mattx_die_notifier);
+
     mattx_dbg(" Syscall Hooks (Kprobes) unregistered.\n");
 }
 

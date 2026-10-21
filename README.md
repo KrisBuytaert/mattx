@@ -16,6 +16,66 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ## 📰 Latest News
 
+*October 2026*
+
+## 🚀 MattX 1.9: The Distributed Shared Memory (DSM) Evolution 🧠🕳️
+
+<div style="display: inline-flex; align-items: center;">
+  <a href="https://youtu.be/RscWxkt_DCs" target="_blank" style="display: inline-block;">
+  <b>MattX 1.9 MESI DSM demo on Youtube</b> 
+  <br>
+    <img src="./web/media/Mattx-1.9-MESI-DSM-bright.jpeg" style="width: 100%; display: block;">
+  </a>
+
+</div>
+
+<br>
+
+Welcome to **MattX 1.9**, the release that officially transforms MattX from an advanced process migrator into a true, hardware-accurate **Single System Image (SSI) Hypervisor**. 
+
+With this release, we have successfully bent the Linux Virtual Memory subsystem to our will. MattX now allows complex, multi-process HPC applications and AI training workloads to seamlessly migrate across the cluster while maintaining perfect synchronisation over **Distributed Shared Memory (DSM)**.
+
+### 🌌 The Crown Jewel: Pluggable Cache Coherence (DSM)
+Migrating processes that share memory (System V IPC) across a network is notoriously difficult. MattX 1.9 solves this by introducing "Ghost VMAs"—hollow memory mappings on remote nodes rigged with custom kernel tripwires. When a migrated process touches this memory, MattX catches the Page Fault and teleports the physical RAM across the TCP Wormhole.
+
+Because there is no "one size fits all" for distributed memory, MattX 1.9 introduces **four pluggable DSM algorithms**, configurable on-the-fly via `/proc/mattx/admin` or `mattx.conf`:
+
+*   **Mode 0 (Lazy Mode):** Uncoherent, fast local caching. Best for Read-Only datasets.
+*   **Mode 1 (The Dirty Sweeper):** Eventual consistency. A background Kthread batches dirty pages and syncs them to the Home Node every 50ms.
+*   **Mode 2 (The MESI Protocol) [DEFAULT]:** The Industry Standard. A mathematically perfect, strict cache coherence engine. 
+    *   **The Master Directory:** The Home Node (VM1) maintains a Node-Local Global Directory tracking the exact state (`SHARED`, `EXCLUSIVE`, `INVALID`) of every 4KB page.
+    *   **The Read-Only Trapdoor:** Remote nodes map pages as strictly Read-Only. Reads execute at native hardware speed with zero network traffic.
+    *   **The Write-Acquire Pipeline:** Writes trigger a Write-Protect Fault. The node asks VM1 for an `EXCLUSIVE` lock. VM1 broadcasts `INVALIDATE` requests to all other nodes, shooting down their caches, before granting the lock and allowing the writer to upgrade to Read-Write.
+    *   **The PTE Shootdown:** Native processes running on the Home Node are fully integrated into the Matrix. MattX uses `unmap_mapping_range` to shoot down native Page Table Entries, forcing local processes to fault and flush dirty data from remote nodes!
+    *   **The Funeral Flush:** When a process exits, MattX proactively fires a 1-Way Data Bomb to sync any dirty `EXCLUSIVE` pages back to the Home Node before destroying the memory.
+*   **Mode 3 (The Single-Step Route):** God Mode. MattX puts a leash on the CPU using the hardware Trap Flag (`X86_EFLAGS_TF`), executing exactly one assembly instruction natively before catching the `#DB` exception to sync the data. 
+
+### 🖥️ The True Supercomputer Experience
+MattX 1.9 consolidates our massive architectural milestones, turning a bunch of standard networked Linux boxes into a single, unified supercomputer:
+*   **Identity Theft (The Silent Ninja):** Syscalls are intercepted and executed natively on the Home Node by Kworkers that temporarily steal the `mm`, `cred`, `nsproxy`, and `files` structs of the original process. Zero split-brain deadlocks.
+*   **Global Cluster Filesystem:** **MattXFS** provides a seamless, cluster-wide VFS using Mount Namespaces.
+*   **Gang Migration:** Multi-threaded monsters are migrated together. Registers, FPU/AVX states, and TLS are packed into a Blueprint and injected into dummy clones on the target node.
+*   **Syscall-Level Load Balancing:** The cluster breathes naturally, balancing CPU load across nodes at the syscall level, completely transparent to the user.
+
+### 🏆 Massive Community Kudos: Kris Buytaert
+A hypervisor is only as strong as its QA, and MattX 1.9 owes a massive debt of gratitude to our legendary contributor, **Kris Buytaert**. 
+
+Kris brought the power of **Test-Driven Development (TDD)** to the MattX Lab by building the automated **MattX TestSuite**. Through his relentless testing and bug hunting, Kris uncovered and submitted surgical Pull Requests for incredibly complex edge cases, including:
+*   Fixing `kzalloc` dispatch flag corruption in the RPC workers.
+*   Solving PhD-level `CLOCK_MONOTONIC` time skew deadlocks for migrated absolute timers.
+*   Implementing production-grade timeouts for the `expel` cordon-and-drain loops.
+
+Kris, your automated tests and surgical PRs are what push MattX from an "experiment" to "production-grade." Thank you! 🙌
+
+Please find Kris's **MattX TestSuite** at: 
+https://github.com/KrisBuytaert/mattx-testsuite
+
+Kris' latest **MattX 1.9 TestSuite Results**
+https://krisbuytaert.be/mattx-test-reports/#q=3f4e121d9bbd
+
+---
+
+
 ## Testing MattX with EESSI
 
 *September 2026*
@@ -103,10 +163,13 @@ https://github.com/KrisBuytaert/mattx-testsuite
 
 ---
 
-## ✨ Key Features (MattX v1.8)
+## ✨ Key Features (MattX v1.9)
 
 ### 🧠 Live Process Teleportation & The Syscall Drainer
 MattX migrates running processes safely using a custom **Syscall Drainer**. Instead of violently freezing processes with `SIGSTOP` while they hold kernel locks, MattX uses modern `task_work_add(TWA_SIGNAL)` to gently guide the process to the user-space boundary. Once in a 100% stable state, its memory map (VMAs), CPU registers (`pt_regs`), and credentials (`struct cred`) are extracted and streamed over a custom TCP data pump to the target node.
+
+### Distributed Shared Memory (DSM)
+We have officially conquered the final boss of Single System Image (SSI) clustering: **Distributed Shared Memory (DSM)**. MattX 1.9 features a hardware-accurate, software-defined DSM using the **MESI Cache Coherence Protocol**. What does this mean? It means you can take a complex, multi-process application and MattX will seamlessly migrate the worker processes across your network nodes. 
 
 ### 👯‍♂️ Thread Migration
 Historically, multi-threaded applications have been the "boogeyman" of Single System Image (SSI) clustering. Because threads share memory, file descriptors, and signal handlers, splitting them across a network introduces catastrophic latency and split-brain deadlocks. MattX solves this natively using a strict **Gang Migration** architecture.
@@ -133,17 +196,31 @@ MattX is designed to be "Zero-Config" via UDP Multicast auto-discovery, but it o
 
 ```ini
 # Network interface and UDP Multicast group for Zero-Config Auto-Discovery
-INTERFACE=eth0
+INTERFACE=enp1s0
 MULTICAST_GROUP=239.0.0.1
 PORT=7225
+# AUTODISCOVERY can be 'multicast' (default) or 'sweep' (for cloud VPCs)
+AUTODISCOVERY=multicast
+# Set to 0 to auto-generate Node ID from MAC address
+NODE_ID=0
+# configure the behavior of the cluster
+MIGRATE_NETWORK_IO=true     # Set to true to enable network I/O migration, false to disable
+MIGRATE_FILE_IO=true        # Set to true to enable file I/O migration, false to disable
+MATTXFS_ENABLED=true        # Set to true to enable MattXFS, false to disable
+DFSA_DIR=/mnt/shared        # Directory for Direct File System Access (DFSA) 
+MPI_SUPPORT=false           # Set to true to enable MPI support, false to disable
+ACCEPT_GUESTS=true          # Set to true to allow migrating processes to this node, false to disallow
+LOCAL_LIBS=true             # Set to true to use local libraries for migrated processes, false to use remote libraries
 
-# Feature Toggles (A/B Testing & Fallbacks)
-MIGRATE_NETWORK_IO=true     # Set to false to disable socket routing
-MIGRATE_FILE_IO=true        # Set to false to fallback to Kprobe File I/O
-MATTXFS_ENABLED=true        # Set to true to enable the MattXFS Namespace Illusion
+# Distributed Shared Memory (DSM) Cache Coherence Algorithm
+# 0 = Lazy Mode (Uncoherent, fast local caching, good for Read-Only)
+# 1 = Dirty Sweeper (Eventual Consistency, syncs every 50ms)
+# 2 = MESI Protocol (Hardware-grade strict consistency) [DEFAULT]
+# 3 = Emulation Route (Zero caching, strict consistency)
+DSM_MODE=2
 
-# Direct File System Access (DFSA)
-DFSA_DIR=/mnt/shared        # Directory to bypass network routing (e.g., shared NFS/SAN)
+# configure your default included processes to migrate for the cluster
+MATTX_INCLUDE="pvmchess-client,mpichess-client,migtest,migtest2,migtest3,dfsatest,epolltest"
 ```
 
 ---

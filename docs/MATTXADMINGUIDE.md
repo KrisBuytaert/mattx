@@ -45,27 +45,35 @@
     * [Edge-Cases: Gang Growers, Exorcists, and Futexes](#edge-cases-gang-growers-exorcists-and-futexes)
 
 
-7. [MattXFS](#mattxfs)
+7. [Distributed Shared Memory (DSM)](#distributed-shared-memory-dsm)
+    * [Introduction to MattX DSM](#1-introduction-to-mattx-dsm)
+    * [DSM Architecture](#2-dsm-architecture)
+    * [Cache Coherence Algorithms (DSM Modes)](#3-cache-coherence-algorithms-dsm-modes)
+    * [Administration & Monitoring](#4-administration--monitoring)
+    * [QA & Stress Testing](#5-qa--stress-testing)
+
+
+8. [MattXFS](#mattxfs)
     * [Completing the SSI Illusion - a cluster wide POSIX filesystem](#completing-the-ssi-illusion---a-cluster-wide-posix-filesystem)
     * ["Overlay cluster filesystem" on process level](#overlay-cluster-filesystem-on-process-level)
     * [The "bind mount root" magic](#the-bind-mount-root-magic)
     * [Remote VFS handler and functions](#remote-vfs-handler-and-functions)
     * ["Linux VFS" vs "kprobe/kretprobe" - MattX let you choose](#linux-vfs-vs-kprobekretprobe---mattx-let-you-choose)
     * [Using MattXFS for "loadbalancing data distribution"](#using-mattxfs-for-loadbalancing-data-distribution)
-8. [Loadbalancing](#loadbalancing)
+9. [Loadbalancing](#loadbalancing)
     * [Automatic migration vs manual migration](#automatic-migration-vs-manual-migration)
     * [Loadbalancing administration](#loadbalancing-administration)
-9. [Administration](#administration)
+10. [Administration](#administration)
     * [The MattX "/proc/mattx" interface](#the-mattx-procmattx-interface)
     * [MattX tools](#mattx-tools)
-10. [Monitoring](#monitoring)
+11. [Monitoring](#monitoring)
     * [3DMattX - a very much different MattX cluster visualization](#3dmattx---a-very-much-different-mattx-cluster-visualization)
     * [3D Wormhole Viewer - a realtime process migration visualization](#3d-wormhole-viewer---a-realtime-process-migration-visualization)
-11. [Configuration](#configuration)
+12. [Configuration](#configuration)
     * [Network- and File IO path optimization](#network--and-file-io-path-optimization)
-12. [Internal Function Documentation](#internal-function-documentation)
-13. [The VFS Wormhole -Syscall Routing Architecture](#the-vfs-wormhole)
-14. [FAQ](#faq)
+13. [Internal Function Documentation](#internal-function-documentation)
+14. [The VFS Wormhole -Syscall Routing Architecture](#the-vfs-wormhole)
+15. [FAQ](#faq)
 
 ---
 
@@ -498,6 +506,118 @@ Migrating threads back and forth across a cluster introduces severe edge cases r
 *   **The Gang Grower (Spawning Missing Threads):** If threads are created natively on the remote node, the remote node will have a larger Gang than the Home Node. During a Return Migration (Recall), the Home Node detects this deficit. MattX injects a TWA callback into the frozen Mother Deputy, forcing her to natively call `sys_clone` to birth the missing dummy threads *before* the incoming brains are injected.
 *   **The Ghost Exorcist (Cleaning Dead Threads):** If a thread dies naturally on the remote node, the Home Node will have *too many* frozen Deputy threads during a Recall. To prevent these leftover threads from waking up and corrupting memory, MattX deploys the "Ghost Exorcist"—a TWA callback that wipes their `futex` pointers and forces them to silently execute `sys_exit(0)`, vanishing without a trace.
 *   **The True Freeze:** To prevent the Linux scheduler's `SIGCONT` ricochet from accidentally waking up Deputy threads while the kernel is actively carving their memory map, MattX utilizes an ironclad "True Freeze" mechanism. The kernel explicitly waits for the CPU to confirm the `__TASK_STOPPED` state before a single byte of memory is modified.
+
+---
+
+## Distributed Shared Memory (DSM)
+
+### 1. Introduction to MattX DSM
+
+In a traditional Single System Image (SSI) cluster, migrating processes that share memory (via System V IPC `shmget`/`shmat`) presents a massive architectural challenge. If Worker A is on Node 1 and Worker B is on Node 2, how do they read and write to the exact same physical memory segment without corrupting the data or crashing the kernel?
+
+**Distributed Shared Memory (DSM)** is the solution. It creates the illusion that all nodes in the cluster share the same physical RAM. 
+*   **The Advantage:** Complex HPC applications, AI training workloads (like PyTorch `multiprocessing`), and database engines can be seamlessly migrated across the cluster without rewriting a single line of code.
+*   **The Challenge:** Network latency. Fetching memory over a TCP socket is inherently slower than reading local silicon. To mitigate this, MattX employs advanced Cache Coherence algorithms to ensure data is cached locally whenever possible, and only synced over the network when absolutely necessary.
+
+### 2. DSM Architecture
+
+The MattX DSM architecture is built on a strict "Home Node Ownership" model. The node where the shared memory is originally created (VM1) is the **Eternal Owner** of the physical RAM. All other nodes (VM2, VM3) act as caching clients.
+
+#### Local vs. Remote Workers
+*   **Local Workers (VM1):** Processes running on the Home Node access the real, physical shared memory segment natively. They run at 100% bare-metal speed. (In strict coherence modes, MattX uses "PTE Shootdowns" to temporarily revoke their access and force them to sync with remote nodes).
+*   **Remote Workers (VM2+):** When a process migrates to a remote node, MattX does *not* allocate real shared memory. Instead, it carves a **"Ghost VMA"**—a blank, anonymous memory hole (`MAP_SHARED | MAP_ANONYMOUS`) of the exact same size.
+
+#### The Tripwires & Kprobes
+Remote Ghost VMAs are rigged with custom kernel tripwires (`mattx_dsm_vm_ops`). 
+When a remote worker tries to read or write to the Ghost VMA, the CPU throws a Page Fault. The MattX `.fault` or `.pfn_mkwrite` handler catches the fault, freezes the thread, and fetches the required 4KB page over the TCP Wormhole from VM1.
+
+To maintain the illusion, MattX uses Kretprobes to intercept all System V IPC management syscalls on remote nodes:
+*   `shmget`, `shmat`, `shmdt`, `shmctl`
+*   Native VM1 faults are intercepted via `shmem_fault` and `shmem_page_mkwrite`.
+
+#### The Registries
+*   **The Guest Registry (VM2):** Translates local virtual addresses (inside the Ghost VMA) into global `shmid` coordinates so the remote node knows exactly what to ask VM1 for.
+*   **The Global Node-Local Directory (VM1):** A master directory on the Home Node that tracks the exact state (Invalid, Shared, Exclusive) of every 4KB page across the entire cluster.
+
+### 3. Cache Coherence Algorithms (DSM Modes)
+
+Because there is no "one size fits all" solution for distributed memory, MattX offers four distinct DSM algorithms. Administrators can tune the cluster based on the specific HPC workload.
+
+#### Mode 0: Lazy Mode (Uncoherent)
+*   **Best for:** Read-Only datasets (e.g., weather simulations where workers only read a massive shared matrix).
+*   **Behavior:** The remote node fetches the page on the first fault and caches it locally forever. Writes are kept local and are never synced back to VM1. Maximum performance, zero coherence.
+
+#### Mode 1: The Dirty Sweeper (Eventual Consistency)
+*   **Best for:** MPI consolidators or workloads that can tolerate slight delays in data visibility.
+*   **Behavior:** A background Kthread (`mattx_sweeper`) runs every 50ms. It scans all Ghost VMAs for dirty pages, fires a 1-Way Data Bomb to update VM1, and safely zaps the local pages using `madvise`. The next access triggers a new fault, fetching the freshest data.
+
+#### Mode 2: The MESI Protocol (Hardware-Grade Strict Consistency)
+*   **Best for:** Complex, write-heavy applications requiring absolute data integrity (The Industry Standard).
+*   **Behavior:** Implements a software-defined L3 Cache Directory. 
+    *   **Reads** are mapped Read-Only (`SHARED`). 
+    *   **Writes** trigger a Write-Protect fault. The node asks VM1 for an `EXCLUSIVE` lock. VM1 broadcasts `INVALIDATE` requests to all other nodes (destroying their cached copies) before granting the lock. The owner upgrades to Read-Write and runs at native speed.
+    *   If another node wants to read, VM1 forces the owner to `FLUSH` the dirty data back to the Home Node.
+    *   **The Funeral Flush:** If a process exits while holding an `EXCLUSIVE` lock, it proactively flushes the dirty data to VM1 before dying, preventing data loss.
+
+```text
++-------------------------------------------------------------------+
+|                  MATTX MESI STATE MACHINE (MODE 2)                |
++-------------------------------------------------------------------+
+|                                                                   |
+|  [VM2: Read Fault] -----> (Fetch Page) -----> State: SHARED (RO)  |
+|                                                                   |
+|  [VM2: Write Fault] ----> (Acquire Lock) ---> State: EXCL   (RW)  |
+|                             |                                     |
+|                             +-> VM1 sends INVALIDATE to VM3       |
+|                                                                   |
+|  [VM3: Read Fault] -----> (Contention!) ----> VM1 pauses VM3      |
+|                             |                                     |
+|                             +-> VM1 sends FLUSH to VM2            |
+|                             +-> VM2 sends dirty data to VM1       |
+|                             +-> VM2 downgrades to SHARED (RO)     |
+|                             +-> VM1 serves fresh page to VM3      |
++-------------------------------------------------------------------+
+```
+
+#### Mode 3: The Single-Step Route (God Mode)
+*   **Best for:** Extreme debugging and 100% strict instruction-level consistency.
+*   **Behavior:** MattX places a leash on the CPU using the hardware Trap Flag (`X86_EFLAGS_TF`). The CPU is allowed to execute exactly *one* assembly instruction (supporting complex AVX/SSE vector math natively). The CPU then throws a Debug Exception (`#DB`), which MattX catches via a Kernel Die Notifier. MattX instantly syncs the data to VM1 and zaps the page. 
+
+### 4. Administration & Monitoring
+
+#### Configuration
+The DSM algorithm can be configured globally via `/etc/mattx.conf`:
+```ini
+# Distributed Shared Memory (DSM) Cache Coherence Algorithm
+# 0 = Lazy Mode (Uncoherent, fast local caching)
+# 1 = Dirty Sweeper (Eventual Consistency)
+# 2 = MESI Protocol (Strict Consistency) [DEFAULT]
+# 3 = Single-Step Route (Zero caching, strict consistency)
+DSM_MODE=2
+```
+It can also be changed on-the-fly without rebooting the cluster:
+`echo "dsm_mode 2" > /proc/mattx/admin`
+
+#### The Matrix Monitor
+Administrators can view the real-time state of the Distributed Shared Memory across the cluster by reading the Matrix Monitor:
+`cat /proc/mattx/dsm`
+
+```text
+MattX Distributed Shared Memory (DSM) Matrix:
+---------------------------------------------------------------------------------------------------
+TYPE     PID    NODE  SHMID       ADDRESS             SIZE        STATE (P0)  HEX DUMP (16B)
+---------------------------------------------------------------------------------------------------
+[EXPORT] 1936   HOME  0           0x76dc76724000      4096        EXCL(P:1936) 4d 61 74 74 58 20 44...
+[IMPORT] 1752   945   0           0x76dc76724000      4096        INVALID      <NOT LOADED YET>
+```
+*Note: Reading the Matrix Monitor on an imported node will actively trigger a Page Fault to fetch the latest Hex Dump from the Home Node!*
+
+### 5. QA & Stress Testing
+
+The MattX project includes two dedicated user-space tools for validating DSM integrity:
+*   **`dsmstresstest <workers> <ops_per_loop> <delay>` (The Chaos Monkey):** Spawns multiple workers that randomly read and write to the same shared memory segment. Used to test cluster stability under extreme MESI contention and live ping-pong migrations.
+*   **`dsmstresstest-debug <workers>` (The Microscope):** Spawns workers that listen for manual commands via `/tmp/<pid>.cmd`. Allows administrators to manually step through the MESI state machine (e.g., `echo "write Hello" > /tmp/1234.cmd`) to observe network RPCs and Page Faults in real-time.
+
 
 ---
 

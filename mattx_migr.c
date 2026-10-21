@@ -69,7 +69,14 @@ mattx_sys_clone_fn real_sys_clone = NULL;
 mattx_sys_mremap_fn real_sys_mremap = NULL;
 mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task = NULL;
 mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task = NULL;
-
+mattx_sys_shmget_fn real_sys_shmget = NULL;
+mattx_sys_shmctl_fn real_sys_shmctl = NULL;
+mattx_sys_shmdt_fn real_sys_shmdt = NULL;
+mattx_sys_shmat_fn real_sys_shmat = NULL;
+mattx_x86_task_fpu_fn real_x86_task_fpu = NULL;
+mattx_zap_vma_ptes_fn real_zap_vma_ptes = NULL;
+mattx_vmf_insert_pfn_prot_fn real_vmf_insert_pfn_prot = NULL;
+mattx_unmap_mapping_range_fn real_unmap_mapping_range = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -81,7 +88,7 @@ static void mattx_resolve_hidden_symbols(void) {
     if (register_kprobe(&kp) == 0) {
         real_task_work_add = (mattx_task_work_add_fn)kp.addr;
         unregister_kprobe(&kp);
-        mattx_dbg("[MIGR] Hacker Magic: Resolved task_work_add at %p\n", real_task_work_add);
+        // mattx_dbg("[MIGR] Hacker Magic: Resolved task_work_add at %p\n", real_task_work_add);
     }
 
     // 2. epoll_create1
@@ -347,6 +354,70 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
     
+    // --- DSM RESOLVERS ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmget";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmget = (mattx_sys_shmget_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmctl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmctl = (mattx_sys_shmctl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmdt";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmdt = (mattx_sys_shmdt_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmat";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmat = (mattx_sys_shmat_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+    
+    // --- THE FPU GHOST RESOLVER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "x86_task_fpu";
+    if (register_kprobe(&kp) == 0) { 
+        real_x86_task_fpu = (mattx_x86_task_fpu_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+        // mattx_dbg("[MIGR] Hacker Magic: Resolved x86_task_fpu at %p\n", real_x86_task_fpu);
+    } else {
+        printk(KERN_ERR "MattX: FATAL - Could not resolve x86_task_fpu!\n");
+    }
+
+    // --- THE vMA PTE ZAPPER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "zap_vma_ptes";
+    if (register_kprobe(&kp) == 0) { 
+        real_zap_vma_ptes = (mattx_zap_vma_ptes_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // --- THE DSM MESI RESOLVER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "vmf_insert_pfn_prot";
+    if (register_kprobe(&kp) == 0) { 
+        real_vmf_insert_pfn_prot = (mattx_vmf_insert_pfn_prot_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // --- THE PTE SHOOTDOWN RESOLVER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "unmap_mapping_range";
+    if (register_kprobe(&kp) == 0) { 
+        real_unmap_mapping_range = (mattx_unmap_mapping_range_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
 
 }
 
@@ -430,6 +501,17 @@ void mattx_freeze_task_safely(struct task_struct *task) {
 EXPORT_SYMBOL(mattx_freeze_task_safely);
 
 
+/*
+ * An exited task (zombie, or PF_EXITING) has had its kernel stack freed:
+ * task->stack is NULL, so task_pt_regs(task) -- stack + THREAD_SIZE - sizeof(pt_regs) --
+ * is a read at 0x3f48 and oopses (mattx#37). Such a task has nothing left to migrate.
+ */
+static bool mattx_task_capturable(struct task_struct *task)
+{
+    return !(READ_ONCE(task->flags) & PF_EXITING) && !READ_ONCE(task->exit_state) &&
+           READ_ONCE(task->stack);
+}
+
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
@@ -442,6 +524,11 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 
     is_returning = false; 
 
+    if (!mattx_task_capturable(task)) {
+        printk(KERN_WARNING "MattX:[EXTRACT] PID %d (%s) has already exited, nothing to migrate.\n", task->pid, task->comm);
+        return;
+    }
+
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     
     // FIX: Use kvzalloc to prevent fragmentation failures!
@@ -453,8 +540,14 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     // Use the Jedi Master Pivot!
     mattx_freeze_task_safely(task);
 
+    // Snapshot OUR (SOURCE) CLOCK_MONOTONIC right at freeze time. See the
+    // comment on monotonic_at_freeze in mattx.h -- this is what lets the
+    // target node correct a stale absolute clock_nanosleep() deadline
+    // after Awakening.
+    req->monotonic_at_freeze = ktime_get_ns();
+
     req->orig_pid = task->pid;
-    
+
     // Pass the Home Node and Feature Flag to the Stub! ---
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
@@ -541,7 +634,19 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     } while (stable_scans < MATTX_REQUIRED_STABLE_SCANS && --stabilize_retries > 0);
 
     req->thread_count = t_count;
+    bool gone = false;
     for (int i = 0; i < t_count; i++) {
+        // A thread can still exit while we freeze/scan the gang; its stack (and so its
+        // pt_regs) is then gone. Give up on the whole capture if any thread has lost it:
+        // a blueprint without that thread is wrong. (The stack is freed only after the
+        // task has fully died, long after PF_EXITING is set, and the threads are frozen,
+        // so checking right before the copy is enough; put_task_stack() is not exported
+        // to modules, so the stack cannot be pinned.)
+        if (gone || !mattx_task_capturable(threads[i])) {
+            gone = true;
+            put_task_struct(threads[i]);
+            continue;
+        }
         req->threads[i].tid = threads[i]->pid;
         struct pt_regs *t_regs = task_pt_regs(threads[i]);
         if (t_regs) {
@@ -560,11 +665,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             // freeze earlier in this function), so its FPU context is
             // safely resident in memory, not live in hardware registers.
             req->threads[i].fpu_size = 0;
-            if (threads[i]->thread.fpu.fpstate) {
-                u32 fsize = threads[i]->thread.fpu.fpstate->size;
+            struct fpu *fpu = MATTX_TASK_FPU(threads[i]);
+            if (fpu && fpu->fpstate) {
+                u32 fsize = fpu->fpstate->size;
                 if (fsize > sizeof(req->threads[i].fpu_state))
                     fsize = sizeof(req->threads[i].fpu_state);
-                memcpy(req->threads[i].fpu_state, &threads[i]->thread.fpu.fpstate->regs, fsize);
+                memcpy(req->threads[i].fpu_state, &fpu->fpstate->regs, fsize);
                 req->threads[i].fpu_size = fsize;
             }
 
@@ -573,6 +679,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             }
         }
         put_task_struct(threads[i]);
+    }
+    if (gone) {
+        printk(KERN_WARNING "MattX:[EXTRACT] PID %d exited while it was being captured, migration aborted.\n", task->pid);
+        kvfree(req);
+        send_sig(SIGCONT, task, 0); // undo the SIGSTOP fallback of the drainer, if it was used
+        return;
     }
     mattx_dbg("[EXTRACT] Packed %d threads into the Gang Blueprint!\n", t_count);
 
@@ -594,6 +706,18 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             req->vmas[vma_count].vm_start = vma->vm_start;
             req->vmas[vma_count].vm_end = vma->vm_end;
             req->vmas[vma_count].vm_flags = vma->vm_flags;
+
+            // The DSM Detector ---
+            req->vmas[vma_count].is_shm = 0;
+            req->vmas[vma_count].shmid = 0;
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    req->vmas[vma_count].is_shm = 1;
+                    req->vmas[vma_count].shmid = (u32)vma->vm_file->f_inode->i_ino; // Use inode as unique ID!
+                    mattx_dbg("[EXTRACT] Found System V SHM Segment at 0x%lx (ID: %u)\n", vma->vm_start, req->vmas[vma_count].shmid);
+                }
+            }
+                        
             vma_count++;
         }
         mmap_read_unlock(mm);
@@ -613,8 +737,33 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
+        int send_ret;
         mattx_dbg("[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
-        mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
+        send_ret = mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
+        if (send_ret < 0) {
+            // mattx#17: the Mother and Gang were already frozen (SIGSTOP'd
+            // at the user-space boundary) above, in anticipation of a
+            // successful hand-off. If the send itself fails -- e.g.
+            // against a stale/dead link right after the target node
+            // restarted its mattx service -- there was previously NO
+            // recovery path anywhere in mattx_migr.c/mattx_comm.c, so the
+            // process stayed frozen (STAT=T) forever. Confirmed via kdump
+            // on the lab cluster: "MattX:[COMM] Network send failed!
+            // (ret: -32)" (EPIPE) logged here, immediately followed by
+            // total silence and a permanently stuck migtest. Thaw
+            // everyone back to running instead of abandoning them frozen.
+            printk(KERN_ERR "MattX:[MIGRATE] Blueprint send to Node %d failed (%d)! Aborting migration, waking PID %d (and %d gang thread(s)) back up.\n",
+                   target_node, send_ret, task->pid, t_count);
+            for (int i = 0; i < t_count; i++) {
+                send_sig(SIGCONT, threads[i], 0);
+            }
+        }
+    } else {
+        printk(KERN_ERR "MattX:[MIGRATE] Node %d has no active link! Aborting migration, waking PID %d (and %d gang thread(s)) back up.\n",
+               target_node, task->pid, t_count);
+        for (int i = 0; i < t_count; i++) {
+            send_sig(SIGCONT, threads[i], 0);
+        }
     }
     kvfree(req); // FIX: Use kvfree!
 }
@@ -649,6 +798,11 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 
     // Use the Jedi Master Pivot!
     mattx_freeze_task_safely(task);
+
+    // Snapshot OUR (SOURCE, i.e. the Remote node the Surrogate is
+    // returning FROM) CLOCK_MONOTONIC right at freeze time -- same
+    // reasoning as the forward-migration capture above.
+    req->monotonic_at_freeze = ktime_get_ns();
 
     req->orig_pid = orig_pid;
 
@@ -720,11 +874,12 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
             // Capture FPU/SSE/AVX state on return! See the forward-path
             // capture above for why this is needed.
             req->threads[i].fpu_size = 0;
-            if (threads[i]->thread.fpu.fpstate) {
-                u32 fsize = threads[i]->thread.fpu.fpstate->size;
+            struct fpu *fpu = MATTX_TASK_FPU(threads[i]);
+            if (fpu && fpu->fpstate) {
+                u32 fsize = fpu->fpstate->size;
                 if (fsize > sizeof(req->threads[i].fpu_state))
                     fsize = sizeof(req->threads[i].fpu_state);
-                memcpy(req->threads[i].fpu_state, &threads[i]->thread.fpu.fpstate->regs, fsize);
+                memcpy(req->threads[i].fpu_state, &fpu->fpstate->regs, fsize);
                 req->threads[i].fpu_size = fsize;
             }
         }
@@ -751,6 +906,18 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
             req->vmas[vma_count].vm_start = vma->vm_start;
             req->vmas[vma_count].vm_end = vma->vm_end;
             req->vmas[vma_count].vm_flags = vma->vm_flags;
+
+            // The DSM Detector ---
+            req->vmas[vma_count].is_shm = 0;
+            req->vmas[vma_count].shmid = 0;
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    req->vmas[vma_count].is_shm = 1;
+                    req->vmas[vma_count].shmid = (u32)vma->vm_file->f_inode->i_ino; // Use inode as unique ID!
+                    mattx_dbg("[EXTRACT] Found System V SHM Segment at 0x%lx (ID: %u)\n", vma->vm_start, req->vmas[vma_count].shmid);
+                }
+            }
+
             vma_count++;
         }
         mmap_read_unlock(mm);
@@ -770,10 +937,49 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
-            mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n", 
+            int send_ret;
+            mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n",
                     vma_count, actual_payload_size);
             mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
-            mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
+            send_ret = mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
+            if (send_ret < 0) {
+                // mattx#17: same discarded-return-value hazard as the
+                // forward-migration path in mattx_capture_and_send_state()
+                // above -- the Surrogate and Gang were already frozen
+                // above in anticipation of a successful hand-off home. On
+                // failure, thaw them back to running AND release the
+                // per-guest is_migrating lock taken above, so the wormhole
+                // (mattx_hooks.c / mattx_fileio.c RPC paths, which check
+                // is_migrating) doesn't treat this guest as permanently
+                // mid-migration.
+                printk(KERN_ERR "MattX:[MIGRATE] RETURN Blueprint send to Node %d failed (%d)! Aborting return migration, waking PID %d (and %d gang thread(s)) back up.\n",
+                       target_node, send_ret, task->pid, t_count);
+                for (int i = 0; i < t_count; i++) {
+                    send_sig(SIGCONT, threads[i], 0);
+                }
+                spin_lock(&guest_lock);
+                for (int i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == task->pid) {
+                        guest_registry[i].is_migrating = false;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+            }
+        } else {
+            printk(KERN_ERR "MattX:[MIGRATE] Node %d has no active link! Aborting return migration, waking PID %d (and %d gang thread(s)) back up.\n",
+                   target_node, task->pid, t_count);
+            for (int i = 0; i < t_count; i++) {
+                send_sig(SIGCONT, threads[i], 0);
+            }
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == task->pid) {
+                    guest_registry[i].is_migrating = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
         }
         kvfree(req); // FIX: Use kvfree!
 }
@@ -821,6 +1027,14 @@ void mattx_send_vma_data(void) {
         // relocated .rodata/GOT/PLT) are safe to assume unchanged.
         if (is_returning && !(vma_flags & (VM_WRITE | VM_EXEC))) {
             mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only, non-exec during Return)\n", i);
+            continue;
+        }
+        
+        // --- THE DSM HOLLOW FILTER ---
+        // If this is a forward migration and the VMA is Shared Memory, DO NOT send the pages!
+        // We want it to arrive on VM2 completely hollow so the Page Fault Tripwire catches it.
+        if (!is_returning && local_migration_req->vmas[i].is_shm) {
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (DSM Segment - Leaving Hollow for Tripwire)\n", i);
             continue;
         }
 
@@ -953,28 +1167,61 @@ int mattx_expel_guest(pid_t local_pid) {
 
     if (surrogate) {
         mattx_dbg("[EXPEL] Initiating forced return for Surrogate PID %d to Node %d...\n", local_pid, home_node);
-        
+
         // 3. Trigger the exact same return pipeline as a Recall!
         mattx_capture_and_return_state(surrogate, orig_pid, home_node);
         put_task_struct(surrogate);
 
         // 4. BLOCKING WAIT: Wait until the guest is fully removed from the registry
+        //
+        // Bounded by MATTX_EXPEL_DRAIN_TIMEOUT_MS: this used to be `while (1)`,
+        // which meant a guest that never dies (e.g. the #20 clock-skew wedge)
+        // would spin here forever. Since this runs synchronously under a
+        // /proc/mattx/admin write() issued from `systemctl stop` / the init
+        // script's drain loop, a wedged guest here wedged the whole stop path
+        // until systemd force-SIGKILLed it (mattx#23).
         mattx_dbg("[EXPEL] Waiting for migration of PID %d to complete...\n", local_pid);
-        while (1) {
-            found = false;
-            spin_lock(&guest_lock);
-            for (int i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == local_pid) {
-                    found = true;
-                    break;
+        {
+            unsigned long expire = jiffies + msecs_to_jiffies(MATTX_EXPEL_DRAIN_TIMEOUT_MS);
+            while (1) {
+                found = false;
+                spin_lock(&guest_lock);
+                for (int i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == local_pid) {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            spin_unlock(&guest_lock);
+                spin_unlock(&guest_lock);
 
-            if (!found) break; // It's gone! Migration complete!
-            
-            // Sleep for 100ms and check again. This safely blocks the /proc write!
-            msleep(100);
+                if (!found) break; // It's gone! Migration complete!
+
+                if (time_after(jiffies, expire)) {
+                    // Give up rather than hang the caller forever. Deliberately
+                    // DON'T force-remove the guest_registry entry or SIGKILL
+                    // anything further here: the Guest Watcher (mattx_sched.c)
+                    // keeps polling guest_registry on its own independent
+                    // BALANCER_INTERVAL_MS cadence regardless of what we do,
+                    // and it - not us - owns freeing guest_registry's DSM
+                    // page pointers/rpc buffers. Ripping the entry out from
+                    // under it here (or re-signalling a task we no longer hold
+                    // a reference to) risks a use-after-free/double-free race
+                    // against whatever the stuck Surrogate/Watcher is still
+                    // doing. Leaving the registry untouched lets the Watcher
+                    // finish the drain later if/when the stuck condition
+                    // clears, and lets the caller (the init script's cordon
+                    // loop, which ignores our return value) move on to the
+                    // next guest / continue shutdown instead of hanging.
+                    printk(KERN_WARNING "MattX: [EXPEL] Timed out after %dms waiting for "
+                           "PID %d (orig PID %u, home Node %d) to drain from the guest "
+                           "registry - giving up, guest state left as-is.\n",
+                           MATTX_EXPEL_DRAIN_TIMEOUT_MS, local_pid, orig_pid, home_node);
+                    return -ETIMEDOUT;
+                }
+
+                // Sleep for 100ms and check again. This safely blocks the /proc write!
+                msleep(100);
+            }
         }
         mattx_dbg("[EXPEL] Successfully expelled PID %d!\n", local_pid);
         return 0;

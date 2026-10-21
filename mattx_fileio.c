@@ -20,11 +20,49 @@
  *
  * Commercial licensing options are available upon request.
  */
- 
+
 #include "mattx.h"
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/namei.h> // For kern_path
+#include <linux/nsproxy.h>
+#include <linux/highmem.h> // Required for kmap_local_page
+#include <linux/pagemap.h> // Required for read_mapping_page
+
+#define MAX_VFS_RPC 64
+
+
+// --- VFS RPC Registry ---
+// This allows mattxfs.ko to sleep while waiting for network replies
+struct vfs_rpc_ctx {
+    u64 req_id;
+    wait_queue_head_t wq;
+    bool done;
+    int error;
+    struct kstat stat;
+    struct mattx_dirent *dirents;
+    u32 dirent_count;
+    u64 new_offset;
+
+    int remote_fd;
+    ssize_t bytes_rw;
+    void *data_buf;
+    loff_t ret_offset;
+
+    bool in_use;    
+};
+
+
+static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
+static DEFINE_SPINLOCK(vfs_rpc_lock);
+static u64 next_req_id = 1;
+
+
+// ============================================================================
+// THE GLOBAL NODE-LOCAL MESI DIRECTORY (VM1)
+// ============================================================================
+struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+DEFINE_SPINLOCK(mattx_dsm_lock);
 
 // --- THE HPC FAST-PATH HELPER ---
 bool is_hpc_local_lib(const char *path) {
@@ -35,6 +73,8 @@ bool is_hpc_local_lib(const char *path) {
     if (strncmp(path, "/usr/lib64/", 11) == 0) return true;
     if (strncmp(path, "/etc/ld.so.cache", 16) == 0) return true;
     if (strncmp(path, "/usr/share/locale/", 18) == 0) return true;
+    if (strncmp(path, "/proc/", 6) == 0) return true; // Localize /proc!
+    if (strncmp(path, "/sys/", 5) == 0) return true;  // Localize /sys!    
     return false;
 }
 EXPORT_SYMBOL(is_hpc_local_lib);
@@ -3561,31 +3601,1606 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 
 
 
+// ============================================================================
+// THE DSM TRIPWIRE (VM2 PAGE FAULT HANDLER)
+// ============================================================================
 
-// --- VFS RPC Registry ---
-// This allows mattxfs.ko to sleep while waiting for network replies
-#define MAX_VFS_RPC 64
-struct vfs_rpc_ctx {
-    u64 req_id;
-    wait_queue_head_t wq;
-    bool done;
-    int error;
-    struct kstat stat;
-    struct mattx_dirent *dirents;
-    u32 dirent_count;
-    u64 new_offset;
+static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
+    struct vm_area_struct *vma = vmf->vma;
+    unsigned long fault_addr = vmf->address & PAGE_MASK; // Align to 4KB boundary
+    int shmid = -1;
+    unsigned long offset = 0;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    bool found = false;
 
-    int remote_fd;
-    ssize_t bytes_rw;
-    void *data_buf;
-    loff_t ret_offset;
+    // 1. TRANSLATION: Find the mapping in the registry
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                unsigned long size = guest_registry[i].dsm_map[d].size;
+                
+                if (fault_addr >= base && fault_addr < base + size) {
+                    shmid = guest_registry[i].dsm_map[d].shmid;
+                    offset = fault_addr - base;
+                    home_node = guest_registry[i].home_node;
+                    orig_pid = guest_registry[i].orig_pid;
+                    found = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
 
-    bool in_use;    
+    if (!found || home_node == -1 || !cluster_map[home_node]) {
+        mattx_dbg("[DSM] SIGSEGV: Unmapped or disconnected DSM access at 0x%lx\n", fault_addr);
+        return VM_FAULT_SIGSEGV;
+    }
+
+
+    // 2. CONCURRENCY: Allocate a sterile RPC slot
+    unsigned long page_idx = offset / PAGE_SIZE;
+    int slot = -1;
+    u64 req_id = 0;
+    void *page_buf = kmalloc(4096, GFP_KERNEL);
+    if (!page_buf) return VM_FAULT_OOM;
+
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            vfs_rpc_registry[i].data_buf = page_buf;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) {
+        kfree(page_buf);
+        return VM_FAULT_SIGSEGV; 
+    }
+
+    // 3. THE REQUEST: Ask VM1 for the page
+    struct mattx_dsm_page_fault_req req = {
+        .req_id = req_id,
+        .orig_pid = orig_pid,
+        .shmid = shmid,
+        .offset = offset
+    };
+    
+    mattx_dbg("[DSM] Page Fault at 0x%lx (SHMID: %d, Offset: %lu). Fetching from Node %d...\n", fault_addr, shmid, offset, home_node);
+    mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_FAULT_REQ, &req, sizeof(req));
+
+    // 4. THE FREEZE: Sleep until the page arrives!
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    int err = vfs_rpc_registry[slot].error;
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    if (err != 0) {
+        kfree(page_buf);
+        return VM_FAULT_SIGSEGV;
+    }
+
+
+    // 5. THE INJECTION: Wire the PFN into the Surrogate's brain!
+    // disabled since defined before: unsigned long page_idx = offset / PAGE_SIZE;
+    void *kaddr = NULL;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    // Allocate the physical page if we haven't yet!
+                    if (!guest_registry[i].dsm_map[d].pages[page_idx]) {
+                        guest_registry[i].dsm_map[d].pages[page_idx] = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+                    }
+                    kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!kaddr) {
+        kfree(page_buf);
+        return VM_FAULT_OOM;
+    }
+
+    // Copy the payload into our persistent physical page
+    memcpy(kaddr, page_buf, 4096);
+
+
+    // Surgically insert the Page Frame Number (PFN) into the application's page tables!
+    unsigned long pfn = __pa(kaddr) >> PAGE_SHIFT;
+    vm_fault_t ret;
+
+    if (config_dsm_mode == 2 && real_vmf_insert_pfn_prot) {
+        // --- MODE 2: THE READ-ONLY TRAPDOOR ---
+        // We use vm_get_page_prot(VM_READ) to generate a strict Read-Only protection mask.
+        // Even if the VMA is RW, the CPU will throw a Write-Protect fault if the app tries to write!
+        pgprot_t ro_prot = vm_get_page_prot(VM_READ);
+        ret = real_vmf_insert_pfn_prot(vma, fault_addr, pfn, ro_prot);
+        
+        if (ret == VM_FAULT_NOPAGE) {
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                        if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                            guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_SHARED;
+                            mattx_dbg("[MESI_VM2] Injected Read-Only Trapdoor at 0x%lx. Local State: SHARED\n", fault_addr);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+        }
+    } else {
+        // Mode 1 or Mode 3: Standard RW injection
+        ret = vmf_insert_pfn(vma, fault_addr, pfn);
+    }
+
+
+
+    // 6. THE LEASH: If we're in DSM_MODE3, set the Trap Flag so we can catch the next instruction!
+    // ###################################################################################
+    if (config_dsm_mode == 3) {
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                guest_registry[i].dsm_step_pending = true;
+                // Check the kernel's fault flags to see if it was a WRITE!
+                guest_registry[i].dsm_step_is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
+                guest_registry[i].dsm_step_addr = fault_addr;
+                guest_registry[i].dsm_step_shmid = shmid;
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        // THE LEASH: Set the Trap Flag!
+        struct pt_regs *regs = task_pt_regs(current);
+        if (regs) regs->flags |= X86_EFLAGS_TF;
+        
+        mattx_dbg("[DSM_MODE3] Page injected at 0x%lx. Trap Flag SET. Awaiting #DB.\n", fault_addr);
+    }
+
+    // ###################################################################################
+
+
+    kfree(page_buf);
+
+    if (ret != VM_FAULT_NOPAGE) {
+        return ret;
+    }
+
+
+    // Mark the page as present so the Sweeper knows to clean it!
+    if (page_idx < MAX_DSM_PAGES) {
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                        set_bit(page_idx, guest_registry[i].dsm_map[d].present_pages);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+
+    mattx_dbg("[DSM] Illusion Complete! Page successfully injected at 0x%lx!\n", fault_addr);
+    return VM_FAULT_NOPAGE;
+}
+
+
+
+// ============================================================================
+// THE MESI WRITE-PROTECT TRAPDOOR (VM2)
+// ============================================================================
+static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
+    unsigned long fault_addr = vmf->address & PAGE_MASK;
+    int shmid = -1;
+    unsigned long offset = 0;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    bool found = false;
+
+    // 1. TRANSLATION: Find the mapping in the registry
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                unsigned long size = guest_registry[i].dsm_map[d].size;
+                
+                if (fault_addr >= base && fault_addr < base + size) {
+                    shmid = guest_registry[i].dsm_map[d].shmid;
+                    offset = fault_addr - base;
+                    home_node = guest_registry[i].home_node;
+                    orig_pid = guest_registry[i].orig_pid;
+                    found = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!found || home_node == -1 || !cluster_map[home_node]) {
+        return VM_FAULT_SIGBUS;
+    }
+
+    if (config_dsm_mode == 2) {
+        mattx_dbg("[MESI_VM2] Write-Protect Fault at 0x%lx. Requesting EXCLUSIVE lock...\n", fault_addr);
+        
+        // 2. CONCURRENCY: Allocate a sterile RPC slot
+        int slot = -1; u64 req_id = 0;
+        spin_lock(&vfs_rpc_lock);
+        for (int j = 0; j < MAX_VFS_RPC; j++) {
+            if (!vfs_rpc_registry[j].in_use) {
+                slot = j; vfs_rpc_registry[j].in_use = true;
+                req_id = next_req_id++; vfs_rpc_registry[j].req_id = req_id;
+                vfs_rpc_registry[j].done = false; init_waitqueue_head(&vfs_rpc_registry[j].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+        
+        if (slot == -1) return VM_FAULT_SIGBUS;
+
+        // 3. THE REQUEST: Ask VM1 for the EXCLUSIVE lock!
+        struct mattx_dsm_write_acquire_req acq_req = { 
+            .req_id = req_id, .orig_pid = orig_pid, .shmid = shmid, .offset = offset 
+        };
+        mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, &acq_req, sizeof(acq_req));
+        
+        // 4. THE FREEZE: Sleep until VM1 invalidates the other nodes!
+        int wait_ret = wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+        
+        int err = vfs_rpc_registry[slot].error;
+        spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+
+        // If we were interrupted by a signal (like migration SIGSTOP/SIGKILL), abort!
+        if (wait_ret == -ERESTARTSYS) {
+            mattx_dbg("[MESI_VM2] Write-Acquire interrupted by signal! Aborting upgrade.\n");
+            return VM_FAULT_RETRY; // Tell the kernel to retry the fault later!
+        }
+
+        if (err != 0) return VM_FAULT_SIGBUS;
+
+        // 5. THE UPGRADE: Mark local state as EXCLUSIVE
+        unsigned long page_idx = offset / PAGE_SIZE;
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                        guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_EXCLUSIVE;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        mattx_dbg("[MESI_VM2] Lock acquired! Kernel will now upgrade page at 0x%lx to EXCLUSIVE (RW).\n", fault_addr);
+    }
+
+    // Return 0 (Success) to tell the Linux kernel: "I handled the lock, you may now make the PTE writable!"
+    return 0; 
+}
+
+
+
+const struct vm_operations_struct mattx_dsm_vm_ops = {
+    .fault = mattx_dsm_fault,
+    .pfn_mkwrite = mattx_dsm_pfn_mkwrite, // <-- THE WRITE TRAPDOOR!
+};
+EXPORT_SYMBOL(mattx_dsm_vm_ops);
+
+
+
+
+
+// ============================================================================
+// DSM CONTROL PLANE (VM1 NATIVE EXECUTION)
+// ============================================================================
+
+// --- SHMGET KWORKER ---
+struct mattx_shmget_kworker_ctx { struct work_struct work; struct mattx_sys_shmget_req req; int target_node; };
+static void mattx_shmget_kworker(struct work_struct *work) {
+    struct mattx_shmget_kworker_ctx *ctx = container_of(work, struct mattx_shmget_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmget) {
+        // THE SILENT NINJA: Steal the IPC Namespace!
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+
+        regs.di = ctx->req.key; regs.si = ctx->req.size; regs.dx = ctx->req.shmflg;
+        ret = real_sys_shmget(&regs);
+
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmget_reply reply = { .orig_pid = ctx->req.orig_pid, .shmid = ret, .error = (ret < 0) ? ret : 0 };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMGET_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_shmget_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmget_req *req = payload; struct mattx_shmget_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmget_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- SHMCTL KWORKER ---
+struct mattx_shmctl_kworker_ctx { struct work_struct work; struct mattx_sys_shmctl_req req; int target_node; };
+static void mattx_shmctl_kworker(struct work_struct *work) {
+    struct mattx_shmctl_kworker_ctx *ctx = container_of(work, struct mattx_shmctl_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+    void *out_buf = kmalloc(128, GFP_KERNEL);
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmctl) {
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+        kthread_use_mm(deputy->mm);
+
+        unsigned long scratchpad = task_pt_regs(deputy)->sp - 8192;
+        regs.di = ctx->req.shmid; regs.si = ctx->req.cmd; regs.dx = scratchpad;
+        
+        ret = real_sys_shmctl(&regs);
+
+        if (ret == 0 && out_buf) {
+            if (copy_from_user(out_buf, (void __user *)scratchpad, 128)) {
+                mattx_dbg("[KWORKER] Warning: Failed to read shmid_ds from scratchpad!\n");
+                ret = -EFAULT; // Sabotage the return code so VM2 knows it failed!
+            }
+        }
+
+        kthread_unuse_mm(deputy->mm);
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmctl_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (ret == 0 && out_buf) memcpy(reply.data, out_buf, 128);
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMCTL_REPLY, &reply, sizeof(reply));
+    if (out_buf) kfree(out_buf);
+    kfree(ctx);
+}
+static void handle_sys_shmctl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmctl_req *req = payload; struct mattx_shmctl_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmctl_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- SHMDT KWORKER ---
+struct mattx_shmdt_kworker_ctx { struct work_struct work; struct mattx_sys_shmdt_req req; int target_node; };
+static void mattx_shmdt_kworker(struct work_struct *work) {
+    struct mattx_shmdt_kworker_ctx *ctx = container_of(work, struct mattx_shmdt_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmdt) {
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+        kthread_use_mm(deputy->mm);
+
+        regs.di = ctx->req.shmaddr;
+        ret = real_sys_shmdt(&regs);
+
+        kthread_unuse_mm(deputy->mm);
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmdt_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMDT_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_shmdt_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmdt_req *req = payload; struct mattx_shmdt_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmdt_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- VM2 REPLY HANDLERS ---
+static void handle_sys_shmget_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmget_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = (reply->error < 0) ? reply->error : reply->shmid;
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+static void handle_sys_shmctl_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmctl_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            if (reply->error == 0) {
+                guest_registry[i].rpc_read_buf = kmalloc(128, GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, reply->data, 128);
+            }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+static void handle_sys_shmdt_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmdt_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+// --- SHMAT KWORKER (VM1) ---
+struct mattx_shmat_kworker_ctx { struct work_struct work; struct mattx_sys_shmat_req req; int target_node; };
+static void mattx_shmat_kworker(struct work_struct *work) {
+    struct mattx_shmat_kworker_ctx *ctx = container_of(work, struct mattx_shmat_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    long ret = -ENOSYS; size_t shm_size = 0; struct task_struct *deputy = NULL;
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmat) {
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+        kthread_use_mm(deputy->mm);
+
+        regs.di = ctx->req.shmid; regs.si = ctx->req.shmaddr; regs.dx = ctx->req.shmflg;
+        ret = real_sys_shmat(&regs);
+
+        // Intelligence Gathering: Find the size of the newly attached segment!
+        if (ret >= 0 && deputy->mm) {
+            mmap_read_lock(deputy->mm);
+            struct vm_area_struct *vma = find_vma(deputy->mm, ret);
+            if (vma && vma->vm_start == ret) {
+                shm_size = vma->vm_end - vma->vm_start;
+                mattx_dbg("[KWORKER] Native shmat successful on VM1. Addr: 0x%lx, Size: %zu\n", ret, shm_size);
+            }
+            mmap_read_unlock(deputy->mm);
+        }
+
+        kthread_unuse_mm(deputy->mm);
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmat_reply reply = { .orig_pid = ctx->req.orig_pid, .ret_addr = (ret >= 0) ? ret : 0, .size = shm_size, .error = (ret < 0) ? ret : 0 };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMAT_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_shmat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmat_req *req = payload; struct mattx_shmat_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmat_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- VM2 REPLY HANDLER ---
+static void handle_sys_shmat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmat_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_lseek_res = reply->size; // Store the size here!
+            
+            // We need to pass the ret_addr back. Let's allocate a small buffer.
+            guest_registry[i].rpc_read_buf = kmalloc(sizeof(unsigned long), GFP_ATOMIC);
+            if (guest_registry[i].rpc_read_buf) {
+                memcpy(guest_registry[i].rpc_read_buf, &reply->ret_addr, sizeof(unsigned long));
+            }
+            
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+
+// --- DSM PAGE FAULT KWORKER (VM1) ---
+struct mattx_dsm_fault_kworker_ctx { struct work_struct work; struct mattx_dsm_page_fault_req req; int target_node; };
+
+static void mattx_dsm_fault_kworker(struct work_struct *work) {
+    struct mattx_dsm_fault_kworker_ctx *ctx = container_of(work, struct mattx_dsm_fault_kworker_ctx, work);
+    struct mattx_dsm_page_fault_reply *reply;
+    struct task_struct *deputy = NULL;
+    int ret = -EFAULT;
+    unsigned long target_addr = 0;
+
+    reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+    if (!reply) { kfree(ctx); return; }
+
+    reply->req_id = ctx->req.req_id;
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy && deputy->mm) {
+        // 1. THE HUNT: Grab the lock just long enough to find the address!
+        mmap_read_lock(deputy->mm);
+        struct vm_area_struct *vma;
+        VMA_ITERATOR(vmi, deputy->mm, 0);
+        for_each_vma(vmi, vma) {
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                        if (vma->vm_start + ctx->req.offset < vma->vm_end) {
+                            target_addr = vma->vm_start + ctx->req.offset;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
+
+        // 2. THE MESI SYNC & PUMP (Completely Lock-Free!)
+        if (target_addr != 0) {
+            unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+
+            // --- MESI FLUSH PIPELINE (MODE 2) ---
+            if (config_dsm_mode == 2) {
+                u32 owner_pid = 0;
+                int owner_node = -1;
+                int dir_idx = -1;
+                int e_idx = -1;
+
+                spin_lock(&export_lock);
+                for (int e = 0; e < export_count; e++) {
+                    if (export_registry[e].orig_pid == ctx->req.orig_pid) {
+                        e_idx = e;
+                        for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
+                            if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
+                                dir_idx = d;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&export_lock);
+
+                spin_lock(&mattx_dsm_lock);
+                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
+                            owner_pid = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&mattx_dsm_lock);
+                
+                if (owner_pid != 0 && owner_pid != ctx->req.orig_pid) {
+                    spin_lock(&export_lock);
+                    for (int e = 0; e < export_count; e++) {
+                        if (export_registry[e].orig_pid == owner_pid) {
+                            owner_node = export_registry[e].target_node;
+                            break;
+                        }
+                    }
+                    spin_unlock(&export_lock);
+                }
+
+                // If someone else owns it exclusively, we must FLUSH them first!
+                if (owner_pid != 0 && owner_pid != ctx->req.orig_pid && owner_node != -1 && cluster_map[owner_node]) {
+                    mattx_dbg("[MESI_VM1] Page %lu is EXCLUSIVE to PID %u (Node %d). Pausing fault to request FLUSH...\n", page_idx, owner_pid, owner_node);
+                    
+                    int slot = -1; u64 req_id = 0;
+                    void *flush_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+                    
+                    if (flush_buf) {
+                        spin_lock(&vfs_rpc_lock);
+                        for (int j = 0; j < MAX_VFS_RPC; j++) {
+                            if (!vfs_rpc_registry[j].in_use) {
+                                slot = j; vfs_rpc_registry[j].in_use = true;
+                                req_id = next_req_id++; vfs_rpc_registry[j].req_id = req_id;
+                                vfs_rpc_registry[j].done = false; vfs_rpc_registry[j].data_buf = flush_buf;
+                                init_waitqueue_head(&vfs_rpc_registry[j].wq);
+                                break;
+                            }
+                        }
+                        spin_unlock(&vfs_rpc_lock);
+
+                        if (slot != -1) {
+                            struct mattx_dsm_flush_req flush_req = {
+                                .req_id = req_id, .orig_pid = owner_pid, .shmid = ctx->req.shmid, .offset = ctx->req.offset
+                            };
+                            
+                            mattx_comm_send(cluster_map[owner_node], MATTX_MSG_DSM_FLUSH_REQ, &flush_req, sizeof(flush_req));
+                            wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+                            
+                            int flush_err = vfs_rpc_registry[slot].error;
+                            spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+
+                            if (flush_err == 0) {
+                                // Write directly to physical RAM bypassing the frozen process's page tables!
+                                mmap_read_lock(deputy->mm);
+                                VMA_ITERATOR(vmi2, deputy->mm, 0);
+                                struct vm_area_struct *vma2;
+                                for_each_vma(vmi2, vma2) {
+                                    if (vma2->vm_file && vma2->vm_file->f_path.dentry->d_name.name && strncmp(vma2->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                                        if (vma2->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                                            struct page *page = read_mapping_page(vma2->vm_file->f_mapping, ctx->req.offset / PAGE_SIZE, NULL);
+                                            if (!IS_ERR(page)) {
+                                                void *kaddr = kmap_local_page(page);
+                                                memcpy(kaddr, flush_buf, PAGE_SIZE);
+                                                kunmap_local(kaddr);
+                                                set_page_dirty(page); 
+                                                put_page(page);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                mmap_read_unlock(deputy->mm);
+                                mattx_dbg("[MESI_VM1] Successfully flushed dirty data from PID %u to physical RAM.\n", owner_pid);
+                            } else {
+                                mattx_dbg("[MESI_VM1] Flush failed (PID %u detached). Assuming RAM was updated via Funeral Flush.\n", owner_pid);
+                            }
+
+                            // Update Directory: Downgrade to SHARED
+                            spin_lock(&mattx_dsm_lock);
+                            for (int gd = 0; gd < MAX_DSM_SEGMENTS; gd++) {
+                                if (mattx_global_dsm_dir[gd].in_use && mattx_global_dsm_dir[gd].shmid == ctx->req.shmid) {
+                                    mattx_global_dsm_dir[gd].page_state[page_idx] = MATTX_PAGE_SHARED;
+                                    mattx_global_dsm_dir[gd].page_owner_pid[page_idx] = 0; 
+                                    memset(mattx_global_dsm_dir[gd].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                                    break;
+                                }
+                            }
+                            spin_unlock(&mattx_dsm_lock);
+                        }
+                        kfree(flush_buf);
+                    }
+                }
+            }
+            // ---------------------------------------
+
+            mattx_dbg("[DSM_PUMP] Found SYSV segment! Sucking 4096 bytes from physical addr 0x%lx...\n", target_addr); 
+            
+            // THE PUMP: Safely extract the data because we dropped the mmap_read_lock!
+            int bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
+            if (bytes == 4096) {
+                ret = 0;
+                mattx_dbg("[DSM_PUMP] Successfully extracted 4KB page. Sending to Node %d...\n", ctx->target_node); 
+
+                // --- MODE 2 MASTER DIRECTORY UPDATE ---
+                if (config_dsm_mode == 2) {
+                    spin_lock(&mattx_dsm_lock);
+                    int dir_idx = -1;
+                    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                            dir_idx = d; break;
+                        }
+                    }
+                    
+                    if (dir_idx == -1) {
+                        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                            if (!mattx_global_dsm_dir[d].in_use) {
+                                dir_idx = d;
+                                mattx_global_dsm_dir[d].in_use = true;
+                                mattx_global_dsm_dir[d].shmid = ctx->req.shmid;
+                                mattx_global_dsm_dir[d].home_pid = ctx->req.orig_pid;
+                                memset(mattx_global_dsm_dir[d].page_state, MATTX_PAGE_INVALID, sizeof(mattx_global_dsm_dir[d].page_state));
+                                memset(mattx_global_dsm_dir[d].page_owner_pid, 0, sizeof(mattx_global_dsm_dir[d].page_owner_pid));
+                                memset(mattx_global_dsm_dir[d].page_shared_mask, 0, sizeof(mattx_global_dsm_dir[d].page_shared_mask));
+                                mattx_dbg("[MESI_VM1] Dynamically registered SHMID %u in Global Directory at slot %d\n", ctx->req.shmid, d);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (dir_idx != -1) {
+                        if (mattx_global_dsm_dir[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
+                            mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
+                        }
+                        int n_idx = ctx->target_node / 64;
+                        int n_bit = ctx->target_node % 64;
+                        mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] |= (1ULL << n_bit);
+                        
+                        mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", page_idx, ctx->req.shmid, ctx->target_node);
+                    }
+                    spin_unlock(&mattx_dsm_lock);
+                }
+            } else {
+                mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); 
+            }
+        }
+        put_task_struct(deputy);
+    }
+
+    reply->error = ret;
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_PAGE_FAULT_REPLY, reply, sizeof(*reply));
+    }
+    kfree(reply);
+    kfree(ctx);
+}
+
+
+static void handle_dsm_page_fault_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_page_fault_req *req = payload;
+
+    mattx_dbg("[DSM_PUMP] Received PAGE_FAULT_REQ from Node %u for SHMID %u at Offset %lu\n", 
+              hdr->sender_id, req->shmid, req->offset);
+
+    struct mattx_dsm_fault_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_fault_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// --- DSM PAGE FAULT REPLY HANDLER (VM2) ---
+static void handle_dsm_page_fault_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_page_fault_reply *reply = payload;
+    
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+            vfs_rpc_registry[i].error = reply->error;
+            
+            // Copy the 4KB payload into the waiting buffer!
+            if (reply->error == 0 && vfs_rpc_registry[i].data_buf) {
+                memcpy(vfs_rpc_registry[i].data_buf, reply->data, 4096);
+            }
+            
+            vfs_rpc_registry[i].done = true;
+            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+}
+
+
+// ============================================================================
+// THE 1-WAY DATA BOMB (VM1 RECEIVER)
+// ============================================================================
+struct mattx_dsm_update_kworker_ctx { struct work_struct work; struct mattx_dsm_page_update_req req; };
+
+static void mattx_dsm_update_kworker(struct work_struct *work) {
+    struct mattx_dsm_update_kworker_ctx *ctx = container_of(work, struct mattx_dsm_update_kworker_ctx, work);
+    struct task_struct *deputy = NULL;
+    struct file *shm_file = NULL;
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy && deputy->mm) {
+        // 1. QUICK GRAB: Find the SYSV file and pin it!
+        mmap_read_lock(deputy->mm);
+        struct vm_area_struct *vma;
+        VMA_ITERATOR(vmi, deputy->mm, 0);
+        for_each_vma(vmi, vma) {
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                        unsigned long target_addr = vma->vm_start + ctx->req.offset;
+                        if (target_addr < vma->vm_end) {
+                            shm_file = vma->vm_file;
+                            get_file(shm_file); // Safely pin the file so it doesn't vanish!
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
+
+        // 2. HEAVY LIFTING: Write directly to physical RAM lock-free!
+        if (shm_file) {
+            // --- THE SAFE BOMB TRICK ---
+            // Use filemap_get_folio instead of read_mapping_page!
+            // read_mapping_page blocks if the page is locked (e.g., during IPC_RMID destruction).
+            // filemap_get_folio is a non-blocking lookup. If the memory is being destroyed,
+            // it just returns an error and we safely drop the bomb!
+            struct folio *folio = filemap_get_folio(shm_file->f_mapping, ctx->req.offset / PAGE_SIZE);
+            
+            if (!IS_ERR(folio)) {
+                struct page *page = folio_page(folio, 0);
+                void *kaddr = kmap_local_page(page);
+                memcpy(kaddr, ctx->req.data, PAGE_SIZE);
+                kunmap_local(kaddr);
+                
+                folio_mark_dirty(folio); // Tell the kernel we modified it!
+                folio_put(folio);        // Release our reference
+                
+                mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
+            } else {
+                mattx_dbg("[DSM_SYNC] SHM segment is gone or locked. Dropping Data Bomb safely.\n");
+            }
+            // ---------------------------------------
+            
+            fput(shm_file); // Release the file
+
+            // --- THE FUNERAL DIRECTORY CLEANUP ---
+            if (config_dsm_mode == 2) {
+                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                spin_lock(&mattx_dsm_lock);
+                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                        // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
+                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
+                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] == ctx->req.orig_pid) {
+                            
+                            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_SHARED;
+                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = 0;
+                            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                            mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&mattx_dsm_lock);
+            }
+            // ------------------------------------------
+        }
+
+        put_task_struct(deputy);
+    }
+    kfree(ctx);
+}
+
+
+static void handle_dsm_page_update(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_page_update_req *req = payload;
+    struct mattx_dsm_update_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_update_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// ============================================================================
+// THE DIRTY SWEEPER THREAD (VM2 & VM1)
+// ============================================================================
+int mattx_dsm_sweeper_loop(void *data) {
+    mattx_dbg(" [DSM] Dirty Sweeper thread started\n");
+
+    while (!kthread_should_stop()) {
+        
+        if (config_dsm_mode == 1) {
+            // --- PHASE 1: THE GUEST SWEEPER (VM2 - MODE 1 ONLY) ---
+            struct mattx_dsm_mapping *local_dsm = kmalloc_array(16, sizeof(struct mattx_dsm_mapping), GFP_KERNEL);
+            if (local_dsm) {
+                for (int i = 0; i < MAX_GUESTS; i++) {
+                    pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1; int dsm_count = 0;
+
+                    spin_lock(&guest_lock);
+                    if (i < guest_count && guest_registry[i].dsm_count > 0) {
+                        local_pid = guest_registry[i].local_pid; orig_pid = guest_registry[i].orig_pid;
+                        home_node = guest_registry[i].home_node; dsm_count = guest_registry[i].dsm_count;
+                        memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
+                        
+                        for (int d = 0; d < dsm_count; d++) {
+                            memset(guest_registry[i].dsm_map[d].present_pages, 0, sizeof(guest_registry[i].dsm_map[d].present_pages));
+                        }
+                    }
+                    spin_unlock(&guest_lock);
+
+                    if (local_pid != -1) {
+                        struct task_struct *surrogate = NULL;
+                        rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
+
+                        if (surrogate && surrogate->mm) {
+                            for (int d = 0; d < dsm_count; d++) {
+                                unsigned long base = local_dsm[d].base_addr;
+                                unsigned long size = local_dsm[d].size;
+                                u32 shmid = local_dsm[d].shmid;
+
+                                // 1. Sync present pages (The Data Bomb)
+                                for (int bit = 0; bit < MAX_DSM_PAGES; bit++) {
+                                    if (test_bit(bit, local_dsm[d].present_pages)) {
+                                        unsigned long offset = bit * PAGE_SIZE;
+                                        if (offset >= size) continue;
+
+                                        void *kaddr = local_dsm[d].pages[bit];
+                                        if (kaddr) {
+                                            size_t req_size = sizeof(struct mattx_dsm_page_update_req);
+                                            struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
+                                            if (req) {
+                                                req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
+                                                memcpy(req->data, kaddr, PAGE_SIZE); 
+                                                if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
+                                                kfree(req);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 2. The Zap! (Burn it all down SAFELY)
+                                if (real_zap_vma_ptes) {
+                                    mmap_read_lock(surrogate->mm);
+                                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                                    if (vma && vma->vm_start <= base) {
+                                        real_zap_vma_ptes(vma, base, size);
+                                        mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
+                                    }
+                                    mmap_read_unlock(surrogate->mm);
+                                }
+                            }
+                            put_task_struct(surrogate);
+                        }
+                    }
+                }
+                kfree(local_dsm); 
+            }
+            
+        } else if (config_dsm_mode == 2) {
+            // --- PHASE 2: THE NATIVE SWEEPER (VM1 - MODE 2 ONLY) ---
+            struct { u32 shmid; u32 home_pid; unsigned long offset; } to_shoot[16];
+            int shoot_count = 0;
+
+            spin_lock(&mattx_dsm_lock);
+            for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                if (mattx_global_dsm_dir[d].in_use) {
+                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                        // If it's SHARED, remote nodes have copies. We must shoot down native PTEs
+                        // to force a fault and catch potential silent native writes!
+                        if (mattx_global_dsm_dir[d].page_state[p] == MATTX_PAGE_SHARED) {
+                            if (shoot_count < 16) {
+                                to_shoot[shoot_count].shmid = mattx_global_dsm_dir[d].shmid;
+                                to_shoot[shoot_count].home_pid = mattx_global_dsm_dir[d].home_pid;
+                                to_shoot[shoot_count].offset = p * PAGE_SIZE;
+                                shoot_count++;
+                            }
+                        }
+                    }
+                }
+            }
+            spin_unlock(&mattx_dsm_lock);
+
+            for (int s = 0; s < shoot_count; s++) {
+                if (real_unmap_mapping_range) {
+                    struct task_struct *deputy = NULL;
+                    rcu_read_lock();
+                    deputy = pid_task(find_vpid(to_shoot[s].home_pid), PIDTYPE_PID);
+                    if (deputy) get_task_struct(deputy);
+                    rcu_read_unlock();
+
+                    if (deputy) {
+                        // --- THE ZOMBIE SHIELD ---
+                        // Never touch a dying process! It is already tearing down its mm_struct
+                        // and holding the mmap_write_lock. If we try to read_lock it, we deadlock!
+                        if (deputy->mm && !(deputy->flags & PF_EXITING)) {
+                            mmap_read_lock(deputy->mm);
+                            struct vm_area_struct *vma;
+                            VMA_ITERATOR(vmi, deputy->mm, 0);
+                            for_each_vma(vmi, vma) {
+                                if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                                    if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                                        if (vma->vm_file->f_inode->i_ino == to_shoot[s].shmid) {
+                                            real_unmap_mapping_range(vma->vm_file->f_mapping, to_shoot[s].offset, PAGE_SIZE, 1);
+                                            mattx_dbg("[MESI_VM1] Native Sweeper: Shot down PTE for SHMID %u Offset %lu to catch writes.\n", to_shoot[s].shmid, to_shoot[s].offset);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            mmap_read_unlock(deputy->mm);
+                        }
+                        put_task_struct(deputy);
+                    }
+                }
+            }
+
+        }
+        
+        // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
+        msleep(50); 
+    }
+    return 0;
+}
+
+
+
+// ============================================================================
+// MODE 3: THE CLEANUP CALLBACK (SYNC & ZAP)
+// ============================================================================
+struct mattx_dsm_cleanup_ctx {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    u32 shmid;
+    unsigned long fault_addr;
+    bool is_write;
 };
 
-static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
-static DEFINE_SPINLOCK(vfs_rpc_lock);
-static u64 next_req_id = 1;
+static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
+    struct mattx_dsm_cleanup_ctx *ctx = container_of(cb, struct mattx_dsm_cleanup_ctx, cb);
+    
+    // 1. THE SYNC (If it was a WRITE)
+    if (ctx->is_write) {
+        void *kaddr = NULL;
+        unsigned long offset = 0;
+        
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                    unsigned long size = guest_registry[i].dsm_map[d].size;
+                    if (ctx->fault_addr >= base && ctx->fault_addr < base + size) {
+                        offset = ctx->fault_addr - base;
+                        unsigned long page_idx = offset / PAGE_SIZE;
+                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (kaddr) {
+            size_t req_size = sizeof(struct mattx_dsm_page_update_req);
+            struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
+            if (req) {
+                req->orig_pid = ctx->orig_pid;
+                req->shmid = ctx->shmid;
+                req->offset = offset;
+                // Read the updated data directly from our physical page pool!
+                memcpy(req->data, kaddr, PAGE_SIZE);
+                
+                if (cluster_map[ctx->home_node]) {
+                    mattx_comm_send(cluster_map[ctx->home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
+                }
+                kfree(req);
+                mattx_dbg("[DSM_MODE3] Synced dirty page at 0x%lx to VM1.\n", ctx->fault_addr);
+            }
+        }
+    }
+
+    // 2. THE ZAP (Burn it down!)
+    if (real_zap_vma_ptes && current->mm) {
+        mmap_read_lock(current->mm);
+        struct vm_area_struct *vma = find_vma(current->mm, ctx->fault_addr);
+        if (vma && vma->vm_start <= ctx->fault_addr) {
+            real_zap_vma_ptes(vma, ctx->fault_addr, PAGE_SIZE);
+            mattx_dbg("[DSM_MODE3] Zapped page at 0x%lx. Ready for next fault.\n", ctx->fault_addr);
+        }
+        mmap_read_unlock(current->mm);
+    }
+    kfree(ctx);
+}
+
+void mattx_inject_dsm_cleanup(u32 orig_pid, int home_node, u32 shmid, unsigned long fault_addr, bool is_write) {
+    struct mattx_dsm_cleanup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        ctx->orig_pid = orig_pid;
+        ctx->home_node = home_node;
+        ctx->shmid = shmid;
+        ctx->fault_addr = fault_addr;
+        ctx->is_write = is_write;
+        init_task_work(&ctx->cb, mattx_dsm_cleanup_cb);
+        
+        if (real_task_work_add) {
+            real_task_work_add(current, &ctx->cb, TWA_RESUME);
+        } else {
+            kfree(ctx);
+        }
+    }
+}
+EXPORT_SYMBOL(mattx_inject_dsm_cleanup);
+
+
+
+
+// ============================================================================
+// MESI PROTOCOL: WRITE ACQUIRE & INVALIDATE (MODE 2)
+// ============================================================================
+
+// --- VM1: WRITE ACQUIRE KWORKER ---
+struct mattx_dsm_write_acquire_kworker_ctx { struct work_struct work; struct mattx_dsm_write_acquire_req req; int target_node; };
+
+static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
+    struct mattx_dsm_write_acquire_kworker_ctx *ctx = container_of(work, struct mattx_dsm_write_acquire_kworker_ctx, work);
+    struct mattx_dsm_write_acquire_reply reply = { .req_id = ctx->req.req_id, .error = 0 };
+    
+    u64 local_shared_mask[MAX_NODES / 64];
+    memset(local_shared_mask, 0, sizeof(local_shared_mask));
+    bool found = false;
+
+    // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
+    spin_lock(&mattx_dsm_lock);
+    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+            unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+
+            // 1. Copy the mask locally!
+            memcpy(local_shared_mask, mattx_global_dsm_dir[d].page_shared_mask[page_idx], sizeof(local_shared_mask));
+            
+            // 2. Update Directory to EXCLUSIVE immediately
+            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = ctx->req.orig_pid;
+            
+            // Clear the global mask
+            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(local_shared_mask));
+            
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_dsm_lock); // DROP THE LOCK!
+    
+    // --- THE HEAVY LIFTING (LOCK-FREE) ---
+    if (found) {
+        mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
+
+        // 1. Send Invalidates to EVERYONE in the local mask!
+        for (int node = 0; node < MAX_NODES; node++) {
+            int n_idx = node / 64;
+            int n_bit = node % 64;
+            
+            if (local_shared_mask[n_idx] & (1ULL << n_bit)) {
+                if (cluster_map[node]) {
+                    struct mattx_dsm_invalidate_req inv_req = {
+                        .req_id = 0, .orig_pid = ctx->req.orig_pid,
+                        .shmid = ctx->req.shmid, .offset = ctx->req.offset
+                    };
+                    mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
+                    mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
+                }
+            }
+        }
+        
+        // 2. THE PTE SHOOTDOWN (VM1)
+        if (real_unmap_mapping_range) {
+            struct task_struct *deputy = NULL;
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+            
+            if (deputy && deputy->mm) {
+                mmap_read_lock(deputy->mm); // Safe to sleep here now!
+                struct vm_area_struct *vma;
+                VMA_ITERATOR(vmi, deputy->mm, 0);
+                for_each_vma(vmi, vma) {
+                    if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                        if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                            if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                                real_unmap_mapping_range(vma->vm_file->f_mapping, ctx->req.offset, PAGE_SIZE, 1);
+                                mattx_dbg("[MESI_VM1] Shot down native PTEs for SHMID %u Offset %lu\n", ctx->req.shmid, ctx->req.offset);
+                                break;
+                            }
+                        }
+                    }
+                }
+                mmap_read_unlock(deputy->mm);
+                put_task_struct(deputy);
+            }
+        }
+    }
+    
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
+}
+
+
+static void handle_dsm_write_acquire_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_write_acquire_req *req = payload;
+    struct mattx_dsm_write_acquire_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_write_acquire_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+// --- VM3: INVALIDATE KWORKER ---
+struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_dsm_invalidate_req req; int target_node; };
+
+static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
+    struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        // THE FIX: Skip the process that is currently acquiring the EXCLUSIVE lock!
+        if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
+            continue; 
+        }
+
+        // We must check ALL OTHER guests on this node for the SHMID!
+        for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+            if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+                unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                unsigned long fault_addr = base + ctx->req.offset;
+                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                
+                // 1. Update local state to INVALID
+                guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
+                
+                // 2. Zap the PTE!
+                struct task_struct *surrogate = NULL;
+                rcu_read_lock();
+                surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                if (surrogate) get_task_struct(surrogate);
+                rcu_read_unlock();
+                
+                if (surrogate && surrogate->mm && real_zap_vma_ptes) {
+                    mmap_read_lock(surrogate->mm);
+                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                    if (vma && vma->vm_start <= base) {
+                        real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
+                        mattx_dbg("[MESI_VM2] Zapped invalidated page at 0x%lx for PID %d\n", fault_addr, surrogate->pid);
+                    }
+                    mmap_read_unlock(surrogate->mm);
+                    put_task_struct(surrogate);
+                }
+            }
+        }
+    }
+    spin_unlock(&guest_lock);
+    kfree(ctx);
+}
+
+static void handle_dsm_invalidate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_invalidate_req *req = payload;
+    struct mattx_dsm_invalidate_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_invalidate_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// --- VM2: WRITE ACQUIRE REPLY HANDLER ---
+static void handle_dsm_write_acquire_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_write_acquire_reply *reply = payload;
+    
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+            vfs_rpc_registry[i].error = reply->error;
+            vfs_rpc_registry[i].done = true;
+            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+}
+
+
+// MESI --- VM2: FLUSH KWORKER ---
+struct mattx_dsm_flush_kworker_ctx { struct work_struct work; struct mattx_dsm_flush_req req; int target_node; };
+
+static void mattx_dsm_flush_kworker(struct work_struct *work) {
+    struct mattx_dsm_flush_kworker_ctx *ctx = container_of(work, struct mattx_dsm_flush_kworker_ctx, work);
+    struct mattx_dsm_flush_reply *reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+    
+    if (!reply) { kfree(ctx); return; }
+    reply->req_id = ctx->req.req_id;
+    reply->error = -ENOENT;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+                    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                    unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                    unsigned long fault_addr = base + ctx->req.offset;
+                    void *kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+
+                    if (kaddr && guest_registry[i].dsm_map[d].page_states[page_idx] == MATTX_PAGE_EXCLUSIVE) {
+                        // 1. Copy the dirty data into the reply!
+                        memcpy(reply->data, kaddr, PAGE_SIZE);
+                        reply->error = 0;
+
+                        // 2. Downgrade local state to INVALID
+                        guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
+
+                        // 3. Zap the PTE!
+                        struct task_struct *surrogate = NULL;
+                        rcu_read_lock();
+                        surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                        if (surrogate) get_task_struct(surrogate);
+                        rcu_read_unlock();
+
+                        if (surrogate && surrogate->mm && real_zap_vma_ptes) {
+                            mmap_read_lock(surrogate->mm);
+                            struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                            if (vma && vma->vm_start <= base) {
+                                real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
+                                mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", fault_addr);
+                            }
+                            mmap_read_unlock(surrogate->mm);
+                            put_task_struct(surrogate);
+                        }
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_FLUSH_REPLY, reply, sizeof(*reply));
+    }
+    kfree(reply);
+    kfree(ctx);
+}
+
+static void handle_dsm_flush_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_flush_req *req = payload;
+    struct mattx_dsm_flush_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_flush_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// MESI --- VM1: FLUSH REPLY HANDLER ---
+static void handle_dsm_flush_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_flush_reply *reply = payload;
+    
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+            vfs_rpc_registry[i].error = reply->error;
+            if (reply->error == 0 && vfs_rpc_registry[i].data_buf) {
+                memcpy(vfs_rpc_registry[i].data_buf, reply->data, PAGE_SIZE);
+            }
+            vfs_rpc_registry[i].done = true;
+            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+}
+
+
+
+// ============================================================================
+// THE NATIVE HOME NODE SYNC KWORKER (VM1)
+// ============================================================================
+struct mattx_vm1_sync_work {
+    struct work_struct work;
+    pid_t local_pid;
+    u32 shmid;
+    unsigned long offset;
+    bool is_write;
+};
+
+static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
+    struct mattx_vm1_sync_work *rpc = container_of(work, struct mattx_vm1_sync_work, work);
+    u32 shmid = rpc->shmid;
+    unsigned long offset = rpc->offset;
+    bool is_write = rpc->is_write;
+    unsigned long page_idx = offset / PAGE_SIZE;
+    
+    u32 owner_pid = 0;
+    int owner_node = -1;
+    int dir_idx = -1;
+    
+    spin_lock(&mattx_dsm_lock);
+    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+            dir_idx = d;
+            if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
+                owner_pid = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
+            }
+            break;
+        }
+    }
+    spin_unlock(&mattx_dsm_lock);
+
+    // 1. FLUSH IF EXCLUSIVE
+    if (owner_pid != 0) {
+        spin_lock(&export_lock);
+        for (int e = 0; e < export_count; e++) {
+            if (export_registry[e].orig_pid == owner_pid) {
+                owner_node = export_registry[e].target_node;
+                break;
+            }
+        }
+        spin_unlock(&export_lock);
+
+        if (owner_node != -1 && cluster_map[owner_node]) {
+            mattx_dbg("[MESI_VM1] Native Fault: Page %lu is EXCLUSIVE to PID %u. Requesting FLUSH...\n", page_idx, owner_pid);
+            
+            int slot = -1; u64 req_id = 0;
+            void *flush_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+            if (flush_buf) {
+                spin_lock(&vfs_rpc_lock);
+                for (int j = 0; j < MAX_VFS_RPC; j++) {
+                    if (!vfs_rpc_registry[j].in_use) {
+                        slot = j; vfs_rpc_registry[j].in_use = true;
+                        req_id = next_req_id++; vfs_rpc_registry[j].req_id = req_id;
+                        vfs_rpc_registry[j].done = false; vfs_rpc_registry[j].data_buf = flush_buf;
+                        init_waitqueue_head(&vfs_rpc_registry[j].wq);
+                        break;
+                    }
+                }
+                spin_unlock(&vfs_rpc_lock);
+
+                if (slot != -1) {
+                    struct mattx_dsm_flush_req flush_req = {
+                        .req_id = req_id, .orig_pid = owner_pid, .shmid = shmid, .offset = offset
+                    };
+                    mattx_comm_send(cluster_map[owner_node], MATTX_MSG_DSM_FLUSH_REQ, &flush_req, sizeof(flush_req));
+                    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+                    
+                    int flush_err = vfs_rpc_registry[slot].error;
+                    spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+
+                    if (flush_err == 0) {
+                        // Write directly to physical RAM bypassing the frozen process's page tables!
+                        struct task_struct *deputy = NULL;
+                        rcu_read_lock(); deputy = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+                        if (deputy) {
+                            mmap_read_lock(deputy->mm);
+                            struct vm_area_struct *vma; VMA_ITERATOR(vmi, deputy->mm, 0);
+                            for_each_vma(vmi, vma) {
+                                if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name && strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                                    if (vma->vm_file->f_inode->i_ino == shmid) {
+                                        
+                                        // --- THE DIRECT PHYSICAL WRITE TRICK ---
+                                        // Grab the physical page directly from the kernel's page cache!
+                                        struct page *page = read_mapping_page(vma->vm_file->f_mapping, offset / PAGE_SIZE, NULL);
+                                        if (!IS_ERR(page)) {
+                                            void *kaddr = kmap_local_page(page);
+                                            memcpy(kaddr, flush_buf, PAGE_SIZE);
+                                            kunmap_local(kaddr);
+                                            set_page_dirty(page); // Tell the kernel we modified it!
+                                            put_page(page);
+                                        } else {
+                                            mattx_dbg("[MESI_VM1] ERROR: Failed to read shmem physical page!\n");
+                                        }
+                                        // ---------------------------------------
+                                        
+                                        break;
+                                    }
+                                }
+                            }
+                            mmap_read_unlock(deputy->mm);
+                            put_task_struct(deputy);
+                        }
+                        mattx_dbg("[MESI_VM1] Native Fault: Successfully flushed dirty data from PID %u.\n", owner_pid);
+                    }
+
+                    spin_lock(&mattx_dsm_lock);
+                    if (dir_idx != -1) {
+                        mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
+                        mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0;
+                        memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                    }
+                    spin_unlock(&mattx_dsm_lock);
+                }
+                kfree(flush_buf);
+            }
+        }
+    }
+
+    // 2. INVALIDATE IF WRITE
+    if (is_write && dir_idx != -1) {
+        spin_lock(&mattx_dsm_lock);
+        for (int node = 0; node < MAX_NODES; node++) {
+            int n_idx = node / 64; int n_bit = node % 64;
+            if (mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
+                if (cluster_map[node]) {
+                    struct mattx_dsm_invalidate_req inv_req = {
+                        .req_id = 0, .orig_pid = 0, .shmid = shmid, .offset = offset
+                    };
+                    mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
+                    mattx_dbg("[MESI_VM1] Native Fault: Sent INVALIDATE to Node %d\n", node);
+                }
+            }
+        }
+        mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+        mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0; // 0 means VM1 owns it!
+        memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+        spin_unlock(&mattx_dsm_lock);
+    }
+
+    // Wake up the native process to retry the fault!
+    struct task_struct *native_task = NULL;
+    rcu_read_lock(); native_task = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (native_task) get_task_struct(native_task); rcu_read_unlock();
+    if (native_task) {
+        mattx_dbg("[MESI_VM1] Native Fault resolved. Waking PID %d to retry.\n", rpc->local_pid);
+        send_sig(SIGCONT, native_task, 0);
+        put_task_struct(native_task);
+    }
+    
+    kfree(rpc);
+}
+
+void mattx_schedule_vm1_sync(pid_t pid, u32 shmid, unsigned long offset, bool is_write) {
+    struct mattx_vm1_sync_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
+    if (rpc) {
+        INIT_WORK(&rpc->work, mattx_vm1_shm_sync_kworker);
+        rpc->local_pid = pid;
+        rpc->shmid = shmid;
+        rpc->offset = offset;
+        rpc->is_write = is_write;
+        schedule_work(&rpc->work);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+// ###############################################################################
+// MattxFS VFS RPC (VM2)
+// ###############################################################################
+
 
 // This context helps us catch the filenames as the kernel reads the local disk
 struct mattx_readdir_ctx {
@@ -4829,8 +6444,22 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_GETDENTS64_REPLY, handle_sys_getdents64_reply);
     mattx_register_handler(MATTX_MSG_SYS_PIPE2_REQ, handle_sys_pipe2_req);
     mattx_register_handler(MATTX_MSG_SYS_PIPE2_REPLY, handle_sys_pipe2_reply);
-
-
+    mattx_register_handler(MATTX_MSG_SYS_SHMGET_REQ, handle_sys_shmget_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMGET_REPLY, handle_sys_shmget_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SHMCTL_REQ, handle_sys_shmctl_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMCTL_REPLY, handle_sys_shmctl_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SHMDT_REQ, handle_sys_shmdt_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMDT_REPLY, handle_sys_shmdt_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SHMAT_REQ, handle_sys_shmat_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMAT_REPLY, handle_sys_shmat_reply);
+    mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REQ, handle_dsm_page_fault_req);
+    mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REPLY, handle_dsm_page_fault_reply);
+    mattx_register_handler(MATTX_MSG_DSM_PAGE_UPDATE, handle_dsm_page_update);
+    mattx_register_handler(MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, handle_dsm_write_acquire_req);
+    mattx_register_handler(MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, handle_dsm_write_acquire_reply);
+    mattx_register_handler(MATTX_MSG_DSM_INVALIDATE_REQ, handle_dsm_invalidate_req);
+    mattx_register_handler(MATTX_MSG_DSM_FLUSH_REQ, handle_dsm_flush_req);
+    mattx_register_handler(MATTX_MSG_DSM_FLUSH_REPLY, handle_dsm_flush_reply);
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }

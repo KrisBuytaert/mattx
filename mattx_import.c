@@ -22,6 +22,7 @@
  */
 
 #include "mattx.h"
+#include <linux/timekeeping.h> // For ktime_get_ns()
 
 // Local state for the import pipeline
 static int injected_pages_count = 0;
@@ -224,9 +225,11 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
 
         // --- GANG INJECTION ---
         int t_idx = 0;
+        pid_t fixup_tids[MAX_GANG_THREADS]; // local tids, for the clock-offset fixup registered below
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
             if (t_idx < pending_migration->thread_count) {
+                if (t_idx < MAX_GANG_THREADS) fixup_tids[t_idx] = t->pid;
                 struct pt_regs *t_regs = task_pt_regs(t);
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
@@ -245,13 +248,14 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     // guaranteed frozen here (stopped, about to be
                     // SIGCONT'd below), so its FPU context is safely
                     // resident in memory, not live in hardware registers.
-                    if (t->thread.fpu.fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
+                    struct fpu *fpu = MATTX_TASK_FPU(t);
+                    if (fpu && fpu->fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
                         u32 fsize = pending_migration->threads[t_idx].fpu_size;
-                        if (fsize > t->thread.fpu.fpstate->size)
-                            fsize = t->thread.fpu.fpstate->size;
+                        if (fsize > fpu->fpstate->size)
+                            fsize = fpu->fpstate->size;
                         if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
                             fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
-                        memcpy(&t->thread.fpu.fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+                        memcpy(&fpu->fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
                     }
                 }
 
@@ -334,6 +338,17 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             }
         }
 
+        // --- Register the clock-offset fixup BEFORE the SIGCONT below! ---
+        // A woken thread can re-enter its interrupted clock_nanosleep()
+        // essentially immediately, so this must be visible to the kretprobe
+        // before we let any thread run, not after.
+        {
+            s64 clock_offset_ns = (s64)ktime_get_ns() - (s64)pending_migration->monotonic_at_freeze;
+            mattx_clock_fixup_register(hijacked_stub_task->pid, clock_offset_ns, t_idx, fixup_tids);
+            mattx_dbg("[IMPORT] Registered clock-offset fixup for PID %d: %lld ns (%d threads)\n",
+                       hijacked_stub_task->pid, clock_offset_ns, t_idx);
+        }
+
         mattx_dbg("[IMPORT] IT'S ALIVE! Waking %d threads in Gang PID %d\n", current_threads, hijacked_stub_task->pid);
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
@@ -359,6 +374,37 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     }
                 }
                 rcu_read_unlock();
+
+                // --- Populate the DSM Translation Map & Arm Tripwires ---
+                guest_registry[i].dsm_count = 0;
+                
+                if (hijacked_stub_task->mm) {
+                    // We need the write lock to modify the VMA flags and ops!
+                    mmap_write_lock(hijacked_stub_task->mm);
+                    
+                    for (int v = 0; v < pending_migration->vma_count; v++) {
+                        if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
+                            int d_idx = guest_registry[i].dsm_count++;
+                            unsigned long base = pending_migration->vmas[v].vm_start;
+                            
+                            guest_registry[i].dsm_map[d_idx].base_addr = base;
+                            guest_registry[i].dsm_map[d_idx].size = pending_migration->vmas[v].vm_end - base;
+                            guest_registry[i].dsm_map[d_idx].shmid = pending_migration->vmas[v].shmid;
+                            
+                            // --- ARM THE TRIPWIRE ---
+                            struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, base);
+                            if (vma && vma->vm_start == base) {
+                                vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
+                                // Add VM_PFNMAP so the kernel doesn't touch our pages!
+                                vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
+                                
+                                mattx_dbg("[IMPORT] Armed DSM Tripwire at 0x%lx (ID: %u, Size: %lu)\n", 
+                                          base, pending_migration->vmas[v].shmid, guest_registry[i].dsm_map[d_idx].size);
+                            }
+                        }
+                    }
+                    mmap_write_unlock(hijacked_stub_task->mm);
+                }
                 break;
             }
         }
@@ -649,6 +695,14 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         struct task_struct *t;
         int t_idx = 0;
         int i;
+        pid_t fixup_tids[MAX_GANG_THREADS]; // local tids, for the clock-offset fixup registered below
+        int fixup_count = 0;
+        // Per thread: where its TID word lives in user memory (clear_child_tid == &pthread->tid),
+        // the TID it holds from the remote node, and the TID the thread has here.
+        unsigned long tidword_addr[MAX_GANG_THREADS] = {0};
+        pid_t tidword_remote[MAX_GANG_THREADS] = {0};
+        pid_t tidword_local[MAX_GANG_THREADS] = {0};
+        int tidword_count = 0;
 
         // --- THE vDSO TRANSPLANT ---
         // disabled vDSO transplant for testing
@@ -699,10 +753,11 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
             if (t_idx < pending_migration->thread_count) {
+                if (fixup_count < MAX_GANG_THREADS) fixup_tids[fixup_count++] = t->pid;
                 struct pt_regs *t_regs = task_pt_regs(t);
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
-                    
+
                     // TLS Hardware Sync on Return! ---
                     t->thread.fsbase = pending_migration->threads[t_idx].fsbase;
                     t->thread.gsbase = pending_migration->threads[t_idx].gsbase;
@@ -711,16 +766,23 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
 
                     t->clear_child_tid = (int __user *)pending_migration->threads[t_idx].clear_child_tid;
                     t->set_child_tid   = (int __user *)pending_migration->threads[t_idx].set_child_tid;
+                    if (pending_migration->threads[t_idx].clear_child_tid && tidword_count < MAX_GANG_THREADS) {
+                        tidword_addr[tidword_count]   = pending_migration->threads[t_idx].clear_child_tid;
+                        tidword_remote[tidword_count] = pending_migration->threads[t_idx].tid;
+                        tidword_local[tidword_count]  = t->pid;
+                        tidword_count++;
+                    }
 
                     // Restore FPU/SSE/AVX state on return! See the matching
                     // capture side in mattx_migr.c for why this is needed.
-                    if (t->thread.fpu.fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
+                    struct fpu *fpu = MATTX_TASK_FPU(t);
+                    if (fpu && fpu->fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
                         u32 fsize = pending_migration->threads[t_idx].fpu_size;
-                        if (fsize > t->thread.fpu.fpstate->size)
-                            fsize = t->thread.fpu.fpstate->size;
+                        if (fsize > fpu->fpstate->size)
+                            fsize = fpu->fpstate->size;
                         if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
                             fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
-                        memcpy(&t->thread.fpu.fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+                        memcpy(&fpu->fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
                     }
                 }
 
@@ -741,6 +803,25 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         }
         rcu_read_unlock();
 
+        // Threads that were created on the remote node come back as fresh "dummy" threads
+        // (Gang Grower) with new local TIDs, but the memory image still holds the TID the
+        // clone() gave them on the remote node (glibc keeps it in pthread->tid, at
+        // clear_child_tid). pthread_cancel()/pthread_kill() then tgkill() a TID that does not
+        // exist here and the thread is never signalled (mattx#9). Overwrite the stale TID with
+        // the real local one -- only where the word still holds exactly the remote TID, so a
+        // runtime that keeps something else at clear_child_tid is left alone.
+        for (int k = 0; k < tidword_count; k++) {
+            int cur = 0;
+            if (tidword_remote[k] == tidword_local[k])
+                continue;
+            if (access_process_vm(hijacked_stub_task, tidword_addr[k], &cur, sizeof(cur), FOLL_FORCE) != sizeof(cur))
+                continue;
+            if (cur != tidword_remote[k])
+                continue;
+            if (access_process_vm(hijacked_stub_task, tidword_addr[k], &tidword_local[k], sizeof(int), FOLL_FORCE | FOLL_WRITE) == sizeof(int))
+                mattx_dbg("[RECALL] TID word 0x%lx: remote TID %d -> local TID %d\n", tidword_addr[k], tidword_remote[k], tidword_local[k]);
+        }
+
         // --- Use the Mother's registers from the Blueprint! ---
         if (pending_migration->thread_count > 0) {
             mattx_dbg("[IMPORT] Deputy Brain Restored. New Mother RIP: 0x%lx\n", (unsigned long)pending_migration->threads[0].regs.rip);
@@ -760,6 +841,19 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             }
         }
         spin_unlock(&export_lock);
+
+        // --- Register the clock-offset fixup BEFORE the SIGCONT below! ---
+        // The Deputy is no longer a "guest" at this point (it's home), but
+        // it can still be carrying a stale absolute clock_nanosleep()
+        // deadline computed on the Remote node's clock. See the comment on
+        // mattx_clock_fixup_register() in mattx.h for why this is tracked
+        // separately from guest_registry.
+        {
+            s64 clock_offset_ns = (s64)ktime_get_ns() - (s64)pending_migration->monotonic_at_freeze;
+            mattx_clock_fixup_register(hijacked_stub_task->pid, clock_offset_ns, fixup_count, fixup_tids);
+            mattx_dbg("[IMPORT] Registered RETURN clock-offset fixup for PID %d: %lld ns (%d threads)\n",
+                       hijacked_stub_task->pid, clock_offset_ns, fixup_count);
+        }
 
         mattx_dbg("[IMPORT] Welcome home! Waking Gang Deputy PID %d\n", hijacked_stub_task->pid);
         rcu_read_lock();

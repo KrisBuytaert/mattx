@@ -62,6 +62,7 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "MPI Support: %s\n", config_mpi_support ? "YES" : "NO");
     seq_printf(m, "Accept Guests: %s\n", config_accept_guests ? "YES" : "NO");
     seq_printf(m, "HPC Local Libs: %s\n", config_hpc_local_libs ? "ON" : "OFF");
+    seq_printf(m, "DSM Mode: %d\n", config_dsm_mode);
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
@@ -128,7 +129,7 @@ static const struct proc_ops guests_proc_ops = {
 };
 
 static int version_show(struct seq_file *m, void *v) {
-    seq_printf(m, "MattX Version: 1.8\n");
+    seq_printf(m, "MattX Version: 1.9\n");
     seq_printf(m, "MattX License: GPLv2\n");
     seq_printf(m, "Copyright (c) 2026 by Matthias Rechenburg\n");
     return 0;
@@ -144,6 +145,162 @@ static const struct proc_ops version_proc_ops = {
     .proc_lseek = seq_lseek,
     .proc_release = single_release,
 };
+
+
+// ============================================================================
+// THE DSM MATRIX MONITOR
+// ============================================================================
+
+// ============================================================================
+// THE DSM MATRIX MONITOR
+// ============================================================================
+
+static int dsm_show(struct seq_file *m, void *v) {
+    int i;
+    unsigned char hex_buf[16];
+    int bytes_read;
+
+    seq_printf(m, "MattX Distributed Shared Memory (DSM) Matrix:\n");
+    seq_printf(m, "---------------------------------------------------------------------------------------------------\n");
+    seq_printf(m, "TYPE     PID    NODE  SHMID       ADDRESS             SIZE        STATE (P0)  HEX DUMP (16B)\n");
+    seq_printf(m, "---------------------------------------------------------------------------------------------------\n");
+
+    // --- 1. IMPORTER VIEW (VM2 - The Hollow VMAs) ---
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        struct task_struct *surrogate = NULL;
+        
+        rcu_read_lock();
+        surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+        if (surrogate) get_task_struct(surrogate);
+        rcu_read_unlock();
+
+        for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+            unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+            unsigned long size = guest_registry[i].dsm_map[d].size;
+            u32 shmid = guest_registry[i].dsm_map[d].shmid;
+            
+            // Extract the local MESI state for Page 0!
+            u8 p_state = guest_registry[i].dsm_map[d].page_states[0];
+            char *state_str = (p_state == MATTX_PAGE_EXCLUSIVE) ? "EXCLUSIVE" : 
+                              (p_state == MATTX_PAGE_SHARED) ? "SHARED" : "INVALID";
+
+            memset(hex_buf, 0, sizeof(hex_buf));
+            bytes_read = 0;
+            
+            // Read directly from our physical page pool!
+            if (guest_registry[i].dsm_map[d].pages[0]) {
+                memcpy(hex_buf, guest_registry[i].dsm_map[d].pages[0], 16);
+                bytes_read = 16;
+            }
+
+            seq_printf(m, "[IMPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  %-10s  ", 
+                       guest_registry[i].local_pid, guest_registry[i].home_node, 
+                       shmid, base, size, state_str);
+            
+            if (bytes_read > 0) {
+                for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
+            } else {
+                seq_printf(m, "<NOT LOADED YET>");
+            }
+            seq_printf(m, "\n");
+
+        }
+        if (surrogate) put_task_struct(surrogate);
+    }
+    spin_unlock(&guest_lock);
+
+
+    // --- 2. EXPORTER VIEW (VM1 - The Physical RAM & Global Directory) ---
+    
+    // Allocate a local copy of the global directory to avoid holding the spinlock!
+    struct mattx_dsm_master_dir *local_dir = kmalloc_array(MAX_DSM_SEGMENTS, sizeof(struct mattx_dsm_master_dir), GFP_KERNEL);
+    
+    if (local_dir) {
+        spin_lock(&mattx_dsm_lock);
+        memcpy(local_dir, mattx_global_dsm_dir, MAX_DSM_SEGMENTS * sizeof(struct mattx_dsm_master_dir));
+        spin_unlock(&mattx_dsm_lock);
+
+        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+            if (!local_dir[d].in_use) continue;
+
+            u32 shmid = local_dir[d].shmid;
+            u32 home_pid = local_dir[d].home_pid;
+            
+            char state_str[32] = "UNTRACKED";
+            u8 p_state = local_dir[d].page_state[0];
+            if (p_state == MATTX_PAGE_EXCLUSIVE) {
+                snprintf(state_str, sizeof(state_str), "EXCL(P:%u)", local_dir[d].page_owner_pid[0]);
+            } else if (p_state == MATTX_PAGE_SHARED) {
+                snprintf(state_str, sizeof(state_str), "SHARED");
+            } else {
+                snprintf(state_str, sizeof(state_str), "INVALID");
+            }
+
+            memset(hex_buf, 0, sizeof(hex_buf));
+            bytes_read = 0;
+            unsigned long base = 0;
+            unsigned long size = 0;
+
+            struct task_struct *deputy = NULL;
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(home_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+
+            if (deputy && deputy->mm) {
+                mmap_read_lock(deputy->mm);
+                struct vm_area_struct *vma;
+                VMA_ITERATOR(vmi, deputy->mm, 0);
+                for_each_vma(vmi, vma) {
+                    if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                        if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                            if (vma->vm_file->f_inode->i_ino == shmid) {
+                                base = vma->vm_start;
+                                size = vma->vm_end - vma->vm_start;
+                                break;
+                            }
+                        }
+                    }
+                }
+                mmap_read_unlock(deputy->mm);
+
+                if (base != 0) {
+                    // Lock-free read from physical RAM!
+                    bytes_read = access_process_vm(deputy, base, hex_buf, 16, FOLL_FORCE);
+                }
+                put_task_struct(deputy);
+            }
+
+            seq_printf(m, "[EXPORT] %-6d %-4s  %-10u  0x%-16lx  %-10lu  %-10s  ", 
+                       home_pid, "HOME", shmid, base, size, state_str);
+            
+            if (bytes_read > 0) {
+                for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
+            } else {
+                seq_printf(m, "<FAULT/UNREADABLE>");
+            }
+            seq_printf(m, "\n");
+        }
+        kfree(local_dir);
+    }
+
+    return 0;
+}
+
+
+static int dsm_open(struct inode *inode, struct file *file) {
+    return single_open(file, dsm_show, NULL);
+}
+
+static const struct proc_ops dsm_proc_ops = {
+    .proc_open = dsm_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+
 
 static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
     char buf[256]; // Increased size to handle long exclude lists!
@@ -207,10 +364,19 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_accept_guests = (arg1 != 0);
             mattx_dbg(" [ADMIN] Accept Guests set to: %s\n", config_accept_guests ? "YES" : "NO");
         }
-        else if (strcmp(cmd, "locallibs") == 0 && arg1 != -1) { // <-- NEW
+        else if (strcmp(cmd, "locallibs") == 0 && arg1 != -1) {
             config_hpc_local_libs = (arg1 != 0);
             mattx_dbg(" [ADMIN] HPC Local Libs Fast-Path set to: %s\n", config_hpc_local_libs ? "ON" : "OFF");
         }
+
+        else if (strncmp(buf, "dsm_mode ", 9) == 0) {
+            int val;
+            if (sscanf(buf + 9, "%d", &val) == 1) {
+                config_dsm_mode = val;
+                mattx_dbg(" [ADMIN] DSM Mode set to %d\n", val);
+            }
+        }
+
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {
@@ -228,10 +394,14 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
                         return count;
                     }
 
+                    // pid_task() is NULL for a PID that does not exist, and the reference must be
+                    // taken on the task we actually keep (the Mother), not on the thread we looked up.
                     rcu_read_lock();
                     task = pid_task(find_vpid(arg1), PIDTYPE_PID);
-                    if (task) get_task_struct(task);
-                    task = task->group_leader; // Grab the Mother!
+                    if (task) {
+                        task = task->group_leader; // Grab the Mother!
+                        get_task_struct(task);
+                    }
                     rcu_read_unlock();
 
                     if (task) {
@@ -262,7 +432,8 @@ int mattx_proc_init(void) {
     proc_create("remote", 0444, mattx_proc_dir, &remote_proc_ops); 
     proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); 
     proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops); 
-
+    proc_create("dsm", 0444, mattx_proc_dir, &dsm_proc_ops);
+    
     mattx_dbg(" /proc/mattx interface created successfully.\n");
     return 0;
 }
@@ -274,6 +445,7 @@ void mattx_proc_exit(void) {
         remove_proc_entry("remote", mattx_proc_dir); 
         remove_proc_entry("guests", mattx_proc_dir); 
         remove_proc_entry("admin", mattx_proc_dir);
+        remove_proc_entry("dsm", mattx_proc_dir);
         remove_proc_entry("mattx", NULL);
     }
 }

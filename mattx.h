@@ -50,7 +50,8 @@
 #include <linux/fdtable.h>       
 #include <linux/anon_inodes.h>   
 #include <linux/uaccess.h>       
-#include <linux/mman.h>          
+#include <linux/mman.h>
+#include <linux/shm.h>
 #include <linux/mmu_context.h>   
 #include <linux/kprobes.h>       
 #include <linux/workqueue.h>     
@@ -63,6 +64,11 @@
 #include <linux/utsname.h>
 #include <linux/resource.h>
 
+// --- SYSTEM V IPC FLAGS (Hidden by the kernel) ---
+#ifndef SHM_RDONLY
+#define SHM_RDONLY 010000
+#endif
+
 // --- KERNEL COMPATIBILITY: The Sockaddr Evolution ---
 // In late 2025 (Linux 6.18/6.19+), the kernel replaced 'struct sockaddr *' 
 // with 'struct sockaddr_unsized *' in internal socket APIs to fix flexible array bounds checking.
@@ -72,10 +78,28 @@
     #define MATTX_SA_CAST(addr) ((struct sockaddr *)(addr))
 #endif
 
+// --- KERNEL 7.0 COMPATIBILITY: The FPU Evolution ---
+// In kernel 7.0, 'struct fpu' was removed from 'thread_struct' to keep it a constant size.
+// It is now dynamically allocated at the end of task_struct and accessed via x86_task_fpu().
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+    // Use the Ghost Resolver!
+    #define MATTX_TASK_FPU(t) (real_x86_task_fpu ? real_x86_task_fpu(t) : NULL)
+#else
+    #define MATTX_TASK_FPU(t) (&(t)->thread.fpu)
+#endif
 
 #define MATTX_PORT 7226
-#define MAX_NODES 1024 
-#define BALANCER_INTERVAL_MS 2000 
+#define MAX_NODES 1024
+#define BALANCER_INTERVAL_MS 2000
+
+// How long mattx_expel_guest() will wait (in ms) for a guest to drain out of
+// guest_registry before giving up. Normal drain completes within one or two
+// Guest Watcher cycles (BALANCER_INTERVAL_MS = 2000ms) after the Surrogate's
+// SIGKILL lands, so a few seconds is the expected case; 30s gives generous
+// headroom for scheduler/lock contention on a busy node while still bounding
+// the wait so a genuinely stuck guest (e.g. #20-style clock skew wedge)
+// cannot hang systemctl stop / module unload forever.
+#define MATTX_EXPEL_DRAIN_TIMEOUT_MS 30000
 
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
@@ -83,6 +107,7 @@
 #define MAX_GUESTS 1024 
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
+#define MAX_DSM_PAGES 256 // 1MB max per segment for this prototype
 
 // Max size of a captured thread's raw FPU/SSE/AVX register image
 // (XSAVE/FXSAVE area). Covers up through AVX2 (~832-960 bytes on typical
@@ -100,6 +125,9 @@
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
+// max dsm segments
+#define MAX_DSM_SEGMENTS 16
+
 
 enum mattx_msg_type {
     MATTX_MSG_HEARTBEAT = 1,
@@ -206,6 +234,23 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_GETDENTS64_REPLY,
     MATTX_MSG_SYS_PIPE2_REQ, 
     MATTX_MSG_SYS_PIPE2_REPLY,
+    MATTX_MSG_SYS_SHMGET_REQ,
+    MATTX_MSG_SYS_SHMGET_REPLY,
+    MATTX_MSG_SYS_SHMAT_REQ,
+    MATTX_MSG_SYS_SHMAT_REPLY,
+    MATTX_MSG_SYS_SHMDT_REQ,
+    MATTX_MSG_SYS_SHMDT_REPLY,
+    MATTX_MSG_SYS_SHMCTL_REQ,
+    MATTX_MSG_SYS_SHMCTL_REPLY,
+    MATTX_MSG_DSM_PAGE_FAULT_REQ,
+    MATTX_MSG_DSM_PAGE_FAULT_REPLY,
+    MATTX_MSG_DSM_PAGE_UPDATE,
+    MATTX_MSG_DSM_WRITE_ACQUIRE_REQ,
+    MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY,
+    MATTX_MSG_DSM_INVALIDATE_REQ,
+    MATTX_MSG_DSM_INVALIDATE_REPLY,
+    MATTX_MSG_DSM_FLUSH_REQ,
+    MATTX_MSG_DSM_FLUSH_REPLY,
 };
 
 struct mattx_header {
@@ -226,6 +271,8 @@ struct mattx_vma_info {
     unsigned long vm_start;
     unsigned long vm_end;
     unsigned long vm_flags;
+    u32 shmid; // The unique DSM ID
+    u8 is_shm; // Flag indicating this is Shared Memory    
 };
 
 struct mattx_cpu_regs {
@@ -234,6 +281,15 @@ struct mattx_cpu_regs {
     uint64_t rip, cs, eflags, rsp, ss;
 
 };
+
+
+// --- MESI Page States ---
+enum mattx_dsm_page_state {
+    MATTX_PAGE_INVALID = 0,
+    MATTX_PAGE_SHARED,    // Read-Only
+    MATTX_PAGE_EXCLUSIVE  // Read-Write (Dirty)
+};
+
 
 // NOTE: bin/mattx_stub.c hand-mirrors this struct (and mattx_migration_req
 // below) byte-for-byte, since it's a separate userspace program that can't
@@ -274,6 +330,16 @@ struct mattx_migration_req {
     uint64_t start_brk; // The start of the Heap
     uint64_t brk;       // The current end of the Heap
     uint64_t vdso_addr; // The vDSO Transplant Address!
+
+    // The SOURCE node's CLOCK_MONOTONIC reading (ns since ITS OWN boot),
+    // taken at freeze time. CLOCK_MONOTONIC is boot-relative, not
+    // wall-clock, so this value is meaningless on any other node by
+    // itself -- it only exists so the target node can compute the delta
+    // needed to reinterpret a stale absolute clock_nanosleep() deadline
+    // still resident in the migrated process's memory/stack. See
+    // mattx_clock_fixup_register()/mattx_clock_fixup_consume() and the
+    // clock_nanosleep kretprobe in mattx_hooks.c.
+    uint64_t monotonic_at_freeze;
 
     char comm[16]; 
     char dfsa_dir[256]; 
@@ -946,6 +1012,17 @@ struct mattx_rpc_work {
     int pipe2_flags;
     void __user *pipe2_pipefd;
 
+    // For DSM Control Plane ---
+    bool is_shmget;
+    bool is_shmctl;
+    bool is_shmdt;
+    bool is_shmat;
+    int shm_key;
+    size_t shm_size;
+    int shm_flg;
+    int shm_id;
+    int shm_cmd;
+    unsigned long shm_addr;
 };
 
 struct mattx_link {
@@ -954,6 +1031,16 @@ struct mattx_link {
     struct socket *sock;
     struct sock *sk;
     struct task_struct *receiver_thread;
+};
+
+
+struct mattx_dsm_mapping {
+    unsigned long base_addr;
+    u32 shmid;
+    unsigned long size;
+    unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
+    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!
+    u8 page_states[MAX_DSM_PAGES]; // Local MESI State (VM2)
 };
 
 
@@ -976,7 +1063,35 @@ struct mattx_guest_info {
     u32 orig_tids[MAX_GANG_THREADS];
     pid_t local_tids[MAX_GANG_THREADS];    
 
+    // The DSM Translation Map ---
+    int dsm_count;
+    struct mattx_dsm_mapping dsm_map[MAX_DSM_SEGMENTS];
+
+    // --- MODE 3: Single-Step Tracking ---
+    bool dsm_step_pending;
+    bool dsm_step_is_write;
+    unsigned long dsm_step_addr;
+    u32 dsm_step_shmid;
 };
+
+
+// DSM MESI: The Master Directory (VM1) ---
+struct mattx_dsm_master_dir {
+    bool in_use;                        // <-- Tracks if this slot is active
+    u32 shmid;
+    u32 home_pid;                       // <-- The PID on VM1 to use for memory reading!    
+    u8 page_state[MAX_DSM_PAGES];       // Global state of the page
+    u32 page_owner_pid[MAX_DSM_PAGES];  // PID of the EXCLUSIVE owner
+
+    // A foolproof 2D array. 1024 nodes / 64 bits = 16 u64s per page!
+    u64 page_shared_mask[MAX_DSM_PAGES][MAX_NODES / 64]; 
+};
+
+
+// --- The Global Node-Local Directory & Lock ---
+extern struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+extern spinlock_t mattx_dsm_lock;
+
 
 struct mattx_export_info {
     pid_t orig_pid;
@@ -984,6 +1099,10 @@ struct mattx_export_info {
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
     bool is_growing_gang; // The Gang Grower Flag!
+
+    // DSM MESI Directory ---
+    int dsm_dir_count;
+    struct mattx_dsm_master_dir dsm_dirs[MAX_DSM_SEGMENTS];    
 };
 
 struct mattx_vfs_getattr_req {
@@ -1111,6 +1230,87 @@ struct mattx_sys_unlink_reply {
     u32 orig_pid;
     int error;
 };
+
+
+
+
+// --- DSM Payloads ---
+struct mattx_sys_shmget_req { u32 orig_pid; int key; size_t size; int shmflg; };
+struct mattx_sys_shmget_reply { u32 orig_pid; int shmid; int error; };
+
+struct mattx_sys_shmat_req { u32 orig_pid; int shmid; unsigned long shmaddr; int shmflg; };
+struct mattx_sys_shmat_reply { u32 orig_pid; unsigned long ret_addr; size_t size; int error; };
+
+struct mattx_sys_shmdt_req { u32 orig_pid; unsigned long shmaddr; };
+struct mattx_sys_shmdt_reply { u32 orig_pid; int error; };
+
+struct mattx_sys_shmctl_req { u32 orig_pid; int shmid; int cmd; };
+struct mattx_sys_shmctl_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[128]; // Large enough to hold struct shmid_ds
+};
+
+// --- DSM Page Fault Payloads ---
+struct mattx_dsm_page_fault_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_page_fault_reply {
+    u64 req_id;
+    int error;
+    char data[4096]; // Exactly one PAGE_SIZE!
+};
+
+struct mattx_dsm_page_update_req {
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+    char data[4096]; // The updated page content!
+};
+
+
+// --- DSM MESI Payloads (Mode 2) ---
+struct mattx_dsm_write_acquire_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_write_acquire_reply {
+    u64 req_id;
+    int error;
+};
+
+struct mattx_dsm_invalidate_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_invalidate_reply {
+    u64 req_id;
+    int error;
+};
+
+struct mattx_dsm_flush_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_flush_reply {
+    u64 req_id;
+    int error;
+    char data[4096]; // The envelope for the dirty 4KB page!
+};
+
 
 
 // This defines the standard signature for all message handlers
@@ -1273,6 +1473,41 @@ extern mattx_sys_getdents64_fn real_sys_getdents64;
 typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
 extern mattx_sys_pipe2_fn real_sys_pipe2;
 
+
+// --- THE DSM GHOST RESOLVERS ---
+typedef long (*mattx_sys_shmget_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmget_fn real_sys_shmget;
+
+typedef long (*mattx_sys_shmctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmctl_fn real_sys_shmctl;
+
+typedef long (*mattx_sys_shmdt_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmdt_fn real_sys_shmdt;
+
+typedef long (*mattx_sys_shmat_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmat_fn real_sys_shmat;
+
+// The DSM Tripwire Struct ---
+extern const struct vm_operations_struct mattx_dsm_vm_ops;
+
+// --- THE DSM SWEEPER ---
+typedef void (*mattx_zap_vma_ptes_fn)(struct vm_area_struct *vma, unsigned long address, unsigned long size);
+extern mattx_zap_vma_ptes_fn real_zap_vma_ptes;
+
+extern int config_dsm_mode; // Expose the config toggle!
+int mattx_dsm_sweeper_loop(void *data); // Expose the Sweeper thread!
+
+// DSM MESI: resolver for vmf_insert_pfn_prot
+typedef vm_fault_t (*mattx_vmf_insert_pfn_prot_fn)(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot);
+extern mattx_vmf_insert_pfn_prot_fn real_vmf_insert_pfn_prot;
+
+
+
+// --- THE FPU GHOST RESOLVER ---
+struct fpu; // Forward declaration just in case
+typedef struct fpu *(*mattx_x86_task_fpu_fn)(struct task_struct *task);
+extern mattx_x86_task_fpu_fn real_x86_task_fpu;
+
 // --- THE THREAD GHOST EXORCIST RESOLVER ---
 typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
 extern mattx_sys_exit_fn real_sys_exit;
@@ -1291,6 +1526,11 @@ typedef void (*mattx_x86_gsbase_write_task_fn)(struct task_struct *task, unsigne
 extern mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task;
 extern mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task;
 
+
+// --- THE PTE SHOOTDOWN RESOLVER ---
+struct address_space;
+typedef void (*mattx_unmap_mapping_range_fn)(struct address_space *mapping, loff_t const holebegin, loff_t const holelen, int even_cows);
+extern mattx_unmap_mapping_range_fn real_unmap_mapping_range;
 
 
 // The Extreme Debugging Macro ---
@@ -1328,6 +1568,17 @@ bool is_guest_process(pid_t pid);
 bool is_rpc_pending(pid_t pid); // Check if a Wormhole is open!
 bool check_rpc_done(pid_t pid);
 
+// --- Clock-Offset Fixup Table (mattx_guest.c) ---------------------------
+// Registered once at Awakening (both forward Surrogate wake-up in
+// handle_migrate_done() and Deputy return wake-up in handle_return_done(),
+// both in mattx_import.c) and consumed at most once per thread by the
+// clock_nanosleep kretprobe in mattx_hooks.c. Deliberately independent of
+// guest_registry: a returned Deputy is no longer a guest (is_guest_process()
+// must say false for it so other Wormhole hooks stop routing its syscalls
+// home), yet it still needs this same one-shot deadline correction.
+void mattx_clock_fixup_register(pid_t local_pid, s64 offset_ns, int thread_count, const pid_t *tids);
+bool mattx_clock_fixup_consume(pid_t local_pid, pid_t tid, s64 *out_offset_ns);
+
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
 void remove_guest_process(int index);
 
@@ -1351,6 +1602,13 @@ void mattx_fileio_exit(void); // The Cleanup function!
 
 extern const struct file_operations mattx_fops; 
 extern const struct inode_operations mattx_iops;
+
+// DSM single step mode 3
+void mattx_inject_dsm_cleanup(u32 orig_pid, int home_node, u32 shmid, unsigned long fault_addr, bool is_write);
+// MESI mode 2 VM1 native worker sync
+void mattx_schedule_vm1_sync(pid_t pid, u32 shmid, unsigned long offset, bool is_write);
+
+
 
 // API for MattXFS ---
 int mattx_get_active_nodes(int *node_array, int max_nodes);

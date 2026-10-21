@@ -255,24 +255,63 @@ restart_guest_loop:
             if (!task || task->exit_state != 0) is_dead = true;
             if (task) put_task_struct(task);
 
+
+            // DSM MESI FUNERAL
             if (is_dead) {
                 u32 dead_orig_pid = guest_registry[i].orig_pid;
                 int dead_home_node = guest_registry[i].home_node;
                 void *buf1 = guest_registry[i].rpc_read_buf;
                 void *buf2 = guest_registry[i].rpc_statx_buf;
-                
-                // --- Extract the migration flag before we delete the entry! ---
                 bool is_migrating = guest_registry[i].is_migrating; 
+                
+                // --- THE FUNERAL FLUSH (MODE 2) ---
+                struct mattx_dsm_page_update_req *flush_reqs = NULL;
+                int flush_count = 0;
+                if (config_dsm_mode == 2) {
+                    // 1. Count the dirty pages
+                    for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                        for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                            if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) flush_count++;
+                        }
+                    }
+                    // 2. Pack them into an array (Allocated with GFP_ATOMIC because we hold a spinlock!)
+                    if (flush_count > 0) {
+                        flush_reqs = kmalloc_array(flush_count, sizeof(*flush_reqs), GFP_ATOMIC);
+                        if (flush_reqs) {
+                            int idx = 0;
+                            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                                for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                    if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) {
+                                        flush_reqs[idx].orig_pid = dead_orig_pid;
+                                        flush_reqs[idx].shmid = guest_registry[i].dsm_map[d].shmid;
+                                        flush_reqs[idx].offset = p * PAGE_SIZE;
+                                        memcpy(flush_reqs[idx].data, guest_registry[i].dsm_map[d].pages[p], PAGE_SIZE);
+                                        idx++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 
                 remove_guest_process(i);
                 spin_unlock(&guest_lock); // DROP LOCK BEFORE CLEANUP!
                 
+                // 3. Fire the Data Bombs safely outside the spinlock!
+                if (flush_reqs) {
+                    for (int f = 0; f < flush_count; f++) {
+                        if (cluster_map[dead_home_node]) {
+                            mattx_comm_send(cluster_map[dead_home_node], MATTX_MSG_DSM_PAGE_UPDATE, &flush_reqs[f], sizeof(struct mattx_dsm_page_update_req));
+                            mattx_dbg("[MESI_VM2] Funeral Flush (Exit): Sent dirty page (SHMID %u, Offset %lu) to VM1\n", flush_reqs[f].shmid, flush_reqs[f].offset);
+                        }
+                    }
+                    kfree(flush_reqs);
+                }
+
                 if (buf1) kfree(buf1);
                 if (buf2) kfree(buf2);
                 
                 // --- THE RECALL SHIELD ---
-                // If the guest is dying because we are migrating it back home,
-                // DO NOT send a PROCESS_EXIT message to VM1!
                 if (!is_migrating) {
                     struct mattx_process_exit exit_msg;
                     exit_msg.orig_pid = dead_orig_pid;
@@ -344,6 +383,22 @@ restart_export_loop:
 // --- Network Handlers for the Scheduler ---
 static void handle_heartbeat(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (link->node_id == -1 && hdr->sender_id < MAX_NODES) {
+        // mattx#17: if a stale connection from a previous crash/reconnect
+        // cycle is still sitting in cluster_map for this node, tear it
+        // down first -- otherwise its socket and receiver kthread (parked
+        // forever in the "Zombie Halt" loop in mattx_receiver_loop(),
+        // mattx_comm.c) leak permanently every time a peer reconnects.
+        // This is what silently exhausted MATTX_PORT across repeated
+        // restarts: each leaked accepted-connection socket lingers in
+        // CLOSE_WAIT, still holding the port even after the listening
+        // socket itself is properly released -- which is why the
+        // listener's own retry-on-EADDRINUSE fix (this same PR) could
+        // still spin forever binding against a port that a *different*,
+        // leaked socket was still squatting on.
+        if (cluster_map[hdr->sender_id] && cluster_map[hdr->sender_id] != link) {
+            mattx_dbg("[SCHED] Replacing stale connection for Node %u -- disconnecting old link first\n", hdr->sender_id);
+            mattx_comm_disconnect(hdr->sender_id);
+        }
         link->node_id = hdr->sender_id;
         cluster_map[link->node_id] = link;
         mattx_dbg(" [SCHED] Registered new connection from Node %u\n", hdr->sender_id);
