@@ -70,6 +70,8 @@ Kris, your automated tests and surgical PRs are what push MattX from an "experim
 Please find Kris's **MattX TestSuite** at: 
 https://github.com/KrisBuytaert/mattx-testsuite
 
+Kris' latest **MattX 1.9 TestSuite Results**
+https://krisbuytaert.be/mattx-test-reports/#q=3f4e121d9bbd
 
 ---
 
