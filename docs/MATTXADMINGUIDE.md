@@ -700,10 +700,10 @@ If a node has 4 cores, its capacity (Affinity) is `4000`. If it has 20 heavy pro
 To figure out if a migration is necessary, the balancer calculates the **Normalized Load**:
 `Normalized Load = (Raw Load * 1000) / Affinity`
 
-If Node A's Normalized Load is significantly higher than Node B's (specifically, a difference of `500`, which equals half a CPU core), the balancer strikes. But it doesn't just blindly throw processes across the network. It follows strict, mathematically proven Rules of Engagement:
+If Node A's Normalized Load is significantly higher than Node B's (specifically, a difference of at least `250`, which equals a quarter of a CPU core), the balancer strikes. But it doesn't just blindly throw processes across the network. It follows strict, mathematically proven Rules of Engagement:
 
-1.  **The Core Protector:** A node will *never* migrate a process if its local load is less than or equal to its physical CPU core count. It ensures your hardware is always fully utilized before asking for help.
-2.  **The Tie-Breaker:** If multiple remote nodes are completely idle (Load `0`), the balancer doesn't just dogpile the first one it sees. It checks their available RAM and gracefully round-robins the processes to the nodes with the most free memory.
+1.  **The Idle Guard:** A node with zero load never migrates anything. Note that the balancer does *not* compare the load against the physical core count: any node whose normalized load exceeds the best remote node's by the threshold above is allowed to shed work, even if it still has idle cores.
+2.  **The Target Choice:** The balancer picks the remote node with the lowest normalized load and skips any node that has closed its doors with `accept 0`. If several nodes tie (for example, all idle), the first one in the node table wins. Free RAM is broadcast to the cluster and shown in `/proc/mattx/nodes`, but it is currently *not* used when choosing the target.
 3.  **The Cooldown:** Pumping gigabytes of memory across a TCP Wormhole is violent. After a successful migration, the balancer goes to sleep for exactly 1 second. This lets the TCP buffers drain, allows the remote CPU scheduler to stabilize, and keeps the cluster's heartbeat smooth and rhythmic. ⏱️
 
 #### The Sniper Rifle (Manual Migration)
