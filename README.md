@@ -21,14 +21,19 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 ## 🚀 MattX 1.9: The Distributed Shared Memory (DSM) Evolution 🧠🕳️
 
 <div style="display: inline-flex; align-items: center;">
+  <a href="https://youtu.be/RscWxkt_DCs" target="_blank" style="display: inline-block;">
+  <b>MattX 1.9 MESI DSM demo on Youtube</b> 
+  <br>
     <img src="./web/media/Mattx-1.9-MESI-DSM-bright.jpeg" style="width: 100%; display: block;">
+  </a>
+
 </div>
 
 <br>
 
 Welcome to **MattX 1.9**, the release that officially transforms MattX from an advanced process migrator into a true, hardware-accurate **Single System Image (SSI) Hypervisor**. 
 
-With this release, we have successfully bent the Linux Virtual Memory subsystem to our will. MattX now allows complex, multi-process HPC applications and AI training workloads to seamlessly migrate across the cluster while maintaining perfect synchronization over **Distributed Shared Memory (DSM)**.
+With this release, we have successfully bent the Linux Virtual Memory subsystem to our will. MattX now allows complex, multi-process HPC applications and AI training workloads to seamlessly migrate across the cluster while maintaining perfect synchronisation over **Distributed Shared Memory (DSM)**.
 
 ### 🌌 The Crown Jewel: Pluggable Cache Coherence (DSM)
 Migrating processes that share memory (System V IPC) across a network is notoriously difficult. MattX 1.9 solves this by introducing "Ghost VMAs"—hollow memory mappings on remote nodes rigged with custom kernel tripwires. When a migrated process touches this memory, MattX catches the Page Fault and teleports the physical RAM across the TCP Wormhole.
