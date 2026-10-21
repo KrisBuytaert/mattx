@@ -3362,6 +3362,85 @@ static int entry_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_reg
 }
 
 
+/*
+ * epoll_wait() of a Surrogate, proxied to the home node.
+ *
+ * The other proxied syscalls freeze the caller with SIGSTOP and wake it from the RPC reply.
+ * SIGSTOP is a group stop: it freezes EVERY thread of the process. For a call that blocks
+ * (epoll_wait with a long or infinite timeout) that deadlocks any program whose waiter is
+ * woken by another of its own threads: the thread that would make the epoll ready is frozen
+ * too (mattx#14: the process stops in state T and never makes progress again).
+ *
+ * So epoll_wait does not use SIGSTOP. The kretprobe handler cannot sleep, but it can queue a
+ * task_work on the calling thread, which runs in process context on the way back to user
+ * space: there the thread sends the request and sleeps on its own completion until the reply
+ * for exactly this request arrives. All other threads keep running. The reply carries a
+ * request id because several threads can be waiting at the same time (the shared per-guest
+ * rpc_done slot the other hooks use cannot represent that).
+ */
+struct mattx_epoll_wait_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int epfd;
+    int maxevents;
+    int timeout;
+    struct epoll_event __user *events_ptr;
+};
+
+static void mattx_epoll_wait_tw_fn(struct callback_head *cb) {
+    struct mattx_epoll_wait_tw *tw = container_of(cb, struct mattx_epoll_wait_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_epoll_pending *p;
+    long rc = 0;
+    int ret = -EINTR;
+
+    p = mattx_epoll_pending_add(tw->orig_pid, tw->home_node);
+    if (!p)
+        goto out;
+
+    if (tw->home_node >= 0 && tw->home_node < MAX_NODES && cluster_map[tw->home_node]) {
+        struct mattx_sys_epoll_wait_req req = {
+            .orig_pid = tw->orig_pid,
+            .epfd = tw->epfd,
+            .maxevents = tw->maxevents,
+            .timeout = tw->timeout,
+            .req_id = p->req_id,
+        };
+        mattx_comm_send(cluster_map[tw->home_node], MATTX_MSG_SYS_EPOLL_WAIT_REQ, &req, sizeof(req));
+
+        // A signal ends the wait, with EINTR like a native epoll_wait(). This matters beyond
+        // signal handlers: the freeze that precedes a recall/migration is a task_work (TWA_SIGNAL)
+        // plus a stop, and a thread asleep in here uninterruptibly could never be frozen (the
+        // recall hung). A finite timeout gets some slack for the round trip.
+        if (tw->timeout >= 0)
+            rc = wait_for_completion_interruptible_timeout(&p->done, msecs_to_jiffies(tw->timeout) + 5 * HZ);
+        else
+            rc = wait_for_completion_interruptible(&p->done);
+
+        if (rc > 0 || (tw->timeout < 0 && rc == 0)) {
+            ret = p->retval;
+            if (ret > 0 && p->events) {
+                if (copy_to_user(tw->events_ptr, p->events, ret * sizeof(struct epoll_event)))
+                    ret = -EFAULT;
+            }
+        } else if (rc == 0) {
+            ret = 0; // finite timeout, and the home node never answered
+        }
+
+        if (rc < 0 || (tw->timeout >= 0 && rc == 0)) {
+            // Give up on this request: tell the home node, or its waiter would eat the next
+            // readiness event on behalf of a thread that no longer listens (lost wakeup).
+            struct mattx_sys_epoll_wait_cancel cancel = { .orig_pid = tw->orig_pid, .req_id = p->req_id };
+            mattx_comm_send(cluster_map[tw->home_node], MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, &cancel, sizeof(cancel));
+        }
+    }
+    mattx_epoll_pending_del(p);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct epoll_wait_kretprobe_data *data = (struct epoll_wait_kretprobe_data *)ri->data;
     int home_node = -1;
@@ -3380,32 +3459,27 @@ static int ret_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs 
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
-            guest_registry[i].rpc_read_buf = NULL;
             break;
         }
     }
     spin_unlock(&guest_lock);
 
-    if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
-        if (rpc) {
-            INIT_WORK(&rpc->work, mattx_rpc_worker);
-            rpc->local_pid = current->pid;
-            rpc->orig_pid = orig_pid;
-            rpc->home_node = home_node;
-            
-            rpc->is_epoll_wait = true;
-            rpc->remote_fd = data->epfd;
-            rpc->epoll_events_ptr = data->event_ptr;
-            rpc->epoll_maxevents = data->maxevents;
-            rpc->timeout_ms = data->timeout;
+    if (home_node != -1 && real_task_work_add) {
+        struct mattx_epoll_wait_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+        if (tw) {
+            init_task_work(&tw->cb, mattx_epoll_wait_tw_fn);
+            tw->orig_pid = orig_pid;
+            tw->home_node = home_node;
+            tw->epfd = data->epfd;
+            tw->maxevents = data->maxevents;
+            tw->timeout = data->timeout;
+            tw->events_ptr = data->event_ptr;
 
-            // --- THE RIP DRIFT FIX ---
+            // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
             regs->ax = -EINTR;
 
-            send_sig(SIGSTOP, current, 0);
-            schedule_work(&rpc->work);
+            if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                kfree(tw);
         }
     }
     return 0;
