@@ -48,6 +48,7 @@ struct vfs_rpc_ctx {
     int remote_fd;
     ssize_t bytes_rw;
     void *data_buf;
+    size_t data_cap; // size of data_buf: a reply can never write more than this
     loff_t ret_offset;
 
     bool in_use;    
@@ -57,6 +58,38 @@ struct vfs_rpc_ctx {
 static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
 static DEFINE_SPINLOCK(vfs_rpc_lock);
 static u64 next_req_id = 1;
+
+/*
+ * Wait for the reply of the VFS RPC in @slot.
+ *
+ * wait_event_interruptible() also returns when a signal arrives, and the freeze that precedes a
+ * migration or recall is a TWA_SIGNAL task_work, so a Surrogate blocked in here can be woken
+ * with no reply yet. The read/write callers then went on to use bytes_rw, which still held the
+ * result of an EARLIER request that had used the slot (it was never reset): a read of 16 bytes
+ * "returned" the 30 bytes of the previous reply, and mattxfs_remote_file_read() copied 30 bytes out
+ * of its 16-byte buffer. Hardened usercopy turned that into a kernel BUG on the node, which showed
+ * up as the intermittent "lost at cycle N" of the pingpong test (about 1 cycle in 100).
+ *
+ * On an interrupted wait the slot is given back (a reply that arrives later finds no in-use slot
+ * with its req_id and is dropped) and -ERESTARTSYS is returned, so the syscall is restarted.
+ */
+static int mattx_vfs_rpc_wait(int slot)
+{
+    int rc = wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    if (!rc)
+        return 0;
+
+    spin_lock(&vfs_rpc_lock);
+    if (vfs_rpc_registry[slot].done) {          // the reply raced in; use it
+        spin_unlock(&vfs_rpc_lock);
+        return 0;
+    }
+    vfs_rpc_registry[slot].in_use = false;
+    vfs_rpc_registry[slot].data_buf = NULL;
+    spin_unlock(&vfs_rpc_lock);
+    return rc;
+}
 
 
 // ============================================================================
@@ -5703,7 +5736,9 @@ ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, 
             req_id = next_req_id++;
             vfs_rpc_registry[i].req_id = req_id;
             vfs_rpc_registry[i].done = false;
+            vfs_rpc_registry[i].bytes_rw = 0;
             vfs_rpc_registry[i].data_buf = buf; 
+            vfs_rpc_registry[i].data_cap = count;
             init_waitqueue_head(&vfs_rpc_registry[i].wq);
             break;
         }
@@ -5718,7 +5753,8 @@ ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, 
     req.pos = *pos;
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READ_REQ, &req, sizeof(req));
 
-    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+    if (mattx_vfs_rpc_wait(slot))
+        return -ERESTARTSYS; // slot already released
 
     bytes_read = vfs_rpc_registry[slot].bytes_rw;
     if (bytes_read > 0) *pos += bytes_read; 
@@ -5767,6 +5803,8 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
             req_id = next_req_id++;
             vfs_rpc_registry[i].req_id = req_id;
             vfs_rpc_registry[i].done = false;
+            vfs_rpc_registry[i].bytes_rw = 0;
+            vfs_rpc_registry[i].data_buf = NULL;
             init_waitqueue_head(&vfs_rpc_registry[i].wq);
             break;
         }
@@ -5784,7 +5822,8 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_WRITE_REQ, req, payload_size);
     kfree(req);
 
-    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+    if (mattx_vfs_rpc_wait(slot))
+        return -ERESTARTSYS; // slot already released
 
     bytes_written = vfs_rpc_registry[slot].bytes_rw;
     if (bytes_written > 0) *pos += bytes_written;
@@ -6263,7 +6302,10 @@ static void handle_vfs_read_reply(struct mattx_link *link, struct mattx_header *
             if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
                 vfs_rpc_registry[i].bytes_rw = reply->bytes_read;
                 if (reply->bytes_read > 0 && vfs_rpc_registry[i].data_buf) {
-                    memcpy(vfs_rpc_registry[i].data_buf, reply->data, reply->bytes_read);
+                    if ((size_t)reply->bytes_read <= vfs_rpc_registry[i].data_cap)
+                        memcpy(vfs_rpc_registry[i].data_buf, reply->data, reply->bytes_read);
+                    else
+                        vfs_rpc_registry[i].bytes_rw = -EIO; // more than was asked for: never overrun the buffer
                 }
                 vfs_rpc_registry[i].done = true;
                 wake_up_interruptible(&vfs_rpc_registry[i].wq);
