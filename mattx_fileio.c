@@ -21,6 +21,7 @@
  * Commercial licensing options are available upon request.
  */
 
+#include <linux/eventfd.h>
 #include "mattx.h"
 #include <linux/wait.h>
 #include <linux/poll.h>
@@ -591,6 +592,42 @@ const struct file_operations mattx_fops = {
 
 // --- Network Handlers for File I/O ---
 
+
+/*
+ * kernel_write() refuses files that have no ->write_iter, and an eventfd only has a plain
+ * ->write (kernel: "kernel write not supported for file [eventfd]", -EINVAL). A Surrogate's
+ * write() to an eventfd that lives on the home node was therefore dropped there, the eventfd
+ * never became readable, and whoever epoll_wait()ed on it never woke up (mattx#14).
+ * Signal the eventfd through its own interface instead.
+ */
+static ssize_t mattx_wormhole_kernel_write(struct file *file, const void *buf, size_t len, loff_t *pos)
+{
+    if (file->f_op && file->f_op->write && !file->f_op->write_iter) {
+        struct eventfd_ctx *ctx = eventfd_ctx_fileget(file);
+
+        if (!IS_ERR(ctx)) {
+            u64 val, n;
+
+            if (len < sizeof(val)) {
+                eventfd_ctx_put(ctx);
+                return -EINVAL;
+            }
+            memcpy(&val, buf, sizeof(val));
+            if (val == U64_MAX) {
+                eventfd_ctx_put(ctx);
+                return -EINVAL;
+            }
+            // eventfd_signal() adds 1; a reader only cares that the counter is non-zero, so
+            // a large increment is capped (the exact total is not reproduced).
+            for (n = 0; n < min_t(u64, val, 1024); n++)
+                eventfd_signal(ctx);
+            eventfd_ctx_put(ctx);
+            return sizeof(val);
+        }
+    }
+    return kernel_write(file, buf, len, pos);
+}
+
 static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
@@ -641,7 +678,7 @@ static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr
                 old_cred = override_creds(deputy->cred);
             }
             
-            ret = kernel_write(file, req->data, req->len, &pos);
+            ret = mattx_wormhole_kernel_write(file, req->data, req->len, &pos);
             
             if (deputy) {
                 revert_creds(old_cred);
@@ -2303,6 +2340,85 @@ struct mattx_epoll_wait_ctx {
     int target_node;
 };
 
+// --- Home side: epoll_wait requests the Surrogate gave up on ---
+struct mattx_epoll_cancelled {
+    struct list_head node;
+    u32 orig_pid;
+    u32 req_id;
+    unsigned long when;
+};
+static LIST_HEAD(mattx_epoll_cancelled_list);
+static DEFINE_SPINLOCK(mattx_epoll_cancelled_lock);
+#define MATTX_EPOLL_CANCELLED_MAX 256
+static int mattx_epoll_cancelled_count;
+
+// True (and the entry is consumed) if this request was cancelled.
+static bool mattx_epoll_take_cancelled(u32 orig_pid, u32 req_id)
+{
+    struct mattx_epoll_cancelled *c, *tmp;
+    bool hit = false;
+
+    spin_lock(&mattx_epoll_cancelled_lock);
+    list_for_each_entry_safe(c, tmp, &mattx_epoll_cancelled_list, node) {
+        if (c->orig_pid == orig_pid && c->req_id == req_id) {
+            list_del(&c->node);
+            kfree(c);
+            mattx_epoll_cancelled_count--;
+            hit = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_epoll_cancelled_lock);
+    return hit;
+}
+
+// Peek without consuming (the kworker polls this every 10 ms).
+static bool mattx_epoll_is_cancelled(u32 orig_pid, u32 req_id)
+{
+    struct mattx_epoll_cancelled *c;
+    bool hit = false;
+
+    spin_lock(&mattx_epoll_cancelled_lock);
+    list_for_each_entry(c, &mattx_epoll_cancelled_list, node) {
+        if (c->orig_pid == orig_pid && c->req_id == req_id) {
+            hit = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_epoll_cancelled_lock);
+    return hit;
+}
+
+// --- Surrogate side: threads waiting for an epoll_wait reply ---
+static LIST_HEAD(mattx_epoll_pending_list);
+static DEFINE_SPINLOCK(mattx_epoll_pending_lock);
+static atomic_t mattx_epoll_req_seq = ATOMIC_INIT(0);
+
+struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node)
+{
+    struct mattx_epoll_pending *p = kzalloc(sizeof(*p), GFP_KERNEL);
+
+    if (!p)
+        return NULL;
+    p->orig_pid = orig_pid;
+    p->home_node = home_node;
+    p->req_id = (u32)atomic_inc_return(&mattx_epoll_req_seq);
+    init_completion(&p->done);
+    spin_lock(&mattx_epoll_pending_lock);
+    list_add_tail(&p->node, &mattx_epoll_pending_list);
+    spin_unlock(&mattx_epoll_pending_lock);
+    return p;
+}
+
+void mattx_epoll_pending_del(struct mattx_epoll_pending *p)
+{
+    spin_lock(&mattx_epoll_pending_lock);
+    list_del_init(&p->node);
+    spin_unlock(&mattx_epoll_pending_lock);
+    kfree(p->events);
+    kfree(p);
+}
+
 
 static void mattx_epoll_wait_cb(struct callback_head *cb) {
     struct mattx_epoll_wait_ctx *ctx = container_of(cb, struct mattx_epoll_wait_ctx, cb);
@@ -2331,6 +2447,7 @@ static void mattx_epoll_wait_cb(struct callback_head *cb) {
     
     if (reply) {
         reply->orig_pid = ctx->req.orig_pid;
+        reply->req_id = ctx->req.req_id;
         reply->retval = ret;
         
         // Read the results back from the user-space scratchpad!
@@ -2386,6 +2503,14 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
                 return; // Exit cleanly without touching the Deputy!
             }
 
+            if (mattx_epoll_is_cancelled(rpc->orig_pid, rpc->epoll_req_id)) {
+                mattx_epoll_take_cancelled(rpc->orig_pid, rpc->epoll_req_id);
+                mattx_dbg("[RPC] epoll_wait request %u of PID %u cancelled by the Surrogate\n", rpc->epoll_req_id, rpc->orig_pid);
+                fput(epoll_file);
+                kfree(rpc);
+                return;
+            }
+
             struct poll_wqueues table;
             poll_initwait(&table);
             __poll_t mask = vfs_poll(epoll_file, &table.pt);
@@ -2427,6 +2552,12 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
         return; // Exit cleanly without touching the Deputy!
     }
 
+    // The Surrogate may have given up while we were breaking out of the loop.
+    if (mattx_epoll_take_cancelled(rpc->orig_pid, rpc->epoll_req_id)) {
+        kfree(rpc);
+        return;
+    }
+
     // Inject task_work into the Deputy to grab them instantly!
     struct task_struct *deputy = NULL;
     rcu_read_lock();
@@ -2441,6 +2572,7 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
             ctx->req.epfd = rpc->remote_fd;
             ctx->req.maxevents = rpc->epoll_maxevents;
             ctx->req.timeout = 0; // INSTANT GRAB! No sleeping, no -EINTR!
+            ctx->req.req_id = rpc->epoll_req_id;
             ctx->target_node = rpc->home_node; 
             
             init_task_work(&ctx->cb, mattx_epoll_wait_cb);
@@ -2458,6 +2590,7 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
         struct mattx_sys_epoll_wait_reply *reply = kzalloc(reply_size, GFP_KERNEL);
         if (reply) {
             reply->orig_pid = rpc->orig_pid;
+            reply->req_id = rpc->epoll_req_id;
             reply->retval = -ESRCH;
             if (cluster_map[rpc->home_node]) {
                 mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_EPOLL_WAIT_REPLY, reply, reply_size);
@@ -2480,6 +2613,7 @@ static void handle_sys_epoll_wait_req(struct mattx_link *link, struct mattx_head
             rpc->remote_fd = req->epfd;
             rpc->epoll_maxevents = req->maxevents;
             rpc->timeout_ms = req->timeout;
+            rpc->epoll_req_id = req->req_id;
             rpc->home_node = hdr->sender_id; // Target node to send reply to
             schedule_work(&rpc->work);
         }
@@ -2487,30 +2621,61 @@ static void handle_sys_epoll_wait_req(struct mattx_link *link, struct mattx_head
 }
 
 
+static void handle_sys_epoll_wait_cancel(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_epoll_wait_cancel *req = payload;
+        struct mattx_epoll_cancelled *c = kmalloc(sizeof(*c), GFP_KERNEL);
+
+        if (!c)
+            return;
+        c->orig_pid = req->orig_pid;
+        c->req_id = req->req_id;
+        c->when = jiffies;
+        spin_lock(&mattx_epoll_cancelled_lock);
+        // A cancel for a request that already finished is never consumed: keep the list bounded.
+        if (mattx_epoll_cancelled_count >= MATTX_EPOLL_CANCELLED_MAX) {
+            struct mattx_epoll_cancelled *old = list_first_entry(&mattx_epoll_cancelled_list, struct mattx_epoll_cancelled, node);
+            list_del(&old->node);
+            kfree(old);
+            mattx_epoll_cancelled_count--;
+        }
+        list_add_tail(&c->node, &mattx_epoll_cancelled_list);
+        mattx_epoll_cancelled_count++;
+        spin_unlock(&mattx_epoll_cancelled_lock);
+    }
+}
+
 static void handle_sys_epoll_wait_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_epoll_wait_reply *reply = payload;
-        int i;
+        struct mattx_epoll_pending *p, *found = NULL;
+        struct epoll_event *events = NULL;
 
-        spin_lock(&guest_lock);
-        for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                guest_registry[i].rpc_fsync_res = reply->retval; 
-                
-                if (reply->retval > 0) {
-                    size_t data_size = reply->retval * sizeof(struct epoll_event);
-                    guest_registry[i].rpc_read_buf = kmalloc(data_size, GFP_ATOMIC);
-                    if (guest_registry[i].rpc_read_buf) {
-                        memcpy(guest_registry[i].rpc_read_buf, reply->events, data_size);
-                    }
-                }
-                
-                guest_registry[i].rpc_done = true;
-                if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq);
+        // Copy the events first: kmalloc(GFP_ATOMIC) under the lock below would work too, but
+        // this keeps the critical section down to the lookup.
+        if (reply->retval > 0) {
+            size_t data_size = reply->retval * sizeof(struct epoll_event);
+            events = kmalloc(data_size, GFP_KERNEL);
+            if (events)
+                memcpy(events, reply->events, data_size);
+        }
+
+        spin_lock(&mattx_epoll_pending_lock);
+        list_for_each_entry(p, &mattx_epoll_pending_list, node) {
+            if (p->orig_pid == reply->orig_pid && p->req_id == reply->req_id && p->home_node == hdr->sender_id) {
+                found = p;
                 break;
             }
         }
-        spin_unlock(&guest_lock);
+        if (found) {
+            found->retval = (reply->retval > 0 && !events) ? -ENOMEM : reply->retval;
+            found->events = events;
+            events = NULL;
+            complete(&found->done);
+        }
+        spin_unlock(&mattx_epoll_pending_lock);
+
+        kfree(events); // nobody is waiting for this reply any more (killed, or an old request)
     }
 }
 
@@ -6404,6 +6569,7 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REPLY, handle_sys_generic_int_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_REQ, handle_sys_epoll_wait_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_REPLY, handle_sys_epoll_wait_reply);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, handle_sys_epoll_wait_cancel);
     mattx_register_handler(MATTX_MSG_SYS_GETSOCKNAME_REQ, handle_sys_getsockname_req);
     mattx_register_handler(MATTX_MSG_SYS_GETSOCKNAME_REPLY, handle_sys_sockname_reply);
     mattx_register_handler(MATTX_MSG_SYS_GETPEERNAME_REQ, handle_sys_getpeername_req);

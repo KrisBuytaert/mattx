@@ -73,6 +73,18 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
             mmap_write_lock(mm);
             struct vm_area_struct *vma = find_vma(mm, target_addr);
             if (vma && target_addr >= vma->vm_start) {
+                if (!(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))) {
+                    // A PROT_NONE page (a stack guard page) on this side. The sender may have it
+                    // as ordinary memory, but nothing can ever access it here, so there is nothing
+                    // to inject -- and forcing VM_WRITE onto a PROT_NONE VMA is what made the
+                    // access_process_vm() below spin forever: the page stays PAGE_NONE, and
+                    // vma_is_accessible() sends every write fault into the NUMA-hinting path,
+                    // which re-installs the same PAGE_NONE pte. That stalled every recall of a
+                    // process with a thread stack (mattx#14).
+                    mmap_write_unlock(mm);
+                    injected_pages_count++;
+                    return;
+                }
                 if (!(vma->vm_flags & VM_WRITE)) {
                     vm_flags_set(vma, vma->vm_flags | VM_WRITE);
                     unprotect = true;
@@ -309,7 +321,12 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     fd_info->home_node = pending_source_node;
                     fd_info->orig_pid = pending_migration->orig_pid;
                     fd_info->remote_fd = fd_num;
-                    fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+                    // O_RDWR, not O_WRONLY: the blueprint does not say how the fd was opened at home, and a
+                    // write-only proxy makes the VFS reject every read() on an inherited fd with EBADF
+                    // before mattx_fops->read ever runs ("Error reading from eventfd: Bad file descriptor",
+                    // mattx#14). The home node does the real access and returns its own error if the fd
+                    // cannot be read.
+                    fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
                 }
             }
 
