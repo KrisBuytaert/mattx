@@ -2343,6 +2343,7 @@ struct mattx_epoll_wait_ctx {
 // --- Home side: epoll_wait requests the Surrogate gave up on ---
 struct mattx_epoll_cancelled {
     struct list_head node;
+    int sender; // Surrogate node that gave up (req_id is a per-node counter!)
     u32 orig_pid;
     u32 req_id;
     unsigned long when;
@@ -2352,15 +2353,35 @@ static DEFINE_SPINLOCK(mattx_epoll_cancelled_lock);
 #define MATTX_EPOLL_CANCELLED_MAX 256
 static int mattx_epoll_cancelled_count;
 
+#define MATTX_EPOLL_CANCELLED_TTL (60 * HZ)
+
+// Caller holds mattx_epoll_cancelled_lock. The list is in arrival order: oldest entries first.
+static void mattx_epoll_cancelled_expire_locked(void)
+{
+    struct mattx_epoll_cancelled *c;
+
+    while (!list_empty(&mattx_epoll_cancelled_list)) {
+        c = list_first_entry(&mattx_epoll_cancelled_list, struct mattx_epoll_cancelled, node);
+        if (!time_after(jiffies, c->when + MATTX_EPOLL_CANCELLED_TTL))
+            break;
+        mattx_dbg("[RPC] Expiring stale epoll cancel (node %d, PID %u, req %u)\n",
+                  c->sender, c->orig_pid, c->req_id);
+        list_del(&c->node);
+        kfree(c);
+        mattx_epoll_cancelled_count--;
+    }
+}
+
 // True (and the entry is consumed) if this request was cancelled.
-static bool mattx_epoll_take_cancelled(u32 orig_pid, u32 req_id)
+static bool mattx_epoll_take_cancelled(int sender, u32 orig_pid, u32 req_id)
 {
     struct mattx_epoll_cancelled *c, *tmp;
     bool hit = false;
 
     spin_lock(&mattx_epoll_cancelled_lock);
+    mattx_epoll_cancelled_expire_locked();    
     list_for_each_entry_safe(c, tmp, &mattx_epoll_cancelled_list, node) {
-        if (c->orig_pid == orig_pid && c->req_id == req_id) {
+        if (c->sender == sender && c->orig_pid == orig_pid && c->req_id == req_id) {
             list_del(&c->node);
             kfree(c);
             mattx_epoll_cancelled_count--;
@@ -2373,14 +2394,15 @@ static bool mattx_epoll_take_cancelled(u32 orig_pid, u32 req_id)
 }
 
 // Peek without consuming (the kworker polls this every 10 ms).
-static bool mattx_epoll_is_cancelled(u32 orig_pid, u32 req_id)
+static bool mattx_epoll_is_cancelled(int sender, u32 orig_pid, u32 req_id)
 {
     struct mattx_epoll_cancelled *c;
     bool hit = false;
 
     spin_lock(&mattx_epoll_cancelled_lock);
+    mattx_epoll_cancelled_expire_locked();
     list_for_each_entry(c, &mattx_epoll_cancelled_list, node) {
-        if (c->orig_pid == orig_pid && c->req_id == req_id) {
+        if (c->sender == sender && c->orig_pid == orig_pid && c->req_id == req_id) {
             hit = true;
             break;
         }
@@ -2388,6 +2410,21 @@ static bool mattx_epoll_is_cancelled(u32 orig_pid, u32 req_id)
     spin_unlock(&mattx_epoll_cancelled_lock);
     return hit;
 }
+
+
+void mattx_epoll_cancelled_purge(void)
+{
+    struct mattx_epoll_cancelled *c, *tmp;
+
+    spin_lock(&mattx_epoll_cancelled_lock);
+    list_for_each_entry_safe(c, tmp, &mattx_epoll_cancelled_list, node) {
+        list_del(&c->node);
+        kfree(c);
+    }
+    mattx_epoll_cancelled_count = 0;
+    spin_unlock(&mattx_epoll_cancelled_lock);
+}
+
 
 // --- Surrogate side: threads waiting for an epoll_wait reply ---
 static LIST_HEAD(mattx_epoll_pending_list);
@@ -2503,8 +2540,8 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
                 return; // Exit cleanly without touching the Deputy!
             }
 
-            if (mattx_epoll_is_cancelled(rpc->orig_pid, rpc->epoll_req_id)) {
-                mattx_epoll_take_cancelled(rpc->orig_pid, rpc->epoll_req_id);
+            if (mattx_epoll_is_cancelled(rpc->home_node, rpc->orig_pid, rpc->epoll_req_id)) {
+                mattx_epoll_take_cancelled(rpc->home_node, rpc->orig_pid, rpc->epoll_req_id);
                 mattx_dbg("[RPC] epoll_wait request %u of PID %u cancelled by the Surrogate\n", rpc->epoll_req_id, rpc->orig_pid);
                 fput(epoll_file);
                 kfree(rpc);
@@ -2553,7 +2590,7 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
     }
 
     // The Surrogate may have given up while we were breaking out of the loop.
-    if (mattx_epoll_take_cancelled(rpc->orig_pid, rpc->epoll_req_id)) {
+    if (mattx_epoll_take_cancelled(rpc->home_node, rpc->orig_pid, rpc->epoll_req_id)) {
         kfree(rpc);
         return;
     }
@@ -2631,7 +2668,9 @@ static void handle_sys_epoll_wait_cancel(struct mattx_link *link, struct mattx_h
         c->orig_pid = req->orig_pid;
         c->req_id = req->req_id;
         c->when = jiffies;
+        c->sender = hdr->sender_id;
         spin_lock(&mattx_epoll_cancelled_lock);
+        mattx_epoll_cancelled_expire_locked();
         // A cancel for a request that already finished is never consumed: keep the list bounded.
         if (mattx_epoll_cancelled_count >= MATTX_EPOLL_CANCELLED_MAX) {
             struct mattx_epoll_cancelled *old = list_first_entry(&mattx_epoll_cancelled_list, struct mattx_epoll_cancelled, node);

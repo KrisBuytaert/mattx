@@ -3407,8 +3407,19 @@ static void mattx_epoll_wait_tw_fn(struct callback_head *cb) {
             .timeout = tw->timeout,
             .req_id = p->req_id,
         };
-        mattx_comm_send(cluster_map[tw->home_node], MATTX_MSG_SYS_EPOLL_WAIT_REQ, &req, sizeof(req));
 
+        struct mattx_link *link = READ_ONCE(cluster_map[tw->home_node]);
+        int sret = link ? mattx_comm_send(link, MATTX_MSG_SYS_EPOLL_WAIT_REQ, &req, sizeof(req)) : -ENOTCONN;
+
+        if (sret < 0) {
+            // Never sleep for a reply to a request that was never sent
+            mattx_dbg("[EPOLL] PID %u req %u: send to home node %d failed (%d), giving up\n",
+                      tw->orig_pid, p->req_id, tw->home_node, sret);
+            ret = -EIO;
+            goto done;
+        }        
+
+        
         // A signal ends the wait, with EINTR like a native epoll_wait(). This matters beyond
         // signal handlers: the freeze that precedes a recall/migration is a task_work (TWA_SIGNAL)
         // plus a stop, and a thread asleep in here uninterruptibly could never be frozen (the
@@ -3432,9 +3443,19 @@ static void mattx_epoll_wait_tw_fn(struct callback_head *cb) {
             // Give up on this request: tell the home node, or its waiter would eat the next
             // readiness event on behalf of a thread that no longer listens (lost wakeup).
             struct mattx_sys_epoll_wait_cancel cancel = { .orig_pid = tw->orig_pid, .req_id = p->req_id };
-            mattx_comm_send(cluster_map[tw->home_node], MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, &cancel, sizeof(cancel));
+
+            // We may have slept for a very long time: look the link up again, it can be gone by now
+            link = READ_ONCE(cluster_map[tw->home_node]);
+            if (link) {
+                if (mattx_comm_send(link, MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, &cancel, sizeof(cancel)) < 0)
+                    mattx_dbg("[EPOLL] PID %u req %u: CANCEL send failed\n", tw->orig_pid, p->req_id);
+            } else {
+                mattx_dbg("[EPOLL] PID %u req %u: link to node %d is gone, CANCEL not sent\n",
+                          tw->orig_pid, p->req_id, tw->home_node);
+            }
         }
     }
+done:    
     mattx_epoll_pending_del(p);
 out:
     regs->ax = ret;

@@ -623,6 +623,7 @@ struct mattx_sys_epoll_wait_cancel {
 };
 struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);
 void mattx_epoll_pending_del(struct mattx_epoll_pending *p);
+void mattx_epoll_cancelled_purge(void);
 
 struct mattx_sys_getsockname_req { 
     u32 orig_pid; int fd; 

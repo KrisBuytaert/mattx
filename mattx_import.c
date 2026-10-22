@@ -26,6 +26,7 @@
 
 // Local state for the import pipeline
 static int injected_pages_count = 0;
+static int skipped_prot_none_pages = 0;
 static char *stub_argv[] = { "/usr/local/bin/mattx-stub", NULL };
 static char *stub_envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
 
@@ -35,6 +36,7 @@ static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr
         
         pending_source_node = hdr->sender_id;
         injected_pages_count = 0;
+        skipped_prot_none_pages = 0;
 
         mattx_dbg("[IMPORT] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
         if (pending_migration) kvfree(pending_migration);
@@ -73,6 +75,7 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
             mmap_write_lock(mm);
             struct vm_area_struct *vma = find_vma(mm, target_addr);
             if (vma && target_addr >= vma->vm_start) {
+
                 if (!(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))) {
                     // A PROT_NONE page (a stack guard page) on this side. The sender may have it
                     // as ordinary memory, but nothing can ever access it here, so there is nothing
@@ -81,10 +84,21 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
                     // vma_is_accessible() sends every write fault into the NUMA-hinting path,
                     // which re-installs the same PAGE_NONE pte. That stalled every recall of a
                     // process with a thread stack (mattx#14).
+                    // Guard pages are all zeroes. Anything else means we are about to lose real data.
+                    bool has_data = memchr_inv(data, 0, ph->length) != NULL;
+
                     mmap_write_unlock(mm);
+                    skipped_prot_none_pages++;
+                    if (has_data)
+                        printk_ratelimited(KERN_WARNING "MattX:[IMPORT] WARNING: dropping NON-ZERO data (%u bytes) at 0x%lx: target VMA is PROT_NONE (mprotect() we never saw?)\n",
+                                           ph->length, target_addr);
+                    else
+                        mattx_dbg("[IMPORT] Skipped all-zero page at 0x%lx (PROT_NONE VMA, %u bytes)\n",
+                                  target_addr, ph->length);
                     injected_pages_count++;
                     return;
                 }
+
                 if (!(vma->vm_flags & VM_WRITE)) {
                     vm_flags_set(vma, vma->vm_flags | VM_WRITE);
                     unprotect = true;
@@ -159,6 +173,9 @@ static void mattx_vdso_transplant_cb(struct callback_head *cb) {
 
 static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
+
+    if (skipped_prot_none_pages)
+        mattx_dbg("[IMPORT] %d pages skipped because the target VMA is PROT_NONE\n", skipped_prot_none_pages);
     
     if (hijacked_stub_task && pending_migration) {
         struct cred *new_cred;
@@ -496,6 +513,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         
         pending_source_node = hdr->sender_id;
         injected_pages_count = 0;
+        skipped_prot_none_pages = 0;        
 
         if (pending_migration) kvfree(pending_migration);
         
@@ -708,6 +726,9 @@ static void mattx_exorcist_cb(struct callback_head *cb) {
 static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
+    if (skipped_prot_none_pages)
+        mattx_dbg("[IMPORT] %d pages skipped because the target VMA is PROT_NONE\n", skipped_prot_none_pages);
+
     if (hijacked_stub_task && pending_migration) {
         struct task_struct *t;
         int t_idx = 0;

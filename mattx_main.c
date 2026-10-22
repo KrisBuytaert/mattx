@@ -330,6 +330,7 @@ static void __exit mattx_exit(void) {
     mattx_fileio_exit();
     
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
+    mattx_epoll_cancelled_purge();   // all receiver threads are dead, nobody can queue a cancel anymore
     if (pending_migration) kvfree(pending_migration);
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
     genl_unregister_family(&mattx_genl_family);
