@@ -113,6 +113,9 @@ static ssize_t mattxfs_remote_file_read(struct file *file, char __user *buf, siz
 
     bytes_read = mattx_rpc_vfs_read(fi->node_id, fi->remote_fd, kbuf, count, pos);
     
+    if (bytes_read > (ssize_t)count)    // never copy more than was asked for (and allocated)
+        bytes_read = -EIO;
+
     if (bytes_read > 0) {
         if (copy_to_user(buf, kbuf, bytes_read)) {
             bytes_read = -EFAULT;
