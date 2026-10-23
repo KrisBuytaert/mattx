@@ -552,7 +552,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
     // Pack the DFSA path into the Blueprint! ---
-    strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
+    strscpy_pad(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir));
 
     cred = get_task_cred(task);
     if (cred) {
@@ -810,7 +810,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
     // Pack the DFSA path into the Blueprint! ---
-    strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
+    strscpy_pad(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir));
 
     // --- The "Lazy Oracle" Nametag Capture! ---
     get_task_comm(req->comm, task);
