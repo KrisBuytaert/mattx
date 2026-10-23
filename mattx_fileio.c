@@ -5520,7 +5520,7 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
 
     // 2. Send the request
     req.req_id = req_id;
-    strncpy(req.path, path, sizeof(req.path) - 1);
+    strscpy_pad(req.path, path, sizeof(req.path));
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_GETATTR_REQ, &req, sizeof(req));
 
     // 3. Sleep until the reply arrives!
@@ -5596,7 +5596,7 @@ int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mat
 
     req.req_id = req_id;
     req.offset = *offset;
-    strncpy(req.path, path, sizeof(req.path) - 1);
+    strscpy_pad(req.path, path, sizeof(req.path));
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READDIR_REQ, &req, sizeof(req));
 
     wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
@@ -5688,7 +5688,7 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
     // Grab the identity of the user typing the command! ---
     req.uid = from_kuid(&init_user_ns, current_fsuid());
     req.gid = from_kgid(&init_user_ns, current_fsgid());
-    strncpy(req.path, path, sizeof(req.path) - 1);
+    strscpy_pad(req.path, path, sizeof(req.path));
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_OPEN_REQ, &req, sizeof(req));
 
     wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
@@ -6018,7 +6018,7 @@ int mattx_rpc_vfs_unlink(int node_id, const char *path) {
     // Grab the identity! ---
     req.uid = from_kuid(&init_user_ns, current_fsuid());
     req.gid = from_kgid(&init_user_ns, current_fsgid());
-    strncpy(req.path, path, sizeof(req.path) - 1);
+    strscpy_pad(req.path, path, sizeof(req.path));
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_SYS_UNLINK_REQ, &req, sizeof(req));
 
     wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);

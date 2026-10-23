@@ -82,8 +82,17 @@
 // In kernel 7.0, 'struct fpu' was removed from 'thread_struct' to keep it a constant size.
 // It is now dynamically allocated at the end of task_struct and accessed via x86_task_fpu().
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-    // Use the Ghost Resolver!
-    #define MATTX_TASK_FPU(t) (real_x86_task_fpu ? real_x86_task_fpu(t) : NULL)
+    #ifdef CONFIG_X86_DEBUG_FPU
+        // x86_task_fpu() is a real out-of-line function in this configuration: use the Ghost Resolver!
+        #define MATTX_TASK_FPU(t) (real_x86_task_fpu ? real_x86_task_fpu(t) : NULL)
+    #else
+        // Without CONFIG_X86_DEBUG_FPU the kernel header only has a macro,
+        //   #define x86_task_fpu(task) ((struct fpu *)((void *)(task) + sizeof(*(task))))
+        // and no such symbol exists to resolve (Fedora 44's 7.2, most distro kernels): the Ghost
+        // Resolver then returned NULL ("FATAL - Could not resolve x86_task_fpu"), silently skipping
+        // the FPU/SSE/AVX state of every thread on migration and return. Use the macro itself.
+        #define MATTX_TASK_FPU(t) x86_task_fpu(t)
+    #endif
 #else
     #define MATTX_TASK_FPU(t) (&(t)->thread.fpu)
 #endif

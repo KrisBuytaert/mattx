@@ -384,6 +384,10 @@ static void mattx_resolve_hidden_symbols(void) {
     }
     
     // --- THE FPU GHOST RESOLVER ---
+    // Only needed (and only possible) where x86_task_fpu() is a real function: kernels >= 6.13 built with
+    // CONFIG_X86_DEBUG_FPU. Everywhere else MATTX_TASK_FPU() is the header's own macro or the old
+    // thread.fpu field and there is no symbol to find (see mattx.h).
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0) && defined(CONFIG_X86_DEBUG_FPU)
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "x86_task_fpu";
     if (register_kprobe(&kp) == 0) { 
@@ -393,6 +397,7 @@ static void mattx_resolve_hidden_symbols(void) {
     } else {
         printk(KERN_ERR "MattX: FATAL - Could not resolve x86_task_fpu!\n");
     }
+#endif
 
     // --- THE vMA PTE ZAPPER ---
     memset(&kp, 0, sizeof(kp)); 
@@ -552,7 +557,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
     // Pack the DFSA path into the Blueprint! ---
-    strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
+    strscpy_pad(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir));
 
     cred = get_task_cred(task);
     if (cred) {
@@ -810,7 +815,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
     // Pack the DFSA path into the Blueprint! ---
-    strncpy(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir) - 1);
+    strscpy_pad(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir));
 
     // --- The "Lazy Oracle" Nametag Capture! ---
     get_task_comm(req->comm, task);

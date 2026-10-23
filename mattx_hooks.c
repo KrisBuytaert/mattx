@@ -86,7 +86,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         memset(&req, 0, sizeof(req));
         req.orig_pid = rpc->orig_pid;
         req.req_id = 0; // 0 means this is a Kprobe request, not a VFS request!
-        strncpy(req.path, rpc->filename, sizeof(req.path) - 1);
+        strscpy_pad(req.path, rpc->filename, sizeof(req.path));
 
         mattx_dbg("[RPC] Worker started for PID %d. Sending UNLINK_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
@@ -540,7 +540,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PREAD64_REQ, &req, sizeof(req));
 
     } else if (rpc->is_statfs) {
-        struct mattx_sys_statfs_req req = { .orig_pid = rpc->orig_pid }; strncpy(req.path, rpc->meta_path, 255);
+        struct mattx_sys_statfs_req req = { .orig_pid = rpc->orig_pid }; strscpy_pad(req.path, rpc->meta_path, sizeof(req.path));
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_STATFS_REQ, &req, sizeof(req));
     
     } else if (rpc->is_fstatfs) {
@@ -548,19 +548,19 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_FSTATFS_REQ, &req, sizeof(req));
     
     } else if (rpc->is_newfstatat) {
-        struct mattx_sys_newfstatat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .flags = rpc->meta_flags }; strncpy(req.path, rpc->meta_path, 255);
+        struct mattx_sys_newfstatat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .flags = rpc->meta_flags }; strscpy_pad(req.path, rpc->meta_path, sizeof(req.path));
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_NEWFSTATAT_REQ, &req, sizeof(req));
     
     } else if (rpc->is_faccessat2) {
-        struct mattx_sys_faccessat2_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .mode = rpc->meta_mode, .flags = rpc->meta_flags }; strncpy(req.path, rpc->meta_path, 255);
+        struct mattx_sys_faccessat2_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .mode = rpc->meta_mode, .flags = rpc->meta_flags }; strscpy_pad(req.path, rpc->meta_path, sizeof(req.path));
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_FACCESSAT2_REQ, &req, sizeof(req));
     
     } else if (rpc->is_readlink) {
-        struct mattx_sys_readlink_req req = { .orig_pid = rpc->orig_pid, .bufsiz = rpc->meta_bufsiz }; strncpy(req.path, rpc->meta_path, 255);
+        struct mattx_sys_readlink_req req = { .orig_pid = rpc->orig_pid, .bufsiz = rpc->meta_bufsiz }; strscpy_pad(req.path, rpc->meta_path, sizeof(req.path));
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_READLINK_REQ, &req, sizeof(req));
     
     } else if (rpc->is_readlinkat) {
-        struct mattx_sys_readlinkat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .bufsiz = rpc->meta_bufsiz }; strncpy(req.path, rpc->meta_path, 255);
+        struct mattx_sys_readlinkat_req req = { .orig_pid = rpc->orig_pid, .dfd = rpc->meta_dfd, .bufsiz = rpc->meta_bufsiz }; strscpy_pad(req.path, rpc->meta_path, sizeof(req.path));
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_READLINKAT_REQ, &req, sizeof(req));
 
     } else if (rpc->is_getdents64) {
@@ -594,7 +594,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         struct mattx_sys_open_req req;
         memset(&req, 0, sizeof(req));
         req.orig_pid = rpc->orig_pid;
-        strncpy(req.filename, rpc->filename, sizeof(req.filename) - 1);
+        strscpy_pad(req.filename, rpc->filename, sizeof(req.filename));
         req.flags = rpc->flags;
         req.mode = rpc->mode;
 
@@ -1858,7 +1858,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 rpc->home_node = home_node;
                 rpc->flags = data->flags;
                 rpc->mode = data->mode;
-                strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
+                strscpy_pad(rpc->filename, filename, sizeof(rpc->filename));
 
                 mattx_dbg("[HOOK] Intercepted open('%s'). Freezing Surrogate %d...\n", filename, my_pid);
                 send_sig(SIGSTOP, current, 0);
@@ -2043,7 +2043,7 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
                 rpc->orig_pid = orig_pid;
                 rpc->home_node = home_node;
                 rpc->is_unlink = true;
-                strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
+                strscpy_pad(rpc->filename, filename, sizeof(rpc->filename));
 
                 mattx_dbg("[HOOK] Intercepted unlinkat('%s'). Freezing Surrogate %d...\n", filename, my_pid);
                 send_sig(SIGSTOP, current, 0);
