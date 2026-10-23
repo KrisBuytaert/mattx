@@ -661,74 +661,154 @@ static ssize_t mattx_wormhole_kernel_write(struct file *file, const void *buf, s
     return kernel_write(file, buf, len, pos);
 }
 
-static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
+/*
+ * FORWARDED WRITES (MATTX_MSG_SYSCALL_FWD)
+ *
+ * A Surrogate's write() to a pipe/socket/eventfd/... that lives on the home node is
+ * fire-and-forget: the Surrogate has already moved on, so these writes must be applied in the
+ * order they arrived.
+ *
+ * They used to run kernel_write() inline in the per-link receiver kthread. A write that blocks
+ * (full pipe or socket buffer) froze EVERY message from that node, including the READ_REQ that
+ * would have drained the pipe: the receiver-thread stall.
+ *
+ * Now the receiver only queues the write on one FIFO and returns; a single work item drains the
+ * FIFO in order. A blocked write stalls this FIFO only, never the receiver kthread.
+ */
+struct mattx_fwd_write {
+    struct list_head node;
+    struct mattx_syscall_req req;   // req.data[] is a flexible array: must stay the LAST member
+};
+
+static LIST_HEAD(mattx_fwd_write_list);
+static DEFINE_SPINLOCK(mattx_fwd_write_lock);
+static bool mattx_fwd_write_running;    // a drain work item is queued or running
+static bool mattx_fwd_write_stopping;   // set by mattx_fileio_exit(): accept no more writes
+static void mattx_fwd_write_drain(struct work_struct *work);
+static DECLARE_WORK(mattx_fwd_write_work, mattx_fwd_write_drain);
+
+// Applies ONE forwarded write on the home node. Runs in the drain work item, so it may sleep.
+static void mattx_fwd_write_apply(struct mattx_syscall_req *req) {
+    struct task_struct *deputy = NULL;
+    struct file *file = NULL;
+    int i;
+
+    if (req->fd >= 1000) {
+        int slot = req->fd - 1000;
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == req->orig_pid) {
+                if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                    file = export_registry[i].remote_files[slot];
+                    get_file(file);
                 }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
+                break;
             }
         }
-        
-        if (file) {
-            loff_t pos = file->f_pos;
-            ssize_t ret;
-            const struct cred *old_cred = NULL;
-            
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
+        spin_unlock(&export_lock);
+    } else {
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct files_struct *files = deputy->files;
+            if (files) {
+                spin_lock(&files->file_lock);
+                struct fdtable *fdt = files_fdtable(files);
+                if (req->fd < fdt->max_fds) {
+                    file = rcu_dereference_raw(fdt->fd[req->fd]);
+                    if (file) get_file(file);
+                }
+                spin_unlock(&files->file_lock);
             }
-            
-            ret = mattx_wormhole_kernel_write(file, req->data, req->len, &pos);
-            
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-            }
-            
-            if (ret >= 0) {
-                file->f_pos = pos;
-            } else {
-                printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
-            }
-            fput(file); 
         }
-        if (deputy) put_task_struct(deputy);
     }
+
+    if (file) {
+        loff_t pos = file->f_pos;
+        ssize_t ret;
+        const struct cred *old_cred = NULL;
+
+        if (deputy) {
+            if (deputy->mm) kthread_use_mm(deputy->mm);
+            old_cred = override_creds(deputy->cred);
+        }
+
+        ret = mattx_wormhole_kernel_write(file, req->data, req->len, &pos);
+
+        if (deputy) {
+            revert_creds(old_cred);
+            if (deputy->mm) kthread_unuse_mm(deputy->mm);
+        }
+
+        if (ret >= 0) {
+            file->f_pos = pos;
+        } else {
+            printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
+        }
+        fput(file);
+    }
+    if (deputy) put_task_struct(deputy);
 }
 
+static void mattx_fwd_write_drain(struct work_struct *work) {
+    struct mattx_fwd_write *w;
+
+    spin_lock(&mattx_fwd_write_lock);
+    while (!list_empty(&mattx_fwd_write_list)) {
+        w = list_first_entry(&mattx_fwd_write_list, struct mattx_fwd_write, node);
+        list_del(&w->node);
+        spin_unlock(&mattx_fwd_write_lock);
+
+        mattx_fwd_write_apply(&w->req);   // may sleep (full pipe/socket): fine, we are not the receiver
+        kfree(w);
+
+        spin_lock(&mattx_fwd_write_lock);
+    }
+    mattx_fwd_write_running = false;
+    spin_unlock(&mattx_fwd_write_lock);
+}
+
+static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_syscall_req *req = payload;
+    struct mattx_fwd_write *w;
+    size_t len;
+    bool kick = false;
+    bool stopping;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+
+    // Never trust req->len beyond what really arrived in this message
+    len = min_t(size_t, req->len, hdr->length - sizeof(*req));
+
+    w = kmalloc(sizeof(*w) + len, GFP_KERNEL);
+    if (!w) {
+        printk(KERN_ERR "MattX:[WORMHOLE] Forwarded write for FD %u dropped: out of memory\n", req->fd);
+        return;
+    }
+    memcpy(&w->req, req, sizeof(*req));
+    w->req.len = len;
+    memcpy(w->req.data, req->data, len);
+
+    spin_lock(&mattx_fwd_write_lock);
+    stopping = mattx_fwd_write_stopping;
+    if (!stopping) {
+        list_add_tail(&w->node, &mattx_fwd_write_list);
+        if (!mattx_fwd_write_running) {
+            mattx_fwd_write_running = true;
+            kick = true;
+        }
+    }
+    spin_unlock(&mattx_fwd_write_lock);
+
+    if (stopping) {
+        kfree(w);   // module is unloading
+        return;
+    }
+    if (kick) schedule_work(&mattx_fwd_write_work);
+}
 
 // --- DATA PLANE: OPENAT (Kworker Native Injector) ---
 struct mattx_open_kworker_ctx {
@@ -899,97 +979,136 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
 }
 
 
-static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_read_req *req = (struct mattx_sys_read_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        
-        mattx_dbg("[WORMHOLE] Received READ request for FD %u from Node %u. Reading from Deputy...\n", req->fd, hdr->sender_id);
+/*
+ * READ_REQ (the IPC Wormhole read: pipe / FIFO / socket / eventfd / proxy fds)
+ *
+ * This used to run kernel_read() inline in the per-link receiver kthread. kernel_read() on an
+ * empty pipe, socket or eventfd BLOCKS until data arrives, and while the receiver kthread sleeps
+ * nothing else from that node is dispatched, not even the forwarded write that would unblock it:
+ * a classic deadlock (the receiver-thread stall). Like the other data-plane requests, a read now
+ * runs in its own kworker; the receiver only copies the request and returns.
+ *
+ * Known limit (the thread-wait conversion fixes it): a blocked read has no cancel path yet. If the
+ * Surrogate dies or is recalled meanwhile, the kworker keeps waiting and may swallow the next bytes.
+ */
+struct mattx_read_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_read_req req;
+    int target_node;
+};
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
+static void mattx_read_kworker(struct work_struct *work) {
+    struct mattx_read_kworker_ctx *ctx = container_of(work, struct mattx_read_kworker_ctx, work);
+    struct mattx_sys_read_req *req = &ctx->req;
+    struct mattx_sys_read_reply fail = { .orig_pid = req->orig_pid };
+    struct mattx_sys_read_reply *reply = NULL;
+    struct task_struct *deputy = NULL;
+    struct file *file = NULL;
+    struct mattx_link *link;
+    // Both senders (mattx_fake_read and the rpc worker) cap a READ_REQ at 4096 bytes as well
+    size_t count = min_t(size_t, req->count, 4096);
+    ssize_t ret = -EBADF;
+    int i;
+
+    mattx_dbg("[WORMHOLE] Received READ request for FD %u from Node %d. Reading from Deputy (kworker)...\n", req->fd, ctx->target_node);
+
+    if (req->fd >= 1000) {
+        int slot = req->fd - 1000;
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == req->orig_pid) {
+                if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                    file = export_registry[i].remote_files[slot];
+                    get_file(file);
                 }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
+                break;
             }
         }
-        
-        if (file) {
-            loff_t pos = file->f_pos;
-            ssize_t ret;
-            const struct cred *old_cred = NULL;
-            void *read_buf = kmalloc(req->count, GFP_KERNEL);
-            
-            if (read_buf) {
-                if (deputy) {
-                    if (deputy->mm) kthread_use_mm(deputy->mm);
-                    old_cred = override_creds(deputy->cred);
-                }
-                
-                ret = kernel_read(file, read_buf, req->count, &pos);
-                
-                if (deputy) {
-                    revert_creds(old_cred);
-                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                }
-                
-                if (ret >= 0) {
-                    file->f_pos = pos;
-                }
+        spin_unlock(&export_lock);
+    } else {
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
 
-                // Prepare and send reply
-                size_t reply_size = sizeof(struct mattx_sys_read_reply) + (ret > 0 ? ret : 0);
-                struct mattx_sys_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
-                if (reply) {
-                    reply->orig_pid = req->orig_pid;
-                    reply->bytes_read = ret;
-                    reply->error = (ret < 0) ? ret : 0;
-                    if (ret > 0) {
-                        memcpy(reply->data, read_buf, ret);
-                    }
-                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_READ_REPLY, reply, reply_size);
-                    kfree(reply);
+        if (deputy) {
+            struct files_struct *files = deputy->files;
+            if (files) {
+                spin_lock(&files->file_lock);
+                struct fdtable *fdt = files_fdtable(files);
+                if (req->fd < fdt->max_fds) {
+                    file = rcu_dereference_raw(fdt->fd[req->fd]);
+                    if (file) get_file(file);
                 }
-                kfree(read_buf);
+                spin_unlock(&files->file_lock);
             }
-            fput(file); 
-        } else {
-            // Send error reply
-            struct mattx_sys_read_reply reply;
-            reply.orig_pid = req->orig_pid;
-            reply.bytes_read = -EBADF;
-            reply.error = -EBADF;
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_READ_REPLY, &reply, sizeof(reply));
+            // The Deputy reference is kept until we are done with deputy->mm and deputy->cred below
+            // (the inline version dropped it right here and then kept using the pointer).
         }
     }
+
+    if (file) {
+        reply = kmalloc(sizeof(*reply) + count, GFP_KERNEL);
+        if (reply) {
+            loff_t pos = file->f_pos;
+            const struct cred *old_cred = NULL;
+
+            if (deputy) {
+                if (deputy->mm) kthread_use_mm(deputy->mm);
+                old_cred = override_creds(deputy->cred);
+            }
+
+            // Reads straight into the reply buffer (may block: that is why we are a kworker)
+            ret = kernel_read(file, reply->data, count, &pos);
+
+            if (deputy) {
+                revert_creds(old_cred);
+                if (deputy->mm) kthread_unuse_mm(deputy->mm);
+            }
+
+            if (ret >= 0) {
+                file->f_pos = pos;
+            }
+        } else {
+            ret = -ENOMEM;
+        }
+        fput(file);
+    }
+    if (deputy) put_task_struct(deputy);
+
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (!link) {
+        mattx_dbg("[WORMHOLE] READ for FD %u: link to Node %d is gone, reply dropped\n", req->fd, ctx->target_node);
+    } else if (reply) {
+        reply->orig_pid = req->orig_pid;
+        reply->bytes_read = ret;
+        reply->error = (ret < 0) ? ret : 0;
+        mattx_comm_send(link, MATTX_MSG_SYS_READ_REPLY, reply, sizeof(*reply) + (ret > 0 ? ret : 0));
+    } else {
+        // No such FD (-EBADF) or out of memory (-ENOMEM): still answer, the Surrogate is waiting!
+        fail.bytes_read = ret;
+        fail.error = ret;
+        mattx_comm_send(link, MATTX_MSG_SYS_READ_REPLY, &fail, sizeof(fail));
+    }
+
+    if (reply) kfree(reply);
+    kfree(ctx);
+}
+
+static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_read_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(struct mattx_sys_read_req)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] READ_REQ dropped: out of memory\n");
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_read_kworker);
+    memcpy(&ctx->req, payload, sizeof(ctx->req));
+    ctx->target_node = hdr->sender_id;
+    schedule_work(&ctx->work);
 }
 
 static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -2145,7 +2264,10 @@ static void mattx_poll_worker(struct work_struct *work) {
 
     if (cluster_map[rpc->home_node]) {
         mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply->retval, rpc->home_node);
-        mattx_comm_send_ctrl(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
+        // POLL_REPLY is data, not a droppable control message: mattx_comm_send_ctrl() uses mutex_trylock and
+        // silently drops the message when the send mutex is busy. The Surrogate then waits forever (poll
+        // with an infinite timeout). A kworker may simply wait for the mutex.
+        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
     }
     
     kfree(reply);
@@ -6719,6 +6841,24 @@ void mattx_fileio_exit(void) {
     struct file *f;
 
     mattx_dbg(" [FILEIO] Purging all open files...\n");
+
+    // 0. Forwarded writes: accept no more, let the drain work item finish, free what is left over
+    {
+        struct mattx_fwd_write *w, *tmp;
+
+        spin_lock(&mattx_fwd_write_lock);
+        mattx_fwd_write_stopping = true;
+        spin_unlock(&mattx_fwd_write_lock);
+
+        flush_work(&mattx_fwd_write_work);
+
+        spin_lock(&mattx_fwd_write_lock);
+        list_for_each_entry_safe(w, tmp, &mattx_fwd_write_list, node) {
+            list_del(&w->node);
+            kfree(w);
+        }
+        spin_unlock(&mattx_fwd_write_lock);
+    }
 
     // 1. Clean up MFS open files
     spin_lock(&mfs_file_lock);
