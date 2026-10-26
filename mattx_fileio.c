@@ -680,6 +680,35 @@ struct mattx_fwd_write {
     struct mattx_syscall_req req;   // req.data[] is a flexible array: must stay the LAST member
 };
 
+// --- Long-waiting kworkers (poll / epoll_wait proxies) ---
+// mattx_poll_worker() and mattx_epoll_wait_kworker() sit in a loop for as long as the Surrogate's
+// poll()/epoll_wait() lasts, which can be forever. On the system workqueue nothing could stop them at
+// rmmod, so they kept running (or sleeping in schedule_timeout) in module text that rmmod had freed:
+// "Oops: int3" in a kworker, a kdump reboot of the node (reproduced every time by unloading a home
+// node whose guests run an epoll/poll loop on another node). They now run on a workqueue of their own:
+// mattx_exit() sets mattx_unloading (the loops return at their next 10 ms tick) and then
+// destroy_workqueue() waits until none is left. Falls back to the system workqueue if the allocation
+// fails; that is the old behaviour.
+static struct workqueue_struct *mattx_wait_wq;
+static bool mattx_unloading;
+
+static void mattx_queue_wait_work(struct work_struct *work) {
+    queue_work(mattx_wait_wq ? mattx_wait_wq : system_wq, work);
+}
+
+// Called first thing in mattx_exit(): tell the waiters to leave.
+void mattx_fileio_waiters_stop(void) {
+    WRITE_ONCE(mattx_unloading, true);
+}
+
+// Called once nothing can queue a waiter any more (the receiver threads are gone).
+void mattx_fileio_waiters_destroy(void) {
+    if (mattx_wait_wq) {
+        destroy_workqueue(mattx_wait_wq);
+        mattx_wait_wq = NULL;
+    }
+}
+
 static LIST_HEAD(mattx_fwd_write_list);
 static DEFINE_SPINLOCK(mattx_fwd_write_lock);
 static bool mattx_fwd_write_running;    // a drain work item is queued or running
@@ -2192,7 +2221,7 @@ static void mattx_poll_worker(struct work_struct *work) {
         }
         spin_unlock(&export_lock);
 
-        if (!deputy_alive) {
+        if (!deputy_alive || READ_ONCE(mattx_unloading)) {
             reply->error = -ESRCH;
             break;
         }
@@ -2288,7 +2317,7 @@ static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hd
             rpc->nfds = req->nfds;
             rpc->timeout = req->timeout;
             memcpy(rpc->poll_fds, req->fds, sizeof(struct mattx_pollfd) * req->nfds);
-            schedule_work(&rpc->work);
+            mattx_queue_wait_work(&rpc->work);
         }
     }
 }
@@ -2678,6 +2707,13 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
         // --- THE WAIT QUEUE LOOP ---
         while (1) {
             bool abort = false;
+
+            // rmmod mattx is waiting for us (see mattx_wait_wq): leave without replying
+            if (READ_ONCE(mattx_unloading)) {
+                fput(epoll_file);
+                kfree(rpc);
+                return;
+            }
             
             // Check the Kill-Switch!
             spin_lock(&export_lock);
@@ -2807,7 +2843,7 @@ static void handle_sys_epoll_wait_req(struct mattx_link *link, struct mattx_head
             rpc->timeout_ms = req->timeout;
             rpc->epoll_req_id = req->req_id;
             rpc->home_node = hdr->sender_id; // Target node to send reply to
-            schedule_work(&rpc->work);
+            mattx_queue_wait_work(&rpc->work);
         }
     }
 }
@@ -6719,6 +6755,10 @@ static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *h
 }
 
 void mattx_fileio_init_handlers(void) {
+    mattx_unloading = false;
+    mattx_wait_wq = alloc_workqueue("mattx_wait", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    if (!mattx_wait_wq)
+        printk(KERN_WARNING "MattX: no private workqueue for poll/epoll waiters, using the system one\n");
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REPLY, handle_sys_open_reply);
