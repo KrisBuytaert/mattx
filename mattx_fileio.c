@@ -4900,7 +4900,10 @@ int mattx_dsm_sweeper_loop(void *data) {
                         struct task_struct *surrogate = NULL;
                         rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
 
-                        if (surrogate && surrogate->mm) {
+                        // same as the deputy walk below: one pinned mm for lock and unlock (surrogate->mm
+                        // goes NULL on exit), and the task reference is dropped on every path
+                        struct mm_struct *smm = surrogate ? get_task_mm(surrogate) : NULL;
+                        if (smm) {
                             for (int d = 0; d < dsm_count; d++) {
                                 unsigned long base = local_dsm[d].base_addr;
                                 unsigned long size = local_dsm[d].size;
@@ -4928,17 +4931,18 @@ int mattx_dsm_sweeper_loop(void *data) {
 
                                 // 2. The Zap! (Burn it all down SAFELY)
                                 if (real_zap_vma_ptes) {
-                                    mmap_read_lock(surrogate->mm);
-                                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                                    mmap_read_lock(smm);
+                                    struct vm_area_struct *vma = find_vma(smm, base);
                                     if (vma && vma->vm_start <= base) {
                                         real_zap_vma_ptes(vma, base, size);
                                         mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
                                     }
-                                    mmap_read_unlock(surrogate->mm);
+                                    mmap_read_unlock(smm);
                                 }
                             }
-                            put_task_struct(surrogate);
+                            mmput(smm);
                         }
+                        if (surrogate) put_task_struct(surrogate);
                     }
                 }
                 kfree(local_dsm); 
@@ -4980,10 +4984,14 @@ int mattx_dsm_sweeper_loop(void *data) {
                         // --- THE ZOMBIE SHIELD ---
                         // Never touch a dying process! It is already tearing down its mm_struct
                         // and holding the mmap_write_lock. If we try to read_lock it, we deadlock!
-                        if (deputy->mm && !(deputy->flags & PF_EXITING)) {
-                            mmap_read_lock(deputy->mm);
+                        // Pin the mm once and use that pointer for lock, walk and unlock: re-reading
+                        // deputy->mm after the lock is taken races with exit_mm() (which sets it to NULL)
+                        // and ends in up_read(&NULL->mmap_lock), an oops in this kthread.
+                        struct mm_struct *mm = (deputy->flags & PF_EXITING) ? NULL : get_task_mm(deputy);
+                        if (mm) {
+                            mmap_read_lock(mm);
                             struct vm_area_struct *vma;
-                            VMA_ITERATOR(vmi, deputy->mm, 0);
+                            VMA_ITERATOR(vmi, mm, 0);
                             for_each_vma(vmi, vma) {
                                 if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
                                     if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
@@ -4995,7 +5003,8 @@ int mattx_dsm_sweeper_loop(void *data) {
                                     }
                                 }
                             }
-                            mmap_read_unlock(deputy->mm);
+                            mmap_read_unlock(mm);
+                            mmput(mm);
                         }
                         put_task_struct(deputy);
                     }
