@@ -620,7 +620,8 @@ const struct file_operations mattx_fops = {
     .read = mattx_fake_read,
     .write = mattx_fake_write,
     .poll = mattx_fake_poll, // THE PACIFIER!
-    .release = mattx_fake_release, 
+    .release = mattx_fake_release,
+    .owner = THIS_MODULE,
 };
 
 // --- Network Handlers for File I/O ---
