@@ -1134,10 +1134,9 @@ struct mattx_export_info {
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
     bool is_growing_gang; // The Gang Grower Flag!
-
-    // DSM MESI Directory ---
-    int dsm_dir_count;
-    struct mattx_dsm_master_dir dsm_dirs[MAX_DSM_SEGMENTS];    
+    // (The per-export copy of the DSM directory that used to live here was never written, and at
+    // MAX_DSM_SEGMENTS x ~34 KB it made export_registry[] 560 MB of zeroed memory per insmod. The
+    // directory is the global mattx_global_dsm_dir[].)
 };
 
 struct mattx_vfs_getattr_req {
