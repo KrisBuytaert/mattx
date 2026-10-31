@@ -4588,23 +4588,6 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             if (config_dsm_mode == 2) {
                 u32 owner_pid = 0;
                 int owner_node = -1;
-                int dir_idx = -1;
-                int e_idx = -1;
-
-                spin_lock(&export_lock);
-                for (int e = 0; e < export_count; e++) {
-                    if (export_registry[e].orig_pid == ctx->req.orig_pid) {
-                        e_idx = e;
-                        for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
-                            if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
-                                dir_idx = d;
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                }
-                spin_unlock(&export_lock);
 
                 spin_lock(&mattx_dsm_lock);
                 for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
